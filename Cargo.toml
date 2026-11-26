@@ -14,9 +14,10 @@ repository = "https://github.com/Pastalikek65/icaloxide"
 rust-version = "1.82"
 
 [workspace.dependencies]
+compact_str = "0.8"
+jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-bundle-always"] }
 memchr = "2.7"
 smallvec = { version = "1.13", features = ["union", "const_generics"] }
-compact_str = "0.8"
 thiserror = "2.0"
 rustc-hash = "2.1"
 pyo3 = { version = "0.24", features = ["abi3-py39"] }

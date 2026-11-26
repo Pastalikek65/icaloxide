@@ -7,6 +7,7 @@ pub mod error;
 pub mod lexer;
 pub mod model;
 pub mod parser;
+pub mod tz;
 pub mod writer;
 
 pub use datetime::{
@@ -19,4 +20,8 @@ pub use error::{
 pub use model::{
     Calendar, ComponentArena, ComponentId, ComponentKind, ComponentMut, ComponentNode,
     ComponentRef, ParamName, Parameter, Property, PropertyName, PropertyValue, ValueType,
+};
+pub use tz::{
+    CalendarTimeZone, CompiledVTimezone, DstDisambiguation, ResolvedInstant, TzError, TzRegistry,
+    TzTransition,
 };

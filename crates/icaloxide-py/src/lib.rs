@@ -2,12 +2,13 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use compact_str::CompactString;
 use icaloxide_core::{
     CalDate, CalDateTime, CalDuration, CalPeriod, CalTime, Calendar as CoreCalendar, ComponentId,
-    ComponentKind, ParseOptions, PropertyName, PropertyValue, TimeZoneRef, UtcOffset,
+    ComponentKind, DstDisambiguation, ParseOptions, PropertyName, PropertyValue, TimeZoneRef,
+    TzRegistry, UtcOffset,
 };
 use pyo3::exceptions::{PyKeyError, PyOSError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -21,6 +22,7 @@ struct PyDateTimeTypes {
     datetime_cls: Py<PyAny>,
     time_cls: Py<PyAny>,
     timedelta_cls: Py<PyAny>,
+    timezone_cls: Py<PyAny>,
     utc_tz: Py<PyAny>,
     zoneinfo_cls: Option<Py<PyAny>>,
 }
@@ -42,6 +44,7 @@ fn dt_types(py: Python<'_>) -> PyResult<&PyDateTimeTypes> {
             datetime_cls: dt_mod.getattr("datetime")?.unbind(),
             time_cls: dt_mod.getattr("time")?.unbind(),
             timedelta_cls: dt_mod.getattr("timedelta")?.unbind(),
+            timezone_cls: tz_cls.unbind(),
             utc_tz,
             zoneinfo_cls,
         })
@@ -67,27 +70,86 @@ fn cal_time_to_py(py: Python<'_>, t: CalTime) -> PyResult<Bound<'_, PyAny>> {
     types.time_cls.bind(py).call1((t.hour, t.minute, t.second))
 }
 
-/// Resolve an optional `TimeZoneRef` into a Python `tzinfo` object when possible.
-fn tzref_to_py<'py>(py: Python<'py>, tz: &TimeZoneRef) -> PyResult<Option<Bound<'py, PyAny>>> {
+fn fixed_tz_to_py<'py>(
+    py: Python<'py>,
+    offset_seconds: i32,
+    name: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    let types = dt_types(py)?;
+    let delta = types
+        .timedelta_cls
+        .bind(py)
+        .call1((0_i32, offset_seconds))?;
+    types.timezone_cls.bind(py).call1((delta, name))
+}
+
+/// Resolve an optional `TimeZoneRef` into a Python `tzinfo` object using `TzRegistry` + `zoneinfo`.
+fn tzref_to_py<'py>(
+    py: Python<'py>,
+    registry: &TzRegistry,
+    date: CalDate,
+    time: CalTime,
+    tz: &TimeZoneRef,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
     let types = dt_types(py)?;
     match tz {
         TimeZoneRef::Utc => Ok(Some(types.utc_tz.bind(py).clone())),
         TimeZoneRef::Floating => Ok(None),
         TimeZoneRef::TzId(id) => {
+            let canonical = registry.resolve_canonical_iana(id.as_str());
+            if canonical.as_deref() == Some("UTC") {
+                return Ok(Some(types.utc_tz.bind(py).clone()));
+            }
+
+            // Prefer custom compiled VTIMEZONE when TZID is not a standard IANA zone.
+            if registry.has_custom_vtimezone(id.as_str()) && canonical.is_none() {
+                if let Some(cal_tz) = registry.resolve(id.as_str()) {
+                    if let Ok(resolved) =
+                        cal_tz.resolve_local(date, time, DstDisambiguation::Compatible)
+                    {
+                        return Ok(Some(fixed_tz_to_py(
+                            py,
+                            resolved.offset_seconds,
+                            id.as_str(),
+                        )?));
+                    }
+                }
+            }
+
+            // Try Python's ZoneInfo using canonical IANA name (handles Windows/Outlook CLDR aliases too).
+            let lookup_key = canonical.as_deref().unwrap_or(id.as_str());
             if let Some(zi_cls) = &types.zoneinfo_cls {
-                if let Ok(zi) = zi_cls.bind(py).call1((id.as_str(),)) {
+                if let Ok(zi) = zi_cls.bind(py).call1((lookup_key,)) {
                     return Ok(Some(zi));
                 }
             }
+
+            // Fallback to bundled Rust IANA TZDB / VTIMEZONE / fixed-offset engine.
+            if let Some(cal_tz) = registry.resolve(id.as_str()) {
+                if let Ok(resolved) =
+                    cal_tz.resolve_local(date, time, DstDisambiguation::Compatible)
+                {
+                    return Ok(Some(fixed_tz_to_py(
+                        py,
+                        resolved.offset_seconds,
+                        lookup_key,
+                    )?));
+                }
+            }
+
             Ok(None)
         }
     }
 }
 
 /// Convert a `CalDateTime` into a Python `datetime.datetime`.
-fn cal_datetime_to_py<'py>(py: Python<'py>, dt: &CalDateTime) -> PyResult<Bound<'py, PyAny>> {
+fn cal_datetime_to_py<'py>(
+    py: Python<'py>,
+    registry: &TzRegistry,
+    dt: &CalDateTime,
+) -> PyResult<Bound<'py, PyAny>> {
     let types = dt_types(py)?;
-    let tzinfo = tzref_to_py(py, &dt.tz)?;
+    let tzinfo = tzref_to_py(py, registry, dt.date, dt.time, &dt.tz)?;
     // Clamp leap second 60 -> 59 for Python datetime compatibility.
     let sec = dt.time.second.min(59);
     types.datetime_cls.bind(py).call1((
@@ -112,15 +174,19 @@ fn cal_duration_to_py(py: Python<'_>, dur: CalDuration) -> PyResult<Bound<'_, Py
 }
 
 /// Convert a `CalPeriod` into a Python tuple `(start_datetime, end_datetime_or_timedelta)`.
-fn cal_period_to_py<'py>(py: Python<'py>, period: &CalPeriod) -> PyResult<Bound<'py, PyTuple>> {
+fn cal_period_to_py<'py>(
+    py: Python<'py>,
+    registry: &TzRegistry,
+    period: &CalPeriod,
+) -> PyResult<Bound<'py, PyTuple>> {
     match period {
         CalPeriod::Explicit { start, end } => {
-            let s = cal_datetime_to_py(py, start)?;
-            let e = cal_datetime_to_py(py, end)?;
+            let s = cal_datetime_to_py(py, registry, start)?;
+            let e = cal_datetime_to_py(py, registry, end)?;
             PyTuple::new(py, [s, e])
         }
         CalPeriod::Duration { start, duration } => {
-            let s = cal_datetime_to_py(py, start)?;
+            let s = cal_datetime_to_py(py, registry, start)?;
             let d = cal_duration_to_py(py, *duration)?;
             PyTuple::new(py, [s, d])
         }
@@ -137,7 +203,11 @@ fn utc_offset_to_py(py: Python<'_>, offset: UtcOffset) -> PyResult<Bound<'_, PyA
 }
 
 /// Convert a Rust `PropertyValue` lazily into a native Python object on demand.
-fn property_value_to_py<'py>(py: Python<'py>, val: &PropertyValue) -> PyResult<Bound<'py, PyAny>> {
+fn property_value_to_py<'py>(
+    py: Python<'py>,
+    registry: &TzRegistry,
+    val: &PropertyValue,
+) -> PyResult<Bound<'py, PyAny>> {
     match val {
         PropertyValue::Text(s)
         | PropertyValue::Uri(s)
@@ -150,7 +220,7 @@ fn property_value_to_py<'py>(py: Python<'py>, val: &PropertyValue) -> PyResult<B
             Ok(list.into_any())
         }
         PropertyValue::Date(d) => cal_date_to_py(py, *d),
-        PropertyValue::DateTime(dt) => cal_datetime_to_py(py, dt),
+        PropertyValue::DateTime(dt) => cal_datetime_to_py(py, registry, dt),
         PropertyValue::DateList(items) => {
             let py_items: Vec<Bound<'py, PyAny>> = items
                 .iter()
@@ -161,16 +231,16 @@ fn property_value_to_py<'py>(py: Python<'py>, val: &PropertyValue) -> PyResult<B
         PropertyValue::DateTimeList(items) => {
             let py_items: Vec<Bound<'py, PyAny>> = items
                 .iter()
-                .map(|dt| cal_datetime_to_py(py, dt))
+                .map(|dt| cal_datetime_to_py(py, registry, dt))
                 .collect::<PyResult<_>>()?;
             Ok(PyList::new(py, py_items)?.into_any())
         }
         PropertyValue::Duration(dur) => cal_duration_to_py(py, *dur),
-        PropertyValue::Period(p) => Ok(cal_period_to_py(py, p)?.into_any()),
+        PropertyValue::Period(p) => Ok(cal_period_to_py(py, registry, p)?.into_any()),
         PropertyValue::PeriodList(items) => {
             let py_items: Vec<Bound<'py, PyTuple>> = items
                 .iter()
-                .map(|p| cal_period_to_py(py, p))
+                .map(|p| cal_period_to_py(py, registry, p))
                 .collect::<PyResult<_>>()?;
             Ok(PyList::new(py, py_items)?.into_any())
         }
@@ -222,6 +292,7 @@ fn extract_input_source(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Inp
 #[derive(Clone)]
 pub struct PyComponent {
     cal: Arc<CoreCalendar>,
+    tz_registry: Arc<OnceLock<TzRegistry>>,
     id: ComponentId,
 }
 
@@ -230,6 +301,10 @@ impl PyComponent {
         self.cal
             .component(self.id)
             .ok_or_else(|| PyKeyError::new_err("invalid component id"))
+    }
+
+    fn registry(&self) -> &TzRegistry {
+        self.tz_registry.get_or_init(|| self.cal.tz_registry())
     }
 }
 
@@ -272,7 +347,7 @@ impl PyComponent {
         let comp = self.node_ref()?;
         let pname = PropertyName::parse(key);
         match comp.property(&pname) {
-            Some(prop) => Ok(property_value_to_py(py, &prop.value)?.unbind()),
+            Some(prop) => Ok(property_value_to_py(py, self.registry(), &prop.value)?.unbind()),
             None => Ok(default.unwrap_or_else(|| py.None())),
         }
     }
@@ -281,9 +356,10 @@ impl PyComponent {
     fn get_all<'py>(&self, py: Python<'py>, key: &str) -> PyResult<Bound<'py, PyList>> {
         let comp = self.node_ref()?;
         let pname = PropertyName::parse(key);
+        let reg = self.registry();
         let mut items = Vec::new();
         for prop in comp.properties_named(&pname) {
-            items.push(property_value_to_py(py, &prop.value)?);
+            items.push(property_value_to_py(py, reg, &prop.value)?);
         }
         PyList::new(py, items)
     }
@@ -320,6 +396,7 @@ impl PyComponent {
             .children()
             .map(|c| PyComponent {
                 cal: Arc::clone(&self.cal),
+                tz_registry: Arc::clone(&self.tz_registry),
                 id: c.id(),
             })
             .collect())
@@ -338,7 +415,7 @@ impl PyComponent {
         let comp = self.node_ref()?;
         let pname = PropertyName::parse(key);
         match comp.property(&pname) {
-            Some(prop) => Ok(property_value_to_py(py, &prop.value)?.unbind()),
+            Some(prop) => Ok(property_value_to_py(py, self.registry(), &prop.value)?.unbind()),
             None => Err(PyKeyError::new_err(key.to_owned())),
         }
     }
@@ -363,6 +440,7 @@ impl PyComponent {
 #[pyclass(name = "Calendar", frozen)]
 pub struct PyCalendar {
     inner: Arc<CoreCalendar>,
+    tz_registry: Arc<OnceLock<TzRegistry>>,
 }
 
 #[pymethods]
@@ -398,6 +476,7 @@ impl PyCalendar {
 
         Ok(Self {
             inner: Arc::new(cal),
+            tz_registry: Arc::new(OnceLock::new()),
         })
     }
 
@@ -424,7 +503,57 @@ impl PyCalendar {
         }
         Self {
             inner: Arc::new(cal),
+            tz_registry: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Return a new [`Calendar`] with missing RFC 5545 `VTIMEZONE` definitions injected.
+    fn add_missing_timezones(&self, py: Python<'_>) -> Self {
+        let updated = py.allow_threads(|| {
+            let mut cloned = (*self.inner).clone();
+            let _ = cloned.add_missing_timezones();
+            cloned
+        });
+        Self {
+            inner: Arc::new(updated),
+            tz_registry: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Resolve the UTC offset for `tzid` at local wall time `dt`, or `None` if unknown.
+    #[pyo3(signature = (tzid, dt))]
+    fn resolve_utc_offset<'py>(
+        &self,
+        py: Python<'py>,
+        tzid: &str,
+        dt: &Bound<'py, PyAny>,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let year = dt.getattr("year")?.extract::<i16>()?;
+        let month = dt.getattr("month")?.extract::<u8>()?;
+        let day = dt.getattr("day")?.extract::<u8>()?;
+        let hour = dt.getattr("hour")?.extract::<u8>()?;
+        let minute = dt.getattr("minute")?.extract::<u8>()?;
+        let second = dt.getattr("second")?.extract::<u8>()?;
+
+        let cal_date =
+            CalDate::new(year, month, day).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let cal_time =
+            CalTime::new(hour, minute, second).map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        let reg = self.registry();
+        let Some(cal_tz) = reg.resolve(tzid) else {
+            return Ok(None);
+        };
+        let Ok(resolved) = cal_tz.resolve_local(cal_date, cal_time, DstDisambiguation::Compatible)
+        else {
+            return Ok(None);
+        };
+        let types = dt_types(py)?;
+        let delta = types
+            .timedelta_cls
+            .bind(py)
+            .call1((0_i32, resolved.offset_seconds))?;
+        Ok(Some(delta))
     }
 
     /// Serialize this calendar to RFC 5545 folded UTF-8 `bytes`.
@@ -441,6 +570,11 @@ impl PyCalendar {
     #[getter]
     fn prodid(&self) -> Option<String> {
         self.inner.prodid().map(str::to_owned)
+    }
+
+    #[getter]
+    fn default_timezone(&self) -> Option<String> {
+        self.registry().default_tzid().map(str::to_owned)
     }
 
     #[getter]
@@ -484,6 +618,7 @@ impl PyCalendar {
             .children()
             .map(|c| PyComponent {
                 cal: Arc::clone(&self.inner),
+                tz_registry: Arc::clone(&self.tz_registry),
                 id: c.id(),
             })
             .collect()
@@ -509,11 +644,16 @@ impl PyCalendar {
 }
 
 impl PyCalendar {
+    fn registry(&self) -> &TzRegistry {
+        self.tz_registry.get_or_init(|| self.inner.tz_registry())
+    }
+
     fn collect_kind(&self, kind: ComponentKind) -> Vec<PyComponent> {
         self.inner
             .components_of_kind(kind)
             .map(|c| PyComponent {
                 cal: Arc::clone(&self.inner),
+                tz_registry: Arc::clone(&self.tz_registry),
                 id: c.id(),
             })
             .collect()

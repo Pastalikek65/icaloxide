@@ -295,6 +295,18 @@ impl Calendar {
         self.root().property_text(&PropertyName::ProdId)
     }
 
+    /// Build a timezone registry from this calendar's `VTIMEZONE`s, `X-WR-TIMEZONE`,
+    /// bundled IANA TZDB, and Windows CLDR aliases.
+    pub fn tz_registry(&self) -> crate::tz::TzRegistry {
+        crate::tz::TzRegistry::from_calendar(self)
+    }
+
+    /// Inject missing RFC 5545 `VTIMEZONE` definitions for all non-UTC `TZID`s
+    /// referenced in this calendar, returning the added `TZID`s.
+    pub fn add_missing_timezones(&mut self) -> Vec<CompactString> {
+        crate::tz::add_missing_timezones(self)
+    }
+
     /// Serialize this calendar to an RFC 5545 folded string (`\r\n` endings, 75-octet limit).
     pub fn to_ical(&self) -> String {
         let mut out = String::with_capacity(self.arena.len() * 128);
