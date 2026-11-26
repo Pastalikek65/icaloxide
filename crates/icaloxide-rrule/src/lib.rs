@@ -1,18 +1,14 @@
-//! RFC 5545 recurrence rule (`RRULE`), exception resolution, and interval-pruned query engine.
-//!
-//! Full implementation arrives in Phase 3 of the `icaloxide` roadmap.
+//! RFC 5545 recurrence rule (`RRULE`), exception resolution, and interval-pruned calendar query engine.
 
 #![forbid(unsafe_code)]
 
-pub use icaloxide_core::Calendar;
+pub mod error;
+pub mod query;
+pub mod recurrence;
+pub mod rrule;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn workspace_core_link_works() {
-        let cal = Calendar::new();
-        assert_eq!(cal.component_count(), 1);
-    }
-}
+pub use error::{IterationBudget, RRuleError};
+pub use query::{AfterIter, CalendarQuery, Occurrence, QueryOptions};
+pub use rrule::{
+    expand_rrule, ByWeekday, Frequency, LocalDateTime, RRule, RRuleIter, UntilValue, Weekday,
+};

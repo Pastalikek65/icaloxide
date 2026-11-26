@@ -17,7 +17,7 @@
 - [x] **Phase 0**: Workspace, CI/CD, licensing, dual-crate Rust + Maturin (`abi3-py39`) build
 - [x] **Phase 1**: `icaloxide-core` (Lexer, RFC 5545/7986/9073/7953 AST, zero-regex temporals, Strict/Lenient parser, 75-octet writer, lazy PyO3 bindings)
 - [x] **Phase 2**: IANA TZDB + CLDR Windows TZID mapping + `VTIMEZONE` compiler & transition cache
-- [ ] **Phase 3**: `icaloxide-rrule` (`RRULE`, `RDATE`, `EXDATE`, `RECURRENCE-ID`, `THISANDFUTURE`, interval pruning index, `at`/`between`/`after`/`count`)
+- [x] **Phase 3**: `icaloxide-rrule` (`RRULE`, `RDATE`, `EXDATE`, `RECURRENCE-ID`, `THISANDFUTURE`, interval pruning index, `at`/`between`/`after`/`count`)
 - [ ] **Phase 4**: Full modern Python API + `icalendar` / `recurring_ical_events` drop-in `compat` layer
 - [ ] **Phase 5**: Differential verification against `icalendar` + `recurring-ical-events` & fuzzing
 - [ ] **Phase 6**: Criterion & Python speed / peak RSS memory benchmarks

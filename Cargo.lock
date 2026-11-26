@@ -61,14 +61,19 @@ version = "0.1.0"
 dependencies = [
  "compact_str",
  "icaloxide-core",
+ "icaloxide-rrule",
  "pyo3",
+ "smallvec",
 ]
 
 [[package]]
 name = "icaloxide-rrule"
 version = "0.1.0"
 dependencies = [
+ "compact_str",
  "icaloxide-core",
+ "rustc-hash",
+ "smallvec",
  "thiserror",
 ]
 

@@ -17,4 +17,6 @@ crate-type = ["cdylib"]
 [dependencies]
 compact_str = { workspace = true }
 icaloxide-core = { path = "../icaloxide-core" }
+icaloxide-rrule = { path = "../icaloxide-rrule" }
 pyo3 = { workspace = true }
+smallvec = { workspace = true }
