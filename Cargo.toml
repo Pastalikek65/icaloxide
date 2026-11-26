@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/icaloxide-core",
+    "crates/icaloxide-rrule",
+    "crates/icaloxide-py",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Pastalikek65/icaloxide"
+rust-version = "1.82"
+
+[workspace.dependencies]
+memchr = "2.7"
+smallvec = { version = "1.13", features = ["union", "const_generics"] }
+compact_str = "0.8"
+thiserror = "2.0"
+rustc-hash = "2.1"
+pyo3 = { version = "0.24", features = ["abi3-py39"] }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+strip = "symbols"

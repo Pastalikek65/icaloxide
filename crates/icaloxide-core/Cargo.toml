@@ -1,0 +1,18 @@
+[package]
+name = "icaloxide-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "High-performance, zero-regex RFC 5545/7986/9073/7953 iCalendar parser, compact arena AST, and 75-octet writer."
+
+[lints]
+workspace = true
+
+[dependencies]
+compact_str = { workspace = true }
+memchr = { workspace = true }
+rustc-hash = { workspace = true }
+smallvec = { workspace = true }
+thiserror = { workspace = true }

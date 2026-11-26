@@ -1,0 +1,15 @@
+[package]
+name = "icaloxide-rrule"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "High-performance RFC 5545 RRULE expansion, recurrence resolution, and interval-pruned calendar query engine."
+
+[lints]
+workspace = true
+
+[dependencies]
+icaloxide-core = { path = "../icaloxide-core" }
+thiserror = { workspace = true }

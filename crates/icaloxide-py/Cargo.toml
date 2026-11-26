@@ -1,0 +1,20 @@
+[package]
+name = "icaloxide-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "PyO3 (abi3) Python bindings for icaloxide."
+
+[lints]
+workspace = true
+
+[lib]
+name = "_icaloxide"
+crate-type = ["cdylib"]
+
+[dependencies]
+compact_str = { workspace = true }
+icaloxide-core = { path = "../icaloxide-core" }
+pyo3 = { workspace = true }
