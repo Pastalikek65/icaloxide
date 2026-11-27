@@ -312,6 +312,134 @@ impl Calendar {
         crate::tz::add_missing_timezones(self)
     }
 
+    /// Return all unique non-UTC `TZID` strings referenced in this calendar.
+    pub fn used_tzids(&self) -> Vec<CompactString> {
+        crate::tz::collect_used_tzids(self)
+    }
+
+    /// Return all referenced non-UTC `TZID` strings missing a `VTIMEZONE` block.
+    pub fn missing_tzids(&self) -> Vec<CompactString> {
+        crate::tz::collect_missing_tzids(self)
+    }
+
+    /// Return all component IDs matching `uid` anywhere in the calendar.
+    pub fn components_with_uid(&self, uid: &str) -> Vec<ComponentId> {
+        let mut out = Vec::new();
+        for (idx, node) in self.arena.nodes.iter().enumerate() {
+            let id = ComponentId(idx as u32);
+            if id == self.root {
+                continue;
+            }
+            if node
+                .properties
+                .iter()
+                .find(|p| p.name == PropertyName::Uid)
+                .and_then(|p| p.value.as_str())
+                == Some(uid)
+            {
+                out.push(id);
+            }
+        }
+        out
+    }
+
+    /// Validate core RFC 5545 structural invariants across the calendar.
+    pub fn validate(&self) -> Vec<ParseWarning> {
+        let mut issues = Vec::new();
+        let root = self.root();
+        if root.property_text(&PropertyName::Version) != Some("2.0") {
+            issues.push(ParseWarning {
+                line: 1,
+                message: CompactString::const_new("VCALENDAR missing VERSION:2.0"),
+            });
+        }
+        if root.property_text(&PropertyName::ProdId).is_none() {
+            issues.push(ParseWarning {
+                line: 1,
+                message: CompactString::const_new("VCALENDAR missing PRODID"),
+            });
+        }
+
+        for (idx, node) in self.arena.nodes.iter().enumerate() {
+            let comp = ComponentRef {
+                arena: &self.arena,
+                id: ComponentId(idx as u32),
+            };
+            match node.kind {
+                ComponentKind::VEvent => {
+                    if comp.uid().is_none() {
+                        issues.push(ParseWarning {
+                            line: 1,
+                            message: CompactString::const_new("VEVENT missing required UID"),
+                        });
+                    }
+                    if comp.property(&PropertyName::DtStamp).is_none() {
+                        issues.push(ParseWarning {
+                            line: 1,
+                            message: CompactString::const_new("VEVENT missing required DTSTAMP"),
+                        });
+                    }
+                    if let (Some(PropertyValue::DateTime(s)), Some(PropertyValue::DateTime(e))) = (
+                        comp.property(&PropertyName::DtStart).map(|p| &p.value),
+                        comp.property(&PropertyName::DtEnd).map(|p| &p.value),
+                    ) {
+                        if matches!(
+                            (&s.tz, &e.tz),
+                            (
+                                crate::datetime::TimeZoneRef::Utc,
+                                crate::datetime::TimeZoneRef::Utc
+                            ) | (
+                                crate::datetime::TimeZoneRef::Floating,
+                                crate::datetime::TimeZoneRef::Floating
+                            )
+                        ) && e.to_naive_timestamp() < s.to_naive_timestamp()
+                        {
+                            issues.push(ParseWarning {
+                                line: 1,
+                                message: CompactString::const_new("VEVENT DTEND precedes DTSTART"),
+                            });
+                        }
+                    }
+                }
+                ComponentKind::VAlarm => {
+                    if comp.property(&PropertyName::Action).is_none() {
+                        issues.push(ParseWarning {
+                            line: 1,
+                            message: CompactString::const_new("VALARM missing required ACTION"),
+                        });
+                    }
+                    if comp.property(&PropertyName::Trigger).is_none() {
+                        issues.push(ParseWarning {
+                            line: 1,
+                            message: CompactString::const_new("VALARM missing required TRIGGER"),
+                        });
+                    }
+                }
+                ComponentKind::VTimezone => {
+                    if comp.property_text(&PropertyName::TzId).is_none() {
+                        issues.push(ParseWarning {
+                            line: 1,
+                            message: CompactString::const_new("VTIMEZONE missing required TZID"),
+                        });
+                    }
+                    let has_obs = comp.children().any(|c| {
+                        matches!(c.kind(), ComponentKind::Standard | ComponentKind::Daylight)
+                    });
+                    if !has_obs {
+                        issues.push(ParseWarning {
+                            line: 1,
+                            message: CompactString::const_new(
+                                "VTIMEZONE missing STANDARD or DAYLIGHT subcomponent",
+                            ),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        issues
+    }
+
     /// Serialize this calendar to an RFC 5545 folded string (`\r\n` endings, 75-octet limit).
     pub fn to_ical(&self) -> String {
         let mut out = String::with_capacity(self.arena.len() * 128);

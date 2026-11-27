@@ -256,14 +256,19 @@ END:VCALENDAR\r\n";
     );
     assert_eq!(occs[3].start_utc, utc_ts(2026, 3, 11, 13, 0, 0));
 
-    // THISANDFUTURE check: Jan 1 & Jan 8 from master; Jan 15+ truncated on master, override emits Jan 15 at 14:00Z
+    // THISANDFUTURE check: Jan 1 & Jan 8 at 10:00Z from master; Jan 15 & Jan 22 shifted to 14:00Z with "New Time"
     let tf_occs = query
         .between(utc_ts(2026, 1, 1, 0, 0, 0), utc_ts(2026, 1, 31, 0, 0, 0))
         .unwrap();
-    assert_eq!(tf_occs.len(), 3);
+    assert_eq!(tf_occs.len(), 4);
     assert_eq!(tf_occs[0].start_utc, utc_ts(2026, 1, 1, 10, 0, 0));
     assert_eq!(tf_occs[1].start_utc, utc_ts(2026, 1, 8, 10, 0, 0));
     assert_eq!(tf_occs[2].start_utc, utc_ts(2026, 1, 15, 14, 0, 0));
+    assert_eq!(tf_occs[3].start_utc, utc_ts(2026, 1, 22, 14, 0, 0));
+    assert_eq!(
+        cal.component(tf_occs[3].component_id).unwrap().summary(),
+        Some("New Time")
+    );
 }
 
 #[test]
@@ -347,4 +352,98 @@ END:VCALENDAR\r\n";
     assert_eq!(multi_occs[1].start_utc, utc_ts(2026, 1, 2, 9, 50, 0));
     assert_eq!(multi_occs[2].kind, ComponentKind::VFreeBusy);
     assert_eq!(multi_occs[3].kind, ComponentKind::VTodo);
+}
+
+#[test]
+fn rdate_period_thisandfuture_split_skip_bad_and_valarm_after() {
+    let ics = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+PRODID:-//icaloxide//v02-test//EN\r\n\
+BEGIN:VEVENT\r\n\
+UID:rdate-per\r\n\
+DTSTART:20260101T100000Z\r\n\
+DURATION:PT1H\r\n\
+RDATE;VALUE=PERIOD:20260105T120000Z/PT3H\r\n\
+SUMMARY:With Period RDATE\r\n\
+BEGIN:VALARM\r\n\
+ACTION:DISPLAY\r\n\
+TRIGGER:-PT30M\r\n\
+DESCRIPTION:Alarm\r\n\
+END:VALARM\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\n\
+UID:split-tf\r\n\
+DTSTART:20260201T090000Z\r\n\
+DURATION:PT1H\r\n\
+RRULE:FREQ=WEEKLY;COUNT=4\r\n\
+SUMMARY:Phase A\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\n\
+UID:split-tf\r\n\
+RECURRENCE-ID;RANGE=THISANDFUTURE:20260215T090000Z\r\n\
+DTSTART:20260215T140000Z\r\n\
+DURATION:PT2H\r\n\
+SUMMARY:Phase B Shifted\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\n\
+UID:bad-series\r\n\
+DTSTART:20260101T000000Z\r\n\
+RRULE:FREQ=INVALID_FREQ\r\n\
+SUMMARY:Broken\r\n\
+END:VEVENT\r\n\
+BEGIN:VAVAILABILITY\r\n\
+UID:avail-container\r\n\
+BEGIN:AVAILABLE\r\n\
+UID:avail-win\r\n\
+DTSTART:20260110T090000Z\r\n\
+DTEND:20260110T170000Z\r\n\
+RRULE:FREQ=DAILY;COUNT=2\r\n\
+SUMMARY:Office Hours\r\n\
+END:AVAILABLE\r\n\
+END:VAVAILABILITY\r\n\
+END:VCALENDAR\r\n";
+
+    let cal = Arc::new(Calendar::parse_str(ics).unwrap());
+    let opts = QueryOptions {
+        components: smallvec![ComponentKind::VEvent, ComponentKind::Available],
+        skip_bad_series: true,
+        ..QueryOptions::default()
+    };
+    let q = Arc::new(CalendarQuery::new(Arc::clone(&cal), opts).unwrap());
+    assert_eq!(q.suppressed_errors().len(), 1);
+
+    // Period RDATE preserves 3-hour custom span
+    let jan = q
+        .between(utc_ts(2026, 1, 1, 0, 0, 0), utc_ts(2026, 1, 15, 0, 0, 0))
+        .unwrap();
+    assert_eq!(jan.len(), 4); // Jan 1 (1h), Jan 5 (3h), Jan 10 (8h), Jan 11 (8h)
+    assert_eq!(jan[1].end_utc - jan[1].start_utc, 3 * 3600);
+    assert_eq!(jan[2].kind, ComponentKind::Available);
+
+    // THISANDFUTURE shifted Feb 15 & Feb 22 to 14:00Z (2h) while keeping Feb 1 & Feb 8 at 09:00Z (1h)
+    let feb = q
+        .between(utc_ts(2026, 2, 1, 0, 0, 0), utc_ts(2026, 2, 28, 0, 0, 0))
+        .unwrap();
+    assert_eq!(feb.len(), 4);
+    assert_eq!(feb[0].start_utc, utc_ts(2026, 2, 1, 9, 0, 0));
+    assert_eq!(feb[1].start_utc, utc_ts(2026, 2, 8, 9, 0, 0));
+    assert_eq!(feb[2].start_utc, utc_ts(2026, 2, 15, 14, 0, 0));
+    assert_eq!(feb[2].end_utc - feb[2].start_utc, 2 * 3600);
+    assert_eq!(feb[3].start_utc, utc_ts(2026, 2, 22, 14, 0, 0));
+
+    // VALARM streaming after()
+    let alarm_opts = QueryOptions {
+        components: smallvec![ComponentKind::VAlarm],
+        skip_bad_series: true,
+        ..QueryOptions::default()
+    };
+    let alarm_q = Arc::new(CalendarQuery::new(Arc::clone(&cal), alarm_opts).unwrap());
+    let alarms: Vec<_> = alarm_q
+        .after(utc_ts(2026, 1, 1, 0, 0, 0))
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(alarms.len(), 2);
+    assert_eq!(alarms[0].start_utc, utc_ts(2026, 1, 1, 9, 30, 0));
+    assert_eq!(alarms[1].start_utc, utc_ts(2026, 1, 5, 11, 30, 0));
 }

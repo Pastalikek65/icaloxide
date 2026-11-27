@@ -9,6 +9,42 @@ use crate::model::{
 };
 use crate::tz::TzRegistry;
 
+/// Return all unique non-UTC `TZID` identifiers referenced anywhere in `cal`.
+pub fn collect_used_tzids(cal: &Calendar) -> Vec<CompactString> {
+    let mut referenced: BTreeSet<CompactString> = BTreeSet::new();
+    let mut min_year: i16 = i16::MAX;
+    let mut max_year: i16 = i16::MIN;
+    collect_tzids_and_years(
+        cal,
+        cal.root_id(),
+        &mut referenced,
+        &mut min_year,
+        &mut max_year,
+    );
+    referenced
+        .into_iter()
+        .filter(|tzid| {
+            !tzid.eq_ignore_ascii_case("UTC")
+                && !tzid.eq_ignore_ascii_case("Etc/UTC")
+                && !tzid.eq_ignore_ascii_case("GMT")
+        })
+        .collect()
+}
+
+/// Return all referenced non-UTC `TZID`s that do not have a corresponding `VTIMEZONE` in `cal`.
+pub fn collect_missing_tzids(cal: &Calendar) -> Vec<CompactString> {
+    let mut existing: BTreeSet<CompactString> = BTreeSet::new();
+    for vtz in cal.timezones() {
+        if let Some(id) = vtz.property_text(&PropertyName::TzId) {
+            existing.insert(CompactString::from(id));
+        }
+    }
+    collect_used_tzids(cal)
+        .into_iter()
+        .filter(|tzid| !existing.contains(tzid))
+        .collect()
+}
+
 /// Inspect all `TZID` references in `cal` and inject missing `VTIMEZONE` definitions
 /// using the bundled IANA TZDB.
 ///

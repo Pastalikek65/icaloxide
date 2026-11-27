@@ -6,9 +6,9 @@ use std::sync::{Arc, OnceLock};
 
 use compact_str::CompactString;
 use icaloxide_core::{
-    CalDate, CalDateTime, CalDuration, CalPeriod, CalTime, Calendar as CoreCalendar, ComponentId,
-    ComponentKind, DstDisambiguation, ParseOptions, PropertyName, PropertyValue, TimeZoneRef,
-    TzRegistry, UtcOffset,
+    CalDate, CalDateTime, CalDuration, CalPeriod, CalTime, Calendar as CoreCalendar,
+    CalendarTimeZone, ComponentId, ComponentKind, DstDisambiguation, ParamName, Parameter,
+    ParseOptions, Property, PropertyName, PropertyValue, TimeZoneRef, TzRegistry, UtcOffset,
 };
 use icaloxide_rrule::{AfterIter, CalendarQuery, Occurrence, QueryOptions, RRuleError};
 use pyo3::exceptions::{PyKeyError, PyOSError, PyTypeError, PyValueError};
@@ -61,7 +61,6 @@ fn rrule_err_to_py(err: &RRuleError) -> PyErr {
     PyValueError::new_err(err.to_string())
 }
 
-/// Convert a `CalDate` into a Python `datetime.date`.
 fn cal_date_to_py(py: Python<'_>, d: CalDate) -> PyResult<Bound<'_, PyAny>> {
     let types = dt_types(py)?;
     types
@@ -70,7 +69,6 @@ fn cal_date_to_py(py: Python<'_>, d: CalDate) -> PyResult<Bound<'_, PyAny>> {
         .call1((i32::from(d.year), d.month, d.day))
 }
 
-/// Convert a `CalTime` into a Python `datetime.time`.
 fn cal_time_to_py(py: Python<'_>, t: CalTime) -> PyResult<Bound<'_, PyAny>> {
     let types = dt_types(py)?;
     types.time_cls.bind(py).call1((t.hour, t.minute, t.second))
@@ -89,7 +87,6 @@ fn fixed_tz_to_py<'py>(
     types.timezone_cls.bind(py).call1((delta, name))
 }
 
-/// Resolve an optional `TimeZoneRef` into a Python `tzinfo` object using `TzRegistry` + `zoneinfo`.
 fn tzref_to_py<'py>(
     py: Python<'py>,
     registry: &TzRegistry,
@@ -107,7 +104,6 @@ fn tzref_to_py<'py>(
                 return Ok(Some(types.utc_tz.bind(py).clone()));
             }
 
-            // Prefer custom compiled VTIMEZONE when TZID is not a standard IANA zone.
             if registry.has_custom_vtimezone(id.as_str()) && canonical.is_none() {
                 if let Some(cal_tz) = registry.resolve(id.as_str()) {
                     if let Ok(resolved) =
@@ -122,7 +118,6 @@ fn tzref_to_py<'py>(
                 }
             }
 
-            // Try Python's ZoneInfo using canonical IANA name (handles Windows/Outlook CLDR aliases too).
             let lookup_key = canonical.as_deref().unwrap_or(id.as_str());
             if let Some(zi_cls) = &types.zoneinfo_cls {
                 if let Ok(zi) = zi_cls.bind(py).call1((lookup_key,)) {
@@ -130,7 +125,6 @@ fn tzref_to_py<'py>(
                 }
             }
 
-            // Fallback to bundled Rust IANA TZDB / VTIMEZONE / fixed-offset engine.
             if let Some(cal_tz) = registry.resolve(id.as_str()) {
                 if let Ok(resolved) =
                     cal_tz.resolve_local(date, time, DstDisambiguation::Compatible)
@@ -148,7 +142,6 @@ fn tzref_to_py<'py>(
     }
 }
 
-/// Convert a `CalDateTime` into a Python `datetime.datetime`.
 fn cal_datetime_to_py<'py>(
     py: Python<'py>,
     registry: &TzRegistry,
@@ -169,7 +162,6 @@ fn cal_datetime_to_py<'py>(
     ))
 }
 
-/// Convert a `CalDuration` into a Python `datetime.timedelta`.
 fn cal_duration_to_py(py: Python<'_>, dur: CalDuration) -> PyResult<Bound<'_, PyAny>> {
     let types = dt_types(py)?;
     let total = dur.total_seconds();
@@ -178,7 +170,6 @@ fn cal_duration_to_py(py: Python<'_>, dur: CalDuration) -> PyResult<Bound<'_, Py
     types.timedelta_cls.bind(py).call1((days, secs))
 }
 
-/// Convert a `CalPeriod` into a Python tuple `(start_datetime, end_datetime_or_timedelta)`.
 fn cal_period_to_py<'py>(
     py: Python<'py>,
     registry: &TzRegistry,
@@ -198,7 +189,6 @@ fn cal_period_to_py<'py>(
     }
 }
 
-/// Convert a `UtcOffset` into a Python `datetime.timedelta`.
 fn utc_offset_to_py(py: Python<'_>, offset: UtcOffset) -> PyResult<Bound<'_, PyAny>> {
     let types = dt_types(py)?;
     let total = i64::from(offset.seconds);
@@ -207,7 +197,6 @@ fn utc_offset_to_py(py: Python<'_>, offset: UtcOffset) -> PyResult<Bound<'_, PyA
     types.timedelta_cls.bind(py).call1((days, secs))
 }
 
-/// Convert a Rust `PropertyValue` lazily into a native Python object on demand.
 fn property_value_to_py<'py>(
     py: Python<'py>,
     registry: &TzRegistry,
@@ -258,10 +247,94 @@ fn property_value_to_py<'py>(
     }
 }
 
-/// Extract a query boundary from Python `datetime.datetime` or `datetime.date` into `(utc_seconds, is_date_only)`.
+enum PyInputTemporal {
+    Date(CalDate),
+    DateTime(CalDateTime),
+}
+
+fn py_to_temporal(
+    obj: &Bound<'_, PyAny>,
+    tzid_override: Option<&str>,
+) -> PyResult<PyInputTemporal> {
+    let year = obj.getattr("year")?.extract::<i16>()?;
+    let month = obj.getattr("month")?.extract::<u8>()?;
+    let day = obj.getattr("day")?.extract::<u8>()?;
+    let cal_date =
+        CalDate::new(year, month, day).map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    if !obj.hasattr("hour")? {
+        return Ok(PyInputTemporal::Date(cal_date));
+    }
+
+    let hour = obj.getattr("hour")?.extract::<u8>()?;
+    let minute = obj.getattr("minute")?.extract::<u8>()?;
+    let second = obj.getattr("second")?.extract::<u8>()?;
+    let cal_time =
+        CalTime::new(hour, minute, second).map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    let tz = if let Some(override_id) = tzid_override {
+        if override_id.eq_ignore_ascii_case("UTC") {
+            TimeZoneRef::Utc
+        } else {
+            TimeZoneRef::TzId(CompactString::from(override_id))
+        }
+    } else {
+        let tzinfo = obj.getattr("tzinfo")?;
+        if tzinfo.is_none() {
+            TimeZoneRef::Floating
+        } else {
+            let offset_obj = obj.call_method0("utcoffset")?;
+            let off_secs = offset_obj
+                .call_method0("total_seconds")?
+                .extract::<f64>()?
+                .round() as i64;
+            if let Ok(key) = tzinfo.getattr("key").and_then(|k| k.extract::<String>()) {
+                if key.eq_ignore_ascii_case("UTC") || key.eq_ignore_ascii_case("Etc/UTC") {
+                    TimeZoneRef::Utc
+                } else {
+                    TimeZoneRef::TzId(CompactString::from(key))
+                }
+            } else if off_secs == 0 {
+                TimeZoneRef::Utc
+            } else {
+                let sign = if off_secs < 0 { '-' } else { '+' };
+                let abs = off_secs.abs();
+                let h = abs / 3600;
+                let m = (abs % 3600) / 60;
+                TimeZoneRef::TzId(CompactString::from(format!("UTC{sign}{h:02}:{m:02}")))
+            }
+        }
+    };
+
+    Ok(PyInputTemporal::DateTime(CalDateTime {
+        date: cal_date,
+        time: cal_time,
+        tz,
+    }))
+}
+
+fn py_duration_to_cal(obj: &Bound<'_, PyAny>) -> PyResult<CalDuration> {
+    let total = obj.call_method0("total_seconds")?.extract::<f64>()?.round() as i64;
+    let negative = total < 0;
+    let abs = total.unsigned_abs();
+    let days = (abs / 86_400) as u32;
+    let rem = abs % 86_400;
+    let hours = (rem / 3_600) as u32;
+    let minutes = ((rem % 3_600) / 60) as u32;
+    let seconds = (rem % 60) as u32;
+    Ok(CalDuration {
+        negative,
+        weeks: 0,
+        days,
+        hours,
+        minutes,
+        seconds,
+    })
+}
+
 fn py_time_bound_to_utc(
     obj: &Bound<'_, PyAny>,
-    default_tz: &icaloxide_core::CalendarTimeZone,
+    default_tz: &CalendarTimeZone,
     is_end_bound: bool,
 ) -> PyResult<i64> {
     let year = obj.getattr("year")?.extract::<i16>()?;
@@ -270,7 +343,6 @@ fn py_time_bound_to_utc(
     let mut cal_date =
         CalDate::new(year, month, day).map_err(|e| PyValueError::new_err(e.to_string()))?;
 
-    // Must check datetime attributes BEFORE date because datetime subclasses date in Python.
     if obj.hasattr("hour")? {
         let hour = obj.getattr("hour")?.extract::<u8>()?;
         let minute = obj.getattr("minute")?.extract::<u8>()?;
@@ -315,7 +387,6 @@ fn py_time_bound_to_utc(
     }
 }
 
-/// Read raw bytes from `bytes`, `bytearray`, `memoryview`, `str`, or `os.PathLike`.
 enum InputSource {
     Bytes(Vec<u8>),
     Path(PathBuf),
@@ -346,7 +417,6 @@ fn extract_input_source(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Inp
     ))
 }
 
-/// Lazy proxy handle for a single iCalendar component (`VEVENT`, `VTODO`, `VALARM`, etc.).
 #[pyclass(name = "Component", frozen)]
 #[derive(Clone)]
 pub struct PyComponent {
@@ -488,7 +558,6 @@ impl PyComponent {
     }
 }
 
-/// Expanded occurrence of a recurring or single calendar component.
 #[pyclass(name = "Occurrence", frozen)]
 #[derive(Clone)]
 pub struct PyOccurrence {
@@ -573,6 +642,19 @@ impl PyOccurrence {
         }
     }
 
+    fn params<'py>(&self, py: Python<'py>, key: &str) -> PyResult<Bound<'py, PyDict>> {
+        let comp = self.comp()?;
+        let pname = PropertyName::parse(key);
+        let dict = PyDict::new(py);
+        if let Some(prop) = comp.property(&pname) {
+            for param in &prop.params {
+                let vals = PyList::new(py, param.values.iter().map(CompactString::as_str))?;
+                dict.set_item(param.name.as_str(), vals)?;
+            }
+        }
+        Ok(dict)
+    }
+
     #[pyo3(signature = (key, default=None))]
     fn get(&self, py: Python<'_>, key: &str, default: Option<PyObject>) -> PyResult<PyObject> {
         let pname = PropertyName::parse(key);
@@ -619,8 +701,12 @@ impl PyOccurrence {
         Ok(self.comp()?.property(&pname).is_some())
     }
 
-    /// Serialize this occurrence's component with occurrence-adjusted `DTSTART` / `DTEND` (or `DUE`).
-    fn to_ical<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+    #[pyo3(signature = (*, keep_recurrence_attributes=false))]
+    fn to_ical<'py>(
+        &self,
+        py: Python<'py>,
+        keep_recurrence_attributes: bool,
+    ) -> PyResult<Bound<'py, PyBytes>> {
         let comp = self.comp()?;
         let mut temp_cal = CoreCalendar::new();
         let copy_id = temp_cal.add_component(comp.kind().clone());
@@ -631,36 +717,40 @@ impl PyOccurrence {
         };
         if let Some(mut dst) = temp_cal.component_mut(copy_id) {
             for prop in comp.properties() {
-                if matches!(
+                let is_span = matches!(
                     prop.name,
                     PropertyName::DtStart
                         | PropertyName::DtEnd
                         | PropertyName::Due
                         | PropertyName::Duration
-                        | PropertyName::RRule
+                );
+                let is_recur = matches!(
+                    prop.name,
+                    PropertyName::RRule
                         | PropertyName::RDate
                         | PropertyName::ExDate
                         | PropertyName::RecurrenceId
-                ) {
+                );
+                if is_span || (!keep_recurrence_attributes && is_recur) {
                     continue;
                 }
                 dst.add_property(prop.clone());
             }
             if self.occ.is_all_day {
-                dst.add_property(icaloxide_core::Property::new(
+                dst.add_property(Property::new(
                     PropertyName::DtStart,
                     PropertyValue::Date(self.occ.start_local.date),
                 ));
-                dst.add_property(icaloxide_core::Property::new(
+                dst.add_property(Property::new(
                     end_prop_name,
                     PropertyValue::Date(self.occ.end_local.date),
                 ));
             } else {
-                dst.add_property(icaloxide_core::Property::new(
+                dst.add_property(Property::new(
                     PropertyName::DtStart,
                     PropertyValue::DateTime(self.occ.start_local.clone()),
                 ));
-                dst.add_property(icaloxide_core::Property::new(
+                dst.add_property(Property::new(
                     end_prop_name,
                     PropertyValue::DateTime(self.occ.end_local.clone()),
                 ));
@@ -677,7 +767,7 @@ impl PyOccurrence {
         let summary = self
             .cal
             .component(self.occ.component_id)
-            .and_then(|c| c.summary().map(str::to_owned));
+            .and_then(icaloxide_core::ComponentRef::summary);
         match summary {
             Some(s) => format!(
                 "Occurrence({kind:?}, start={}, summary={s:?})",
@@ -688,7 +778,6 @@ impl PyOccurrence {
     }
 }
 
-/// Streaming lazy iterator yielding [`Occurrence`] instances in chronological order.
 #[pyclass(name = "OccurrenceIterator")]
 pub struct PyOccurrenceIterator {
     cal: Arc<CoreCalendar>,
@@ -722,7 +811,48 @@ impl PyOccurrenceIterator {
     }
 }
 
-/// Interval-indexed recurring calendar query engine.
+#[pyclass(name = "OccurrencePageIterator")]
+pub struct PyOccurrencePageIterator {
+    cal: Arc<CoreCalendar>,
+    tz_registry: Arc<OnceLock<TzRegistry>>,
+    iter: AfterIter,
+    page_size: usize,
+    exhausted: bool,
+}
+
+#[pymethods]
+impl PyOccurrencePageIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<Vec<PyOccurrence>>> {
+        if slf.exhausted || slf.page_size == 0 {
+            return Ok(None);
+        }
+        let mut page = Vec::with_capacity(slf.page_size);
+        for _ in 0..slf.page_size {
+            match slf.iter.next() {
+                Some(Ok(occ)) => page.push(PyOccurrence {
+                    cal: Arc::clone(&slf.cal),
+                    tz_registry: Arc::clone(&slf.tz_registry),
+                    occ,
+                }),
+                Some(Err(e)) => return Err(rrule_err_to_py(&e)),
+                None => {
+                    slf.exhausted = true;
+                    break;
+                }
+            }
+        }
+        if page.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(page))
+        }
+    }
+}
+
 #[pyclass(name = "CalendarQuery", frozen)]
 pub struct PyCalendarQuery {
     cal: Arc<CoreCalendar>,
@@ -732,7 +862,15 @@ pub struct PyCalendarQuery {
 
 #[pymethods]
 impl PyCalendarQuery {
-    /// Return all occurrences falling on `date_or_dt` (`datetime.date` or `datetime.datetime`).
+    #[getter]
+    fn suppressed_errors(&self) -> Vec<String> {
+        self.query
+            .suppressed_errors()
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
     fn at(&self, py: Python<'_>, date_or_dt: &Bound<'_, PyAny>) -> PyResult<Vec<PyOccurrence>> {
         let occs = if date_or_dt.hasattr("hour")? {
             let instant_utc =
@@ -758,7 +896,6 @@ impl PyCalendarQuery {
             .collect())
     }
 
-    /// Return all occurrences intersecting `[start, end)` (`datetime` or inclusive `date` range).
     fn between(
         &self,
         py: Python<'_>,
@@ -780,7 +917,6 @@ impl PyCalendarQuery {
             .collect())
     }
 
-    /// Return a streaming chronological iterator of occurrences ending after `dt`.
     #[pyo3(signature = (dt, *, limit=None))]
     fn after(&self, dt: &Bound<'_, PyAny>, limit: Option<usize>) -> PyResult<PyOccurrenceIterator> {
         let earliest_utc = py_time_bound_to_utc(dt, self.query.default_timezone(), false)?;
@@ -792,7 +928,54 @@ impl PyCalendarQuery {
         })
     }
 
-    /// Count occurrences intersecting `[start, end)` without allocating Python objects.
+    #[pyo3(signature = (page_size, earliest_end=None))]
+    fn paginate(
+        &self,
+        page_size: usize,
+        earliest_end: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<PyOccurrencePageIterator> {
+        if page_size == 0 {
+            return Err(PyValueError::new_err("page_size must be >= 1"));
+        }
+        let anchor_utc = if let Some(dt) = earliest_end {
+            py_time_bound_to_utc(dt, self.query.default_timezone(), false)?
+        } else {
+            i64::from(CalDate::new(1900, 1, 1).unwrap().to_days_since_epoch()) * 86_400
+        };
+        Ok(PyOccurrencePageIterator {
+            cal: Arc::clone(&self.cal),
+            tz_registry: Arc::clone(&self.tz_registry),
+            iter: self.query.after(anchor_utc),
+            page_size,
+            exhausted: false,
+        })
+    }
+
+    fn first(&self, py: Python<'_>) -> PyResult<Option<PyOccurrence>> {
+        let occ = py
+            .allow_threads(|| self.query.first())
+            .map_err(|e| rrule_err_to_py(&e))?;
+        Ok(occ.map(|o| PyOccurrence {
+            cal: Arc::clone(&self.cal),
+            tz_registry: Arc::clone(&self.tz_registry),
+            occ: o,
+        }))
+    }
+
+    fn all(&self, py: Python<'_>) -> PyResult<Vec<PyOccurrence>> {
+        let occs = py
+            .allow_threads(|| self.query.all())
+            .map_err(|e| rrule_err_to_py(&e))?;
+        Ok(occs
+            .into_iter()
+            .map(|occ| PyOccurrence {
+                cal: Arc::clone(&self.cal),
+                tz_registry: Arc::clone(&self.tz_registry),
+                occ,
+            })
+            .collect())
+    }
+
     fn count(
         &self,
         py: Python<'_>,
@@ -806,7 +989,6 @@ impl PyCalendarQuery {
     }
 }
 
-/// High-performance Rust-backed iCalendar container.
 #[pyclass(name = "Calendar", frozen)]
 pub struct PyCalendar {
     inner: Arc<CoreCalendar>,
@@ -895,13 +1077,13 @@ impl PyCalendar {
     ) -> Self {
         let mut cal = CoreCalendar::new();
         if let Some(pid) = prodid {
-            cal.root_mut().set_property(icaloxide_core::Property::new(
+            cal.root_mut().set_property(Property::new(
                 PropertyName::ProdId,
                 PropertyValue::Text(CompactString::from(pid)),
             ));
         }
         if let Some(cal_name) = name {
-            cal.root_mut().set_property(icaloxide_core::Property::new(
+            cal.root_mut().set_property(Property::new(
                 PropertyName::Name,
                 PropertyValue::Text(CompactString::from(cal_name)),
             ));
@@ -912,16 +1094,18 @@ impl PyCalendar {
         }
     }
 
-    /// Build an indexed [`CalendarQuery`] engine for recurring/non-recurring queries.
-    #[pyo3(signature = (*, components=None, skip_cancelled=false))]
+    #[pyo3(signature = (*, components=None, skip_cancelled=false, skip_bad_series=false, default_tz=None))]
     fn query(
         &self,
         py: Python<'_>,
         components: Option<Vec<String>>,
         skip_cancelled: bool,
+        skip_bad_series: bool,
+        default_tz: Option<&str>,
     ) -> PyResult<PyCalendarQuery> {
         let mut opts = QueryOptions {
             skip_cancelled,
+            skip_bad_series,
             ..QueryOptions::default()
         };
         if let Some(list) = components {
@@ -930,6 +1114,11 @@ impl PyCalendar {
                 kinds.push(ComponentKind::parse(&item));
             }
             opts.components = kinds;
+        }
+        if let Some(tz_name) = default_tz {
+            if let Some(resolved) = self.registry().resolve(tz_name) {
+                opts.default_tz = Some(resolved);
+            }
         }
         let cal_arc = Arc::clone(&self.inner);
         let q = py
@@ -952,6 +1141,42 @@ impl PyCalendar {
             inner: Arc::new(updated),
             tz_registry: Arc::new(OnceLock::new()),
         }
+    }
+
+    fn used_tzids(&self) -> Vec<String> {
+        self.inner
+            .used_tzids()
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    fn missing_tzids(&self) -> Vec<String> {
+        self.inner
+            .missing_tzids()
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    fn validate(&self) -> Vec<(usize, String)> {
+        self.inner
+            .validate()
+            .into_iter()
+            .map(|w| (w.line, w.message.to_string()))
+            .collect()
+    }
+
+    fn with_uid(&self, uid: &str) -> Vec<PyComponent> {
+        self.inner
+            .components_with_uid(uid)
+            .into_iter()
+            .map(|id| PyComponent {
+                cal: Arc::clone(&self.inner),
+                tz_registry: Arc::clone(&self.tz_registry),
+                id,
+            })
+            .collect()
     }
 
     #[pyo3(signature = (tzid, dt))]
@@ -1044,6 +1269,16 @@ impl PyCalendar {
     }
 
     #[getter]
+    fn freebusies(&self) -> Vec<PyComponent> {
+        self.collect_kind(ComponentKind::VFreeBusy)
+    }
+
+    #[getter]
+    fn availabilities(&self) -> Vec<PyComponent> {
+        self.collect_kind(ComponentKind::VAvailability)
+    }
+
+    #[getter]
     fn subcomponents(&self) -> Vec<PyComponent> {
         self.inner
             .root()
@@ -1091,13 +1326,209 @@ impl PyCalendar {
     }
 }
 
+/// Mutable Rust-backed builder for constructing high-performance calendars without Python dict overhead.
+#[pyclass(name = "CalendarBuilder")]
+pub struct PyCalendarBuilder {
+    cal: CoreCalendar,
+}
+
+#[pymethods]
+impl PyCalendarBuilder {
+    #[new]
+    #[pyo3(signature = (*, prodid=None, name=None))]
+    fn new(prodid: Option<&str>, name: Option<&str>) -> Self {
+        let mut cal = CoreCalendar::new();
+        if let Some(pid) = prodid {
+            cal.root_mut().set_property(Property::new(
+                PropertyName::ProdId,
+                PropertyValue::Text(CompactString::from(pid)),
+            ));
+        }
+        if let Some(cal_name) = name {
+            cal.root_mut().set_property(Property::new(
+                PropertyName::Name,
+                PropertyValue::Text(CompactString::from(cal_name)),
+            ));
+        }
+        Self { cal }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (*, uid, summary, start, end=None, duration=None, rrule=None, tzid=None, location=None, description=None, categories=None))]
+    fn add_event(
+        &mut self,
+        uid: &str,
+        summary: &str,
+        start: &Bound<'_, PyAny>,
+        end: Option<&Bound<'_, PyAny>>,
+        duration: Option<&Bound<'_, PyAny>>,
+        rrule: Option<&str>,
+        tzid: Option<&str>,
+        location: Option<&str>,
+        description: Option<&str>,
+        categories: Option<Vec<String>>,
+    ) -> PyResult<()> {
+        let comp_id = self.cal.add_component(ComponentKind::VEvent);
+        let start_val = py_to_temporal(start, tzid)?;
+        let end_val = match end {
+            Some(e) => Some(py_to_temporal(e, tzid)?),
+            None => None,
+        };
+        let dur_val = match duration {
+            Some(d) => Some(py_duration_to_cal(d)?),
+            None => None,
+        };
+
+        if let Some(mut ev) = self.cal.component_mut(comp_id) {
+            ev.add_property(Property::new(
+                PropertyName::Uid,
+                PropertyValue::Text(CompactString::from(uid)),
+            ));
+            ev.add_property(Property::new(
+                PropertyName::Summary,
+                PropertyValue::Text(CompactString::from(summary)),
+            ));
+            match start_val {
+                PyInputTemporal::Date(d) => ev.add_property(
+                    Property::new(PropertyName::DtStart, PropertyValue::Date(d))
+                        .with_param(Parameter::new(ParamName::Value, "DATE")),
+                ),
+                PyInputTemporal::DateTime(dt) => ev.add_property(Property::new(
+                    PropertyName::DtStart,
+                    PropertyValue::DateTime(dt),
+                )),
+            }
+            if let Some(ev_end) = end_val {
+                match ev_end {
+                    PyInputTemporal::Date(d) => ev.add_property(
+                        Property::new(PropertyName::DtEnd, PropertyValue::Date(d))
+                            .with_param(Parameter::new(ParamName::Value, "DATE")),
+                    ),
+                    PyInputTemporal::DateTime(dt) => ev.add_property(Property::new(
+                        PropertyName::DtEnd,
+                        PropertyValue::DateTime(dt),
+                    )),
+                }
+            }
+            if let Some(dur) = dur_val {
+                ev.add_property(Property::new(
+                    PropertyName::Duration,
+                    PropertyValue::Duration(dur),
+                ));
+            }
+            if let Some(r) = rrule {
+                ev.add_property(Property::new(
+                    PropertyName::RRule,
+                    PropertyValue::Recur(CompactString::from(r)),
+                ));
+            }
+            if let Some(loc) = location {
+                ev.add_property(Property::new(
+                    PropertyName::Location,
+                    PropertyValue::Text(CompactString::from(loc)),
+                ));
+            }
+            if let Some(desc) = description {
+                ev.add_property(Property::new(
+                    PropertyName::Description,
+                    PropertyValue::Text(CompactString::from(desc)),
+                ));
+            }
+            if let Some(cats) = categories {
+                ev.add_property(Property::new(
+                    PropertyName::Categories,
+                    PropertyValue::TextList(cats.into_iter().map(CompactString::from).collect()),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[pyo3(signature = (*, uid, summary, start=None, due=None, tzid=None, status=None))]
+    fn add_todo(
+        &mut self,
+        uid: &str,
+        summary: &str,
+        start: Option<&Bound<'_, PyAny>>,
+        due: Option<&Bound<'_, PyAny>>,
+        tzid: Option<&str>,
+        status: Option<&str>,
+    ) -> PyResult<()> {
+        let comp_id = self.cal.add_component(ComponentKind::VTodo);
+        let start_val = match start {
+            Some(s) => Some(py_to_temporal(s, tzid)?),
+            None => None,
+        };
+        let due_val = match due {
+            Some(d) => Some(py_to_temporal(d, tzid)?),
+            None => None,
+        };
+
+        if let Some(mut td) = self.cal.component_mut(comp_id) {
+            td.add_property(Property::new(
+                PropertyName::Uid,
+                PropertyValue::Text(CompactString::from(uid)),
+            ));
+            td.add_property(Property::new(
+                PropertyName::Summary,
+                PropertyValue::Text(CompactString::from(summary)),
+            ));
+            if let Some(sv) = start_val {
+                match sv {
+                    PyInputTemporal::Date(d) => td.add_property(
+                        Property::new(PropertyName::DtStart, PropertyValue::Date(d))
+                            .with_param(Parameter::new(ParamName::Value, "DATE")),
+                    ),
+                    PyInputTemporal::DateTime(dt) => td.add_property(Property::new(
+                        PropertyName::DtStart,
+                        PropertyValue::DateTime(dt),
+                    )),
+                }
+            }
+            if let Some(dv) = due_val {
+                match dv {
+                    PyInputTemporal::Date(d) => td.add_property(
+                        Property::new(PropertyName::Due, PropertyValue::Date(d))
+                            .with_param(Parameter::new(ParamName::Value, "DATE")),
+                    ),
+                    PyInputTemporal::DateTime(dt) => td.add_property(Property::new(
+                        PropertyName::Due,
+                        PropertyValue::DateTime(dt),
+                    )),
+                }
+            }
+            if let Some(st) = status {
+                td.add_property(Property::new(
+                    PropertyName::Status,
+                    PropertyValue::Text(CompactString::from(st)),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn build(&self) -> PyCalendar {
+        PyCalendar {
+            inner: Arc::new(self.cal.clone()),
+            tz_registry: Arc::new(OnceLock::new()),
+        }
+    }
+
+    fn to_ical<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        let s = py.allow_threads(|| self.cal.to_ical());
+        PyBytes::new(py, s.as_bytes())
+    }
+}
+
 #[pymodule]
 fn _icaloxide(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<PyCalendar>()?;
+    m.add_class::<PyCalendarBuilder>()?;
     m.add_class::<PyComponent>()?;
     m.add_class::<PyCalendarQuery>()?;
     m.add_class::<PyOccurrence>()?;
     m.add_class::<PyOccurrenceIterator>()?;
+    m.add_class::<PyOccurrencePageIterator>()?;
     Ok(())
 }

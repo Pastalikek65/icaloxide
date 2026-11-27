@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use crate::datetime::{CalDate, CalDateTime, CalTime, TimeZoneRef, UtcOffset};
 
-pub use generator::add_missing_timezones;
+pub use generator::{add_missing_timezones, collect_missing_tzids, collect_used_tzids};
 pub use registry::TzRegistry;
 pub use vtimezone::{CompiledVTimezone, TzTransition};
 pub use windows::{parse_fixed_offset_tzid, resolve_iana_alias, strip_vendor_prefix};

@@ -5,6 +5,15 @@ All notable changes to `icaloxide` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-11-27
+
+### Added
+
+- **Full `icalendar` & `recurring-ical-events` Parity Upgrades**
+  - Native Rust `CalendarBuilder`, `Calendar.used_tzids()`, `Calendar.missing_tzids()`, `Calendar.validate()`, `Calendar.with_uid()`, `freebusies`, and `availabilities`.
+  - `RDATE;VALUE=PERIOD` custom occurrence duration support, full `RANGE=THISANDFUTURE` shifted/split-series semantics, `skip_bad_series` with `suppressed_errors`, `VALARM` streaming in `after()`, `VAVAILABILITY`/`AVAILABLE` query indexing, plus `first()`, `all()`, and `paginate()`.
+  - Full `compat` `vRecur` dictionary interface, `Parameters`, `v*` property types, full Python `dict` protocol on `Component`, ergonomic `Event`/`Todo`/`Alarm` factories, and RFC 7265 jCal (`to_jcal`, `to_json`, `from_jcal`).
+
 ## [0.1.0] - 2026-11-27
 
 ### Added

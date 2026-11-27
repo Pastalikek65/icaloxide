@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use compact_str::CompactString;
 use icaloxide_core::datetime::{CalDate, CalDateTime, CalTime};
-use icaloxide_core::model::{Calendar, ComponentId, ComponentKind, ComponentRef, PropertyName};
+use icaloxide_core::model::{
+    Calendar, ComponentId, ComponentKind, ComponentRef, PropertyName, PropertyValue,
+};
 use icaloxide_core::tz::{CalendarTimeZone, DstDisambiguation, TzRegistry};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -14,9 +16,11 @@ use smallvec::SmallVec;
 use crate::error::{IterationBudget, RRuleError};
 use crate::query::components::{expand_alarms_for_parent, extract_freebusy_occurrences};
 use crate::recurrence::series::{
-    compute_end_local, extract_component_timing, overlaps_window, CompiledSeries,
+    apply_this_and_future_shift, compute_end_local, extract_component_timing, overlaps_window,
+    resolve_local_instant, utc_to_local_approx, CompiledSeries, OverrideEntry,
 };
 use crate::recurrence::SpanDuration;
+use crate::rrule::{LocalDateTime, RRuleIter};
 
 /// A resolved calendar occurrence emitted by [`CalendarQuery`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +41,7 @@ pub struct Occurrence {
 pub struct QueryOptions {
     pub components: SmallVec<[ComponentKind; 4]>,
     pub skip_cancelled: bool,
+    pub skip_bad_series: bool,
     pub default_tz: Option<CalendarTimeZone>,
     pub budget: IterationBudget,
 }
@@ -48,13 +53,14 @@ impl Default for QueryOptions {
         Self {
             components,
             skip_cancelled: false,
+            skip_bad_series: false,
             default_tz: None,
             budget: IterationBudget::default(),
         }
     }
 }
 
-/// Interval-indexed calendar query engine supporting `at`, `between`, `after`, and `count`.
+/// Interval-indexed calendar query engine supporting `at`, `between`, `after`, `count`, `first`, and `all`.
 #[derive(Debug)]
 pub struct CalendarQuery {
     cal: Arc<Calendar>,
@@ -67,6 +73,8 @@ pub struct CalendarQuery {
     alarm_parent_singles: Vec<Occurrence>,
     alarm_parent_series: Vec<CompiledSeries>,
     want_alarms: bool,
+    max_alarm_pad_secs: i64,
+    suppressed_errors: Vec<CompactString>,
 }
 
 impl CalendarQuery {
@@ -80,6 +88,8 @@ impl CalendarQuery {
             .unwrap_or(CalendarTimeZone::Utc);
 
         let want_alarms = options.components.contains(&ComponentKind::VAlarm);
+        let want_availability = options.components.contains(&ComponentKind::VAvailability)
+            || options.components.contains(&ComponentKind::Available);
         let want_non_alarm: SmallVec<[ComponentKind; 4]> = options
             .components
             .iter()
@@ -91,46 +101,26 @@ impl CalendarQuery {
         let mut series = Vec::new();
         let mut alarm_parent_singles = Vec::new();
         let mut alarm_parent_series = Vec::new();
+        let mut suppressed_errors = Vec::new();
+        let mut max_alarm_pad_secs: i64 = 30 * 86_400;
 
-        // Collect VFREEBUSY directly if requested.
         if want_non_alarm.contains(&ComponentKind::VFreeBusy) {
             for fb in cal.freebusies() {
                 singles.extend(extract_freebusy_occurrences(fb, &reg, &default_tz));
             }
         }
 
-        // Partition components of requested kinds (and VEVENT/VTODO if VALARM is requested).
-        let mut grouped: FxHashMap<(ComponentKind, CompactString), Vec<ComponentRef<'_>>> =
-            FxHashMap::default();
-        let mut ungrouped: Vec<ComponentRef<'_>> = Vec::new();
+        let (grouped, ungrouped) = partition_query_components(
+            &cal,
+            &want_non_alarm,
+            want_alarms,
+            want_availability,
+            &mut max_alarm_pad_secs,
+        );
 
-        for child in cal.root().children() {
-            let kind = child.kind();
-            if *kind == ComponentKind::VTimezone || *kind == ComponentKind::VFreeBusy {
-                continue;
-            }
-            let is_direct = want_non_alarm.contains(kind);
-            let is_alarm_parent =
-                want_alarms && matches!(kind, ComponentKind::VEvent | ComponentKind::VTodo);
-            if !is_direct && !is_alarm_parent {
-                continue;
-            }
-
-            if let Some(uid) = child.uid() {
-                grouped
-                    .entry((kind.clone(), CompactString::from(uid)))
-                    .or_default()
-                    .push(child);
-            } else {
-                ungrouped.push(child);
-            }
-        }
-
-        for comp in ungrouped {
-            let is_direct = want_non_alarm.contains(comp.kind());
-            let has_alarm = want_alarms && has_valarm_child(comp);
-            classify_component_group(
-                &[comp],
+        let mut push_group = |comps: &[ComponentRef<'_>], is_direct: bool, has_alarm: bool| {
+            let res = classify_component_group(
+                comps,
                 &reg,
                 &default_tz,
                 options.skip_cancelled,
@@ -140,24 +130,29 @@ impl CalendarQuery {
                 &mut series,
                 &mut alarm_parent_singles,
                 &mut alarm_parent_series,
-            )?;
+            );
+            if let Err(err) = res {
+                if options.skip_bad_series {
+                    suppressed_errors.push(CompactString::from(err.to_string()));
+                } else {
+                    return Err(err);
+                }
+            }
+            Ok(())
+        };
+
+        for comp in ungrouped {
+            let is_direct = want_non_alarm.contains(comp.kind())
+                || (want_availability && comp.kind() == &ComponentKind::Available);
+            let has_alarm = want_alarms && has_valarm_child(comp);
+            push_group(&[comp], is_direct, has_alarm)?;
         }
 
         for ((kind, _), comps) in grouped {
-            let is_direct = want_non_alarm.contains(&kind);
+            let is_direct = want_non_alarm.contains(&kind)
+                || (want_availability && kind == ComponentKind::Available);
             let has_alarm = want_alarms && comps.iter().any(|c| has_valarm_child(*c));
-            classify_component_group(
-                &comps,
-                &reg,
-                &default_tz,
-                options.skip_cancelled,
-                is_direct,
-                has_alarm,
-                &mut singles,
-                &mut series,
-                &mut alarm_parent_singles,
-                &mut alarm_parent_series,
-            )?;
+            push_group(&comps, is_direct, has_alarm)?;
         }
 
         singles.sort_by_key(|o| (o.start_utc, o.end_utc, o.component_id.0));
@@ -181,6 +176,8 @@ impl CalendarQuery {
             alarm_parent_singles,
             alarm_parent_series,
             want_alarms,
+            max_alarm_pad_secs: max_alarm_pad_secs.min(365 * 86_400),
+            suppressed_errors,
         })
     }
 
@@ -199,6 +196,11 @@ impl CalendarQuery {
         &self.default_tz
     }
 
+    /// Errors suppressed during query construction when `skip_bad_series` is enabled.
+    pub fn suppressed_errors(&self) -> &[CompactString] {
+        &self.suppressed_errors
+    }
+
     /// Return all occurrences intersecting `[start_utc, end_utc)`.
     pub fn between(&self, start_utc: i64, end_utc: i64) -> Result<Vec<Occurrence>, RRuleError> {
         if end_utc <= start_utc {
@@ -208,13 +210,20 @@ impl CalendarQuery {
         self.collect_singles_in_window(start_utc, end_utc, &mut out);
 
         for s in &self.series {
-            s.expand_window(
+            let mut buf = Vec::new();
+            match s.expand_window(
                 start_utc,
                 end_utc,
                 self.options.skip_cancelled,
                 self.options.budget,
-                &mut out,
-            )?;
+                &mut buf,
+            ) {
+                Ok(()) => out.extend(buf),
+                Err(err) if self.options.skip_bad_series => {
+                    let _ = err;
+                }
+                Err(err) => return Err(err),
+            }
         }
 
         if self.want_alarms {
@@ -255,6 +264,23 @@ impl CalendarQuery {
         self.between(utc_ts, utc_ts + 1)
     }
 
+    /// Return the earliest occurrence across `[1900-01-01, 2100-12-31]`, if any.
+    pub fn first(self: &Arc<Self>) -> Result<Option<Occurrence>, RRuleError> {
+        let floor_utc = i64::from(CalDate::new(1900, 1, 1).unwrap().to_days_since_epoch()) * 86_400;
+        match self.after(floor_utc).next() {
+            Some(Ok(occ)) => Ok(Some(occ)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    /// Return all occurrences across `[1900-01-01, 2100-12-31]`.
+    pub fn all(&self) -> Result<Vec<Occurrence>, RRuleError> {
+        let start_utc = i64::from(CalDate::new(1900, 1, 1).unwrap().to_days_since_epoch()) * 86_400;
+        let end_utc = i64::from(CalDate::new(2100, 12, 31).unwrap().to_days_since_epoch()) * 86_400;
+        self.between(start_utc, end_utc)
+    }
+
     /// Count occurrences intersecting `[start_utc, end_utc)`.
     pub fn count_between(&self, start_utc: i64, end_utc: i64) -> Result<usize, RRuleError> {
         if end_utc <= start_utc {
@@ -275,14 +301,19 @@ impl CalendarQuery {
         let mut buf = Vec::new();
         for ser in &self.series {
             buf.clear();
-            ser.expand_window(
+            match ser.expand_window(
                 start_utc,
                 end_utc,
                 self.options.skip_cancelled,
                 self.options.budget,
                 &mut buf,
-            )?;
-            count += buf.len();
+            ) {
+                Ok(()) => count += buf.len(),
+                Err(err) if self.options.skip_bad_series => {
+                    let _ = err;
+                }
+                Err(err) => return Err(err),
+            }
         }
         if self.want_alarms {
             buf.clear();
@@ -317,10 +348,8 @@ impl CalendarQuery {
         end_utc: i64,
         out: &mut Vec<Occurrence>,
     ) -> Result<(), RRuleError> {
-        // Generous parent search padding (+/- 30 days) for negative/positive alarm triggers.
-        const ALARM_PAD: i64 = 30 * 86_400;
-        let p_start = start_utc.saturating_sub(ALARM_PAD);
-        let p_end = end_utc.saturating_add(ALARM_PAD);
+        let p_start = start_utc.saturating_sub(self.max_alarm_pad_secs);
+        let p_end = end_utc.saturating_add(self.max_alarm_pad_secs);
 
         let mut parent_occs = Vec::new();
         for p in &self.alarm_parent_singles {
@@ -329,13 +358,20 @@ impl CalendarQuery {
             }
         }
         for ser in &self.alarm_parent_series {
-            ser.expand_window(
+            let mut buf = Vec::new();
+            match ser.expand_window(
                 p_start,
                 p_end,
                 self.options.skip_cancelled,
                 self.options.budget,
-                &mut parent_occs,
-            )?;
+                &mut buf,
+            ) {
+                Ok(()) => parent_occs.extend(buf),
+                Err(err) if self.options.skip_bad_series => {
+                    let _ = err;
+                }
+                Err(err) => return Err(err),
+            }
         }
 
         for p_occ in parent_occs {
@@ -359,6 +395,8 @@ pub struct AfterIter {
     earliest_end_utc: i64,
     singles_idx: usize,
     series_streams: Vec<OwnedSeriesStream>,
+    alarm_parent_streams: Vec<OwnedSeriesStream>,
+    alarm_parent_singles_idx: usize,
     heap: BinaryHeap<Reverse<HeapEntry>>,
     initialized: bool,
 }
@@ -374,6 +412,8 @@ struct HeapEntry {
 enum HeapSource {
     Single,
     Series(usize),
+    AlarmFromParentSeries(usize),
+    AlarmFromParentSingle,
 }
 
 impl PartialEq for HeapEntry {
@@ -404,10 +444,11 @@ impl Ord for HeapEntry {
     }
 }
 
-/// Self-contained streaming wrapper over one series index inside `Arc<CalendarQuery>`.
 struct OwnedSeriesStream {
     series_idx: usize,
+    is_alarm_parent: bool,
     rule_cursors: Vec<OwnedRuleCursor>,
+    split_cursors: Vec<OwnedSplitCursor>,
     static_items: BinaryHeap<Reverse<HeapEntry>>,
     seen_instants: rustc_hash::FxHashSet<i64>,
 }
@@ -418,9 +459,23 @@ struct OwnedRuleCursor {
     periods_checked: usize,
     consecutive_empty: usize,
     emitted: u32,
-    pending: std::collections::VecDeque<crate::rrule::LocalDateTime>,
+    pending: std::collections::VecDeque<LocalDateTime>,
     finished: bool,
     until_utc: Option<i64>,
+    next_occ: Option<Occurrence>,
+}
+
+struct OwnedSplitCursor {
+    tf_idx: usize,
+    rule_idx: usize,
+    next_period_idx: u64,
+    periods_checked: usize,
+    consecutive_empty: usize,
+    emitted: u32,
+    pending: std::collections::VecDeque<LocalDateTime>,
+    finished: bool,
+    until_utc: Option<i64>,
+    next_split_utc: Option<i64>,
     next_occ: Option<Occurrence>,
 }
 
@@ -431,6 +486,8 @@ impl AfterIter {
             earliest_end_utc,
             singles_idx: 0,
             series_streams: Vec::new(),
+            alarm_parent_streams: Vec::new(),
+            alarm_parent_singles_idx: 0,
             heap: BinaryHeap::new(),
             initialized: false,
         }
@@ -438,20 +495,48 @@ impl AfterIter {
 
     fn init(&mut self) -> Result<(), RRuleError> {
         self.initialized = true;
-        // Prime single occurrences
         self.push_next_single();
 
-        // Prime each recurring series stream
         for s_idx in 0..self.query.series.len() {
-            let mut stream = self.build_owned_stream(s_idx);
-            if let Some(first) = self.pop_from_owned_stream(&mut stream)? {
-                self.heap.push(Reverse(HeapEntry {
+            let mut stream = build_owned_stream(
+                &self.query.series[s_idx],
+                s_idx,
+                false,
+                self.earliest_end_utc,
+                self.query.options.skip_cancelled,
+            );
+            match self.pop_from_owned_stream(&mut stream, self.earliest_end_utc) {
+                Ok(Some(first)) => self.heap.push(Reverse(HeapEntry {
                     occ: first,
                     source: HeapSource::Series(s_idx),
                     is_master: true,
-                }));
+                })),
+                Ok(None) => {}
+                Err(e) if self.query.options.skip_bad_series => {
+                    let _ = e;
+                }
+                Err(e) => return Err(e),
             }
             self.series_streams.push(stream);
+        }
+
+        if self.query.want_alarms {
+            let parent_anchor = self
+                .earliest_end_utc
+                .saturating_sub(self.query.max_alarm_pad_secs);
+            self.push_alarms_from_next_parent_single();
+            for p_idx in 0..self.query.alarm_parent_series.len() {
+                let mut stream = build_owned_stream(
+                    &self.query.alarm_parent_series[p_idx],
+                    p_idx,
+                    true,
+                    parent_anchor,
+                    self.query.options.skip_cancelled,
+                );
+                let pushed = self.pump_alarm_parent_stream(&mut stream, p_idx)?;
+                let _ = pushed;
+                self.alarm_parent_streams.push(stream);
+            }
         }
         Ok(())
     }
@@ -460,12 +545,7 @@ impl AfterIter {
         while self.singles_idx < self.query.singles.len() {
             let occ = &self.query.singles[self.singles_idx];
             self.singles_idx += 1;
-            let keep = if occ.end_utc > occ.start_utc {
-                occ.end_utc > self.earliest_end_utc
-            } else {
-                occ.start_utc >= self.earliest_end_utc
-            };
-            if keep {
+            if keeps_for_after(occ.start_utc, occ.end_utc, self.earliest_end_utc) {
                 self.heap.push(Reverse(HeapEntry {
                     occ: occ.clone(),
                     source: HeapSource::Single,
@@ -476,89 +556,120 @@ impl AfterIter {
         }
     }
 
-    fn build_owned_stream(&self, series_idx: usize) -> OwnedSeriesStream {
-        let ser = &self.query.series[series_idx];
-        let mut static_items = BinaryHeap::new();
-        for ov in &ser.overrides {
-            if self.query.options.skip_cancelled && ov.cancelled {
+    fn push_alarms_from_next_parent_single(&mut self) {
+        let parent_anchor = self
+            .earliest_end_utc
+            .saturating_sub(self.query.max_alarm_pad_secs);
+        while self.alarm_parent_singles_idx < self.query.alarm_parent_singles.len() {
+            let p_occ = &self.query.alarm_parent_singles[self.alarm_parent_singles_idx];
+            self.alarm_parent_singles_idx += 1;
+            if !keeps_for_after(p_occ.start_utc, p_occ.end_utc, parent_anchor) {
                 continue;
             }
-            let keep = if ov.end_utc > ov.start_utc {
-                ov.end_utc > self.earliest_end_utc
-            } else {
-                ov.start_utc >= self.earliest_end_utc
-            };
-            if keep {
-                static_items.push(Reverse(HeapEntry {
-                    occ: Occurrence {
-                        component_id: ov.component_id,
-                        kind: ov.kind.clone(),
-                        start_utc: ov.start_utc,
-                        end_utc: ov.end_utc,
-                        start_local: ov.start_local.clone(),
-                        end_local: ov.end_local.clone(),
-                        is_all_day: ov.is_all_day,
-                        recurrence_id_utc: Some(ov.recurrence_id_utc),
-                        parent_id: None,
-                    },
-                    source: HeapSource::Series(series_idx),
-                    is_master: false,
-                }));
-            }
-        }
-
-        let mut rule_cursors = Vec::new();
-        if let Some(master) = &ser.master {
-            if !(self.query.options.skip_cancelled && master.cancelled) {
-                push_master_statics(
-                    master,
-                    series_idx,
-                    ser.this_and_future_cutoff,
-                    self.earliest_end_utc,
-                    &mut static_items,
-                );
-                for (r_idx, rule) in master.rrules.iter().enumerate() {
-                    let until_utc = resolve_until_with_tz(rule, &master.tz);
-                    rule_cursors.push(OwnedRuleCursor {
-                        rule_idx: r_idx,
-                        next_period_idx: 0,
-                        periods_checked: 0,
-                        consecutive_empty: 0,
-                        emitted: 0,
-                        pending: std::collections::VecDeque::new(),
-                        finished: false,
-                        until_utc,
-                        next_occ: None,
-                    });
+            if let Some(p_comp) = self.query.cal.component(p_occ.component_id) {
+                let mut added_any = false;
+                for alarm in
+                    expand_alarms_for_parent(p_comp, p_occ, &self.query.reg, &self.query.default_tz)
+                {
+                    if alarm.start_utc >= self.earliest_end_utc {
+                        self.heap.push(Reverse(HeapEntry {
+                            occ: alarm,
+                            source: HeapSource::AlarmFromParentSingle,
+                            is_master: false,
+                        }));
+                        added_any = true;
+                    }
+                }
+                if added_any {
+                    break;
                 }
             }
         }
+    }
 
-        OwnedSeriesStream {
-            series_idx,
-            rule_cursors,
-            static_items,
-            seen_instants: rustc_hash::FxHashSet::default(),
+    fn pump_alarm_parent_stream(
+        &mut self,
+        stream: &mut OwnedSeriesStream,
+        p_idx: usize,
+    ) -> Result<bool, RRuleError> {
+        let parent_anchor = self
+            .earliest_end_utc
+            .saturating_sub(self.query.max_alarm_pad_secs);
+        loop {
+            let next_parent = match self.pop_from_owned_stream(stream, parent_anchor) {
+                Ok(v) => v,
+                Err(e) if self.query.options.skip_bad_series => {
+                    let _ = e;
+                    return Ok(false);
+                }
+                Err(e) => return Err(e),
+            };
+            let Some(p_occ) = next_parent else {
+                return Ok(false);
+            };
+            if let Some(p_comp) = self.query.cal.component(p_occ.component_id) {
+                let mut added_any = false;
+                for alarm in expand_alarms_for_parent(
+                    p_comp,
+                    &p_occ,
+                    &self.query.reg,
+                    &self.query.default_tz,
+                ) {
+                    if alarm.start_utc >= self.earliest_end_utc {
+                        self.heap.push(Reverse(HeapEntry {
+                            occ: alarm,
+                            source: HeapSource::AlarmFromParentSeries(p_idx),
+                            is_master: false,
+                        }));
+                        added_any = true;
+                    }
+                }
+                if added_any {
+                    return Ok(true);
+                }
+            }
         }
     }
 
     fn pop_from_owned_stream(
         &self,
         stream: &mut OwnedSeriesStream,
+        earliest_end: i64,
     ) -> Result<Option<Occurrence>, RRuleError> {
-        let ser = &self.query.series[stream.series_idx];
-        let Some(master) = &ser.master else {
-            return Ok(stream.static_items.pop().map(|r| r.0.occ));
+        let ser = if stream.is_alarm_parent {
+            &self.query.alarm_parent_series[stream.series_idx]
+        } else {
+            &self.query.series[stream.series_idx]
         };
 
         loop {
-            for cursor in &mut stream.rule_cursors {
-                if cursor.next_occ.is_none() && !cursor.finished {
-                    cursor.next_occ = advance_owned_cursor(
-                        cursor,
-                        master,
-                        ser.this_and_future_cutoff,
-                        self.earliest_end_utc,
+            if let Some(master) = &ser.master {
+                if !(self.query.options.skip_cancelled && master.cancelled) {
+                    for cursor in &mut stream.rule_cursors {
+                        if cursor.next_occ.is_none() && !cursor.finished {
+                            cursor.next_occ = advance_owned_cursor(
+                                cursor,
+                                master,
+                                &ser.this_and_future,
+                                ser.rrule_split_cutoff,
+                                self.query.options.skip_cancelled,
+                                earliest_end,
+                                self.query.options.budget,
+                            )?;
+                        }
+                    }
+                }
+            }
+
+            for sc in &mut stream.split_cursors {
+                if sc.next_occ.is_none() && !sc.finished {
+                    let tf = &ser.this_and_future[sc.tf_idx];
+                    sc.next_occ = advance_split_cursor(
+                        sc,
+                        tf,
+                        &ser.overrides,
+                        ser.master.as_ref().map(|m| &m.exdates),
+                        earliest_end,
                         self.query.options.budget,
                     )?;
                 }
@@ -570,30 +681,70 @@ impl AfterIter {
                 .enumerate()
                 .filter_map(|(i, c)| c.next_occ.as_ref().map(|o| (i, o.start_utc, o.end_utc)))
                 .min_by_key(|&(_, s, e)| (s, e));
-            let best_static = stream.static_items.peek().map(|r| &r.0);
+            let best_split = stream
+                .split_cursors
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| c.next_occ.as_ref().map(|o| (i, o.start_utc, o.end_utc)))
+                .min_by_key(|&(_, s, e)| (s, e));
+            let best_static = stream
+                .static_items
+                .peek()
+                .map(|r| (r.0.occ.start_utc, r.0.occ.end_utc));
 
-            let (occ, from_master) = match (best_rule, best_static) {
-                (None, None) => return Ok(None),
-                (Some((i, _, _)), None) => (stream.rule_cursors[i].next_occ.take().unwrap(), true),
-                (None, Some(_)) => {
-                    let item = stream.static_items.pop().unwrap().0;
-                    (item.occ, item.is_master)
-                }
-                (Some((i, rs, re)), Some(st)) => {
-                    if (rs, re) < (st.occ.start_utc, st.occ.end_utc) {
-                        (stream.rule_cursors[i].next_occ.take().unwrap(), true)
-                    } else {
-                        let item = stream.static_items.pop().unwrap().0;
-                        (item.occ, item.is_master)
-                    }
-                }
+            let (occ, from_master) =
+                pick_earliest_stream_item(stream, best_rule, best_split, best_static);
+
+            let Some(occ) = occ else {
+                return Ok(None);
             };
-
             if from_master && !stream.seen_instants.insert(occ.start_utc) {
                 continue;
             }
             return Ok(Some(occ));
         }
+    }
+}
+
+fn pick_earliest_stream_item(
+    stream: &mut OwnedSeriesStream,
+    best_rule: Option<(usize, i64, i64)>,
+    best_split: Option<(usize, i64, i64)>,
+    best_static: Option<(i64, i64)>,
+) -> (Option<Occurrence>, bool) {
+    let mut best_kind: Option<u8> = None; // 0=rule, 1=split, 2=static
+    let mut best_key = (i64::MAX, i64::MAX);
+
+    if let Some((_, s, e)) = best_rule {
+        best_kind = Some(0);
+        best_key = (s, e);
+    }
+    if let Some((_, s, e)) = best_split {
+        if (s, e) < best_key {
+            best_kind = Some(1);
+            best_key = (s, e);
+        }
+    }
+    if let Some((s, e)) = best_static {
+        if (s, e) < best_key {
+            best_kind = Some(2);
+        }
+    }
+
+    match best_kind {
+        Some(0) => {
+            let i = best_rule.unwrap().0;
+            (stream.rule_cursors[i].next_occ.take(), true)
+        }
+        Some(1) => {
+            let i = best_split.unwrap().0;
+            (stream.split_cursors[i].next_occ.take(), true)
+        }
+        Some(2) => {
+            let item = stream.static_items.pop().unwrap().0;
+            (Some(item.occ), item.is_master)
+        }
+        _ => (None, false),
     }
 }
 
@@ -610,17 +761,9 @@ impl Iterator for AfterIter {
         match entry.source {
             HeapSource::Single => self.push_next_single(),
             HeapSource::Series(s_idx) => {
-                // Temporarily take stream out to satisfy borrow checker cleanly.
-                let mut stream = std::mem::replace(
-                    &mut self.series_streams[s_idx],
-                    OwnedSeriesStream {
-                        series_idx: s_idx,
-                        rule_cursors: Vec::new(),
-                        static_items: BinaryHeap::new(),
-                        seen_instants: rustc_hash::FxHashSet::default(),
-                    },
-                );
-                let next_res = self.pop_from_owned_stream(&mut stream);
+                let mut stream =
+                    std::mem::replace(&mut self.series_streams[s_idx], empty_stream(s_idx, false));
+                let next_res = self.pop_from_owned_stream(&mut stream, self.earliest_end_utc);
                 self.series_streams[s_idx] = stream;
                 match next_res {
                     Ok(Some(occ)) => self.heap.push(Reverse(HeapEntry {
@@ -629,7 +772,22 @@ impl Iterator for AfterIter {
                         is_master: true,
                     })),
                     Ok(None) => {}
+                    Err(e) if self.query.options.skip_bad_series => {
+                        let _ = e;
+                    }
                     Err(e) => return Some(Err(e)),
+                }
+            }
+            HeapSource::AlarmFromParentSingle => self.push_alarms_from_next_parent_single(),
+            HeapSource::AlarmFromParentSeries(p_idx) => {
+                let mut stream = std::mem::replace(
+                    &mut self.alarm_parent_streams[p_idx],
+                    empty_stream(p_idx, true),
+                );
+                let res = self.pump_alarm_parent_stream(&mut stream, p_idx);
+                self.alarm_parent_streams[p_idx] = stream;
+                if let Err(e) = res {
+                    return Some(Err(e));
                 }
             }
         }
@@ -637,28 +795,218 @@ impl Iterator for AfterIter {
     }
 }
 
+fn empty_stream(series_idx: usize, is_alarm_parent: bool) -> OwnedSeriesStream {
+    OwnedSeriesStream {
+        series_idx,
+        is_alarm_parent,
+        rule_cursors: Vec::new(),
+        split_cursors: Vec::new(),
+        static_items: BinaryHeap::new(),
+        seen_instants: rustc_hash::FxHashSet::default(),
+    }
+}
+
+fn build_owned_stream(
+    ser: &CompiledSeries,
+    series_idx: usize,
+    is_alarm_parent: bool,
+    earliest_end_utc: i64,
+    skip_cancelled: bool,
+) -> OwnedSeriesStream {
+    let mut static_items = BinaryHeap::new();
+    let source = if is_alarm_parent {
+        HeapSource::AlarmFromParentSeries(series_idx)
+    } else {
+        HeapSource::Series(series_idx)
+    };
+
+    for ov in &ser.overrides {
+        if skip_cancelled && ov.cancelled {
+            continue;
+        }
+        if keeps_for_after(ov.start_utc, ov.end_utc, earliest_end_utc) {
+            static_items.push(Reverse(HeapEntry {
+                occ: Occurrence {
+                    component_id: ov.component_id,
+                    kind: ov.kind.clone(),
+                    start_utc: ov.start_utc,
+                    end_utc: ov.end_utc,
+                    start_local: ov.start_local.clone(),
+                    end_local: ov.end_local.clone(),
+                    is_all_day: ov.is_all_day,
+                    recurrence_id_utc: Some(ov.recurrence_id_utc),
+                    parent_id: None,
+                },
+                source,
+                is_master: false,
+            }));
+        }
+    }
+
+    let mut rule_cursors = Vec::new();
+    if let Some(master) = &ser.master {
+        if !(skip_cancelled && master.cancelled) {
+            push_master_statics(
+                master,
+                source,
+                &ser.this_and_future,
+                ser.rrule_split_cutoff,
+                skip_cancelled,
+                earliest_end_utc,
+                &mut static_items,
+            );
+            for (r_idx, rule) in master.rrules.iter().enumerate() {
+                let until_utc = resolve_until_with_tz(rule, &master.tz);
+                rule_cursors.push(OwnedRuleCursor {
+                    rule_idx: r_idx,
+                    next_period_idx: 0,
+                    periods_checked: 0,
+                    consecutive_empty: 0,
+                    emitted: 0,
+                    pending: std::collections::VecDeque::new(),
+                    finished: false,
+                    until_utc,
+                    next_occ: None,
+                });
+            }
+        }
+    }
+
+    let mut split_cursors = Vec::new();
+    push_split_cursors(
+        ser,
+        source,
+        earliest_end_utc,
+        skip_cancelled,
+        &mut static_items,
+        &mut split_cursors,
+    );
+
+    OwnedSeriesStream {
+        series_idx,
+        is_alarm_parent,
+        rule_cursors,
+        split_cursors,
+        static_items,
+        seen_instants: rustc_hash::FxHashSet::default(),
+    }
+}
+
+fn push_split_cursors(
+    ser: &CompiledSeries,
+    source: HeapSource,
+    earliest_end_utc: i64,
+    skip_cancelled: bool,
+    static_items: &mut BinaryHeap<Reverse<HeapEntry>>,
+    split_cursors: &mut Vec<OwnedSplitCursor>,
+) {
+    for (tf_idx, tf) in ser.this_and_future.iter().enumerate() {
+        if skip_cancelled && tf.cancelled {
+            continue;
+        }
+        if tf.override_rrules.is_empty() {
+            if ser.master.is_none() && keeps_for_after(tf.start_utc, tf.end_utc, earliest_end_utc) {
+                static_items.push(Reverse(HeapEntry {
+                    occ: Occurrence {
+                        component_id: tf.component_id,
+                        kind: tf.kind.clone(),
+                        start_utc: tf.start_utc,
+                        end_utc: tf.end_utc,
+                        start_local: tf.start_local.clone(),
+                        end_local: tf.end_local.clone(),
+                        is_all_day: tf.is_all_day,
+                        recurrence_id_utc: Some(tf.recurrence_id_utc),
+                        parent_id: None,
+                    },
+                    source,
+                    is_master: false,
+                }));
+            }
+            continue;
+        }
+        let next_split_utc = ser
+            .this_and_future
+            .get(tf_idx + 1)
+            .map(|n| n.recurrence_id_utc);
+        for (rule_idx, rule) in tf.override_rrules.iter().enumerate() {
+            split_cursors.push(OwnedSplitCursor {
+                tf_idx,
+                rule_idx,
+                next_period_idx: 0,
+                periods_checked: 0,
+                consecutive_empty: 0,
+                emitted: 0,
+                pending: std::collections::VecDeque::new(),
+                finished: false,
+                until_utc: resolve_until_with_tz(rule, &tf.tz),
+                next_split_utc,
+                next_occ: None,
+            });
+        }
+    }
+}
+
+fn push_master_statics(
+    master: &crate::recurrence::series::MasterSeries,
+    source: HeapSource,
+    this_and_future: &[OverrideEntry],
+    rrule_split_cutoff: Option<i64>,
+    skip_cancelled: bool,
+    earliest_end_utc: i64,
+    static_items: &mut BinaryHeap<Reverse<HeapEntry>>,
+) {
+    let mut try_push = |dt: &CalDateTime, span: SpanDuration| {
+        let s_utc = resolve_local_instant(dt, &master.tz);
+        if rrule_split_cutoff.is_some_and(|cut| s_utc >= cut) {
+            return;
+        }
+        if master.exdates.matches(s_utc, dt.date, dt.time) {
+            return;
+        }
+        if let Some(occ) =
+            apply_this_and_future_shift(master, this_and_future, s_utc, dt, span, skip_cancelled)
+        {
+            if keeps_for_after(occ.start_utc, occ.end_utc, earliest_end_utc) {
+                static_items.push(Reverse(HeapEntry {
+                    occ,
+                    source,
+                    is_master: true,
+                }));
+            }
+        }
+    };
+
+    try_push(&master.start_local, master.span);
+    for rdt in &master.rdates {
+        try_push(&rdt.start_local, rdt.custom_span.unwrap_or(master.span));
+    }
+}
+
 fn advance_owned_cursor(
     cursor: &mut OwnedRuleCursor,
     master: &crate::recurrence::series::MasterSeries,
-    cutoff: Option<i64>,
+    this_and_future: &[OverrideEntry],
+    rrule_split_cutoff: Option<i64>,
+    skip_cancelled: bool,
     earliest_end_utc: i64,
     budget: IterationBudget,
 ) -> Result<Option<Occurrence>, RRuleError> {
-    use crate::rrule::{LocalDateTime, RRuleIter};
-
     let rule = &master.rrules[cursor.rule_idx];
     let dtstart_ldt = LocalDateTime::new(master.start_local.date, master.start_local.time);
     let max_span_secs = match master.span {
         SpanDuration::Days(d) => i64::from(d) * 86_400 + 86_400,
         SpanDuration::Seconds(s) => s,
     };
+    let max_back_shift = this_and_future
+        .iter()
+        .map(|tf| (-tf.time_shift_secs).max(0))
+        .max()
+        .unwrap_or(0);
     let ff_utc = earliest_end_utc
-        .saturating_sub(max_span_secs)
+        .saturating_sub(max_span_secs + max_back_shift)
         .max(master.min_start_utc);
-    let ff_off = master.tz.offset_at_utc(ff_utc).unwrap_or(0);
-    let ff_local = LocalDateTime::from_naive_timestamp(ff_utc + i64::from(ff_off));
+    let ff_local = utc_to_local_approx(ff_utc, &master.tz);
 
-    // Resume from saved cursor state on a lightweight RRuleIter by setting start fast-forward on first run.
     let mut iter = RRuleIter::new(
         rule,
         dtstart_ldt,
@@ -692,31 +1040,123 @@ fn advance_owned_cursor(
             time: ldt.time,
             tz: master.start_local.tz.clone(),
         };
-        let s_utc = resolve_local_with_tz(&cand_local, &master.tz);
-        if cursor.until_utc.is_some_and(|u| s_utc > u) {
+        let s_utc = resolve_local_instant(&cand_local, &master.tz);
+        if cursor.until_utc.is_some_and(|u| s_utc > u)
+            || rrule_split_cutoff.is_some_and(|cut| s_utc >= cut)
+        {
             cursor.finished = true;
             break;
         }
-        if cutoff.is_some_and(|c| s_utc >= c) || master.exdates.matches(s_utc, ldt.date, ldt.time) {
+        if master.exdates.matches(s_utc, ldt.date, ldt.time) {
             continue;
         }
-        let (e_utc, e_local) = compute_end_local(&cand_local, s_utc, master.span, &master.tz);
-        let keep = if e_utc > s_utc {
-            e_utc > earliest_end_utc
-        } else {
-            s_utc >= earliest_end_utc
+        let Some(occ) = apply_this_and_future_shift(
+            master,
+            this_and_future,
+            s_utc,
+            &cand_local,
+            master.span,
+            skip_cancelled,
+        ) else {
+            continue;
         };
-        if !keep {
+        if !keeps_for_after(occ.start_utc, occ.end_utc, earliest_end_utc) {
+            continue;
+        }
+        found = Some(occ);
+        break;
+    }
+
+    let (p_idx, p_chk, c_empty, emitted, pending, fin) = iter.save_state();
+    cursor.next_period_idx = p_idx;
+    cursor.periods_checked = p_chk;
+    cursor.consecutive_empty = c_empty;
+    cursor.emitted = emitted;
+    cursor.pending = pending;
+    if fin || found.is_none() {
+        cursor.finished = true;
+    }
+    Ok(found)
+}
+
+fn advance_split_cursor(
+    cursor: &mut OwnedSplitCursor,
+    tf: &OverrideEntry,
+    single_overrides: &[OverrideEntry],
+    master_exdates: Option<&crate::recurrence::ExclusionSet>,
+    earliest_end_utc: i64,
+    budget: IterationBudget,
+) -> Result<Option<Occurrence>, RRuleError> {
+    let rule = &tf.override_rrules[cursor.rule_idx];
+    let dtstart_ldt = LocalDateTime::new(tf.start_local.date, tf.start_local.time);
+    let max_span_secs = match tf.span {
+        SpanDuration::Days(d) => i64::from(d) * 86_400 + 86_400,
+        SpanDuration::Seconds(s) => s,
+    };
+    let ff_utc = earliest_end_utc
+        .saturating_sub(max_span_secs)
+        .max(tf.start_utc);
+    let ff_local = utc_to_local_approx(ff_utc, &tf.tz);
+
+    let mut iter = RRuleIter::new(
+        rule,
+        dtstart_ldt,
+        cursor.until_utc.map(|u| {
+            let off = tf.tz.offset_at_utc(u).unwrap_or(0);
+            LocalDateTime::from_naive_timestamp(u + 86_400 + i64::from(off))
+        }),
+        if cursor.periods_checked == 0 && cursor.emitted == 0 && cursor.pending.is_empty() {
+            Some(ff_local)
+        } else {
+            None
+        },
+        budget,
+    );
+
+    if cursor.periods_checked > 0 || cursor.emitted > 0 || !cursor.pending.is_empty() {
+        iter.restore_state(
+            cursor.next_period_idx,
+            cursor.periods_checked,
+            cursor.consecutive_empty,
+            cursor.emitted,
+            std::mem::take(&mut cursor.pending),
+        );
+    }
+
+    let mut found = None;
+    for item in &mut iter {
+        let ldt = item?;
+        let cand_local = CalDateTime {
+            date: ldt.date,
+            time: ldt.time,
+            tz: tf.start_local.tz.clone(),
+        };
+        let s_utc = resolve_local_instant(&cand_local, &tf.tz);
+        if cursor.until_utc.is_some_and(|u| s_utc > u)
+            || cursor.next_split_utc.is_some_and(|n| s_utc >= n)
+        {
+            cursor.finished = true;
+            break;
+        }
+        if master_exdates.is_some_and(|ex| ex.matches(s_utc, ldt.date, ldt.time))
+            || single_overrides
+                .iter()
+                .any(|o| o.recurrence_id_utc == s_utc)
+        {
+            continue;
+        }
+        let (e_utc, e_local) = compute_end_local(&cand_local, s_utc, tf.span, &tf.tz);
+        if !keeps_for_after(s_utc, e_utc, earliest_end_utc) {
             continue;
         }
         found = Some(Occurrence {
-            component_id: master.component_id,
-            kind: master.kind.clone(),
+            component_id: tf.component_id,
+            kind: tf.kind.clone(),
             start_utc: s_utc,
             end_utc: e_utc,
             start_local: cand_local,
             end_local: e_local,
-            is_all_day: master.is_all_day,
+            is_all_day: tf.is_all_day,
             recurrence_id_utc: Some(s_utc),
             parent_id: None,
         });
@@ -733,6 +1173,15 @@ fn advance_owned_cursor(
         cursor.finished = true;
     }
     Ok(found)
+}
+
+#[inline]
+const fn keeps_for_after(start_utc: i64, end_utc: i64, earliest_end_utc: i64) -> bool {
+    if end_utc > start_utc {
+        end_utc > earliest_end_utc
+    } else {
+        start_utc >= earliest_end_utc
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -810,61 +1259,23 @@ fn classify_component_group(
     Ok(())
 }
 
-fn push_master_statics(
-    master: &crate::recurrence::series::MasterSeries,
-    series_idx: usize,
-    cutoff: Option<i64>,
-    earliest_end_utc: i64,
-    static_items: &mut BinaryHeap<Reverse<HeapEntry>>,
-) {
-    let mut try_push = |dt: &CalDateTime| {
-        let s_utc = resolve_local_with_tz(dt, &master.tz);
-        let (e_utc, e_loc) = compute_end_local(dt, s_utc, master.span, &master.tz);
-        let keep = if e_utc > s_utc {
-            e_utc > earliest_end_utc
-        } else {
-            s_utc >= earliest_end_utc
-        };
-        if keep
-            && cutoff.is_none_or(|c| s_utc < c)
-            && !master.exdates.matches(s_utc, dt.date, dt.time)
-        {
-            static_items.push(Reverse(HeapEntry {
-                occ: Occurrence {
-                    component_id: master.component_id,
-                    kind: master.kind.clone(),
-                    start_utc: s_utc,
-                    end_utc: e_utc,
-                    start_local: dt.clone(),
-                    end_local: e_loc,
-                    is_all_day: master.is_all_day,
-                    recurrence_id_utc: Some(s_utc),
-                    parent_id: None,
-                },
-                source: HeapSource::Series(series_idx),
-                is_master: true,
-            }));
-        }
-    };
-
-    try_push(&master.start_local);
-    for rdt in &master.rdates {
-        try_push(rdt);
-    }
-}
-
 fn has_valarm_child(comp: ComponentRef<'_>) -> bool {
     comp.children().any(|c| c.kind() == &ComponentKind::VAlarm)
 }
 
-fn resolve_local_with_tz(dt: &CalDateTime, tz: &CalendarTimeZone) -> i64 {
-    if matches!(dt.tz, icaloxide_core::datetime::TimeZoneRef::Utc) {
-        return dt.to_naive_timestamp();
+fn scan_max_alarm_pad(comp: ComponentRef<'_>) -> i64 {
+    let mut max_pad: i64 = 0;
+    for child in comp.children() {
+        if child.kind() != &ComponentKind::VAlarm {
+            continue;
+        }
+        if let Some(PropertyValue::Duration(d)) =
+            child.property(&PropertyName::Trigger).map(|p| &p.value)
+        {
+            max_pad = max_pad.max(d.total_seconds().abs() + 86_400);
+        }
     }
-    match tz.resolve_local(dt.date, dt.time, DstDisambiguation::Compatible) {
-        Ok(r) => r.utc_timestamp,
-        Err(_) => dt.to_naive_timestamp(),
-    }
+    max_pad
 }
 
 fn resolve_until_with_tz(rule: &crate::rrule::RRule, tz: &CalendarTimeZone) -> Option<i64> {
@@ -892,4 +1303,99 @@ fn resolve_until_with_tz(rule: &crate::rrule::RRule, tz: &CalendarTimeZone) -> O
             }
         }
     })
+}
+
+type ComponentGrouping<'a> = (
+    FxHashMap<(ComponentKind, String), Vec<ComponentRef<'a>>>,
+    Vec<ComponentRef<'a>>,
+);
+
+fn push_partitioned<'a>(
+    comp: ComponentRef<'a>,
+    want_alarms: bool,
+    has_alarm: bool,
+    max_alarm_pad_secs: &mut i64,
+    grouped: &mut FxHashMap<(ComponentKind, String), Vec<ComponentRef<'a>>>,
+    ungrouped: &mut Vec<ComponentRef<'a>>,
+) {
+    if want_alarms && has_alarm {
+        *max_alarm_pad_secs = (*max_alarm_pad_secs).max(scan_max_alarm_pad(comp));
+    }
+    if let Some(uid) = comp.uid() {
+        grouped
+            .entry((comp.kind().clone(), uid.to_owned()))
+            .or_default()
+            .push(comp);
+    } else {
+        ungrouped.push(comp);
+    }
+}
+
+fn partition_query_components<'a>(
+    cal: &'a Calendar,
+    want_non_alarm: &[ComponentKind],
+    want_alarms: bool,
+    want_availability: bool,
+    max_alarm_pad_secs: &mut i64,
+) -> ComponentGrouping<'a> {
+    let mut grouped: FxHashMap<(ComponentKind, String), Vec<ComponentRef<'a>>> =
+        FxHashMap::default();
+    let mut ungrouped: Vec<ComponentRef<'a>> = Vec::new();
+
+    for comp in cal.root().children() {
+        if matches!(
+            comp.kind(),
+            ComponentKind::VTimezone | ComponentKind::VFreeBusy
+        ) {
+            continue;
+        }
+        if comp.kind() == &ComponentKind::VAvailability {
+            if want_availability {
+                for child in comp.children() {
+                    if child.kind() == &ComponentKind::Available {
+                        let child_alarm = has_valarm_child(child);
+                        push_partitioned(
+                            child,
+                            want_alarms,
+                            child_alarm,
+                            max_alarm_pad_secs,
+                            &mut grouped,
+                            &mut ungrouped,
+                        );
+                    }
+                }
+                if want_non_alarm.contains(&ComponentKind::VAvailability)
+                    && comp.property(&PropertyName::DtStart).is_some()
+                {
+                    let has_alarm = has_valarm_child(comp);
+                    push_partitioned(
+                        comp,
+                        want_alarms,
+                        has_alarm,
+                        max_alarm_pad_secs,
+                        &mut grouped,
+                        &mut ungrouped,
+                    );
+                }
+            }
+            continue;
+        }
+
+        let is_direct = want_non_alarm.contains(comp.kind())
+            || (want_availability && comp.kind() == &ComponentKind::Available);
+        let has_alarm = want_alarms && has_valarm_child(comp);
+        if !is_direct && !has_alarm {
+            continue;
+        }
+        push_partitioned(
+            comp,
+            want_alarms,
+            has_alarm,
+            max_alarm_pad_secs,
+            &mut grouped,
+            &mut ungrouped,
+        );
+    }
+
+    (grouped, ungrouped)
 }

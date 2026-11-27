@@ -58,8 +58,8 @@ for ev in events:
 - **Zero-Copy / Single-Pass Lexer**: Uses `memchr` SIMD scanning and fast-path line unfolding that borrows straight from input slices on unfolded lines while correctly unfolding UTF-8 sequences split across fold boundaries.
 - **Compact Arena AST**: Interned `PropertyName`, `ParamName`, and `ComponentKind` enums eliminate thousands of heap string allocations; components live in a cache-friendly flat `Vec<ComponentNode>` arena.
 - **Embedded IANA + CLDR Windows + `VTIMEZONE` Compiler**: Bundled `jiff` TZDB guarantees consistent timezone resolution on Windows, Linux, and macOS without external `tzdata`, plus compiled transition tables for custom `VTIMEZONE`s.
-- **Interval-Pruned $O(1)$ Fast-Forward `RRULE` Engine**: Jumps directly to target windows when `COUNT` is absent, handles `RDATE`, dual-key `EXDATE`, `RECURRENCE-ID` (`RANGE=THISANDFUTURE`), `VEVENT`/`VTODO`/`VJOURNAL`/`VFREEBUSY`/`VALARM`, and enforces DoS iteration budgets.
-- **Lazy Python Proxies**: `Calendar.from_ical(...)` parses in Rust with the GIL released (`allow_threads`) and exposes lightweight lazy `Component` / `Occurrence` handles.
+- **Interval-Pruned $O(1)$ Fast-Forward `RRULE` Engine**: Jumps directly to target windows when `COUNT` is absent, handles `RDATE` (including `VALUE=PERIOD`), dual-key `EXDATE`, `RECURRENCE-ID` (`RANGE=THISANDFUTURE` series splitting), `VEVENT`/`VTODO`/`VJOURNAL`/`VFREEBUSY`/`VAVAILABILITY`/`AVAILABLE`/`VALARM`, `skip_bad_series`, `paginate()`, and enforces DoS iteration budgets.
+- **Lazy Python Proxies, Builder & jCal (`RFC 7265`)**: `Calendar.from_ical(...)` parses in Rust with the GIL released (`allow_threads`), `CalendarBuilder` builds calendars natively in Rust, and `icaloxide.compat` covers `Parameters`, `vRecur`/`vGeo`/`vPeriod`/`vDuration` value wrappers, `Availability`/`Available`, and `to_jcal`/`from_jcal`.
 
 ## Roadmap Status
 

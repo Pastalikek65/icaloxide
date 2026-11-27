@@ -297,3 +297,23 @@ END:VCALENDAR\r\n";
     let err = Calendar::parse_with_options(deep.as_bytes(), &opts).unwrap_err();
     assert_eq!(err.kind, ParseErrorKind::MaxDepthExceeded { max_depth: 2 });
 }
+
+#[test]
+fn used_missing_tzids_uid_lookup_and_validate() {
+    let ics = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+PRODID:-//icaloxide//val//EN\r\n\
+BEGIN:VEVENT\r\n\
+UID:u-1\r\n\
+DTSTART;TZID=Europe/Istanbul:20260601T100000\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+
+    let cal = Calendar::parse_str(ics).unwrap();
+    assert_eq!(cal.used_tzids(), vec!["Europe/Istanbul"]);
+    assert_eq!(cal.missing_tzids(), vec!["Europe/Istanbul"]);
+    assert_eq!(cal.components_with_uid("u-1").len(), 1);
+    let issues = cal.validate();
+    assert!(issues.iter().any(|w| w.message.contains("DTSTAMP")));
+}

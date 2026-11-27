@@ -1,7 +1,4 @@
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
-
-use icaloxide_core::datetime::{CalDate, CalDateTime, CalTime, TimeZoneRef};
+use icaloxide_core::datetime::{CalDate, CalDateTime, CalPeriod, CalTime, TimeZoneRef};
 use icaloxide_core::model::{
     ComponentId, ComponentKind, ComponentRef, ParamName, PropertyName, PropertyValue,
 };
@@ -17,6 +14,13 @@ use crate::rrule::{LocalDateTime, RRule, RRuleIter, UntilValue};
 pub enum SpanDuration {
     Days(i32),
     Seconds(i64),
+}
+
+/// An `RDATE` entry with optional custom duration (`RDATE;VALUE=PERIOD`).
+#[derive(Debug, Clone)]
+pub struct RDateEntry {
+    pub start_local: CalDateTime,
+    pub custom_span: Option<SpanDuration>,
 }
 
 /// Dual-key exclusion set matching `EXDATE` and `RECURRENCE-ID` across UTC instants,
@@ -73,8 +77,7 @@ impl ExclusionSet {
     }
 }
 
-/// Resolve a [`CalDateTime`] to `(utc_timestamp, CalendarTimeZone)`, falling back to `default_tz`
-/// or UTC if a referenced `TZID` is unknown or floating.
+/// Resolve a [`CalDateTime`] to `(utc_timestamp, CalendarTimeZone)`.
 pub fn resolve_datetime_with_fallback(
     dt: &CalDateTime,
     reg: &TzRegistry,
@@ -143,7 +146,7 @@ pub struct ExtractedTiming {
     pub cancelled: bool,
 }
 
-/// Extract timing (`DTSTART`/`DUE`/`DTEND`/`DURATION`) from a component (`VEVENT`, `VTODO`, `VJOURNAL`, `AVAILABLE`).
+/// Extract timing (`DTSTART`/`DUE`/`DTEND`/`DURATION`) from a component.
 pub fn extract_component_timing(
     comp: ComponentRef<'_>,
     reg: &TzRegistry,
@@ -241,6 +244,10 @@ pub struct OverrideEntry {
     pub end_utc: i64,
     pub start_local: CalDateTime,
     pub end_local: CalDateTime,
+    pub span: SpanDuration,
+    pub tz: CalendarTimeZone,
+    pub time_shift_secs: i64,
+    pub override_rrules: Vec<RRule>,
     pub is_all_day: bool,
     pub cancelled: bool,
     pub sequence: i64,
@@ -257,7 +264,7 @@ pub struct MasterSeries {
     pub is_all_day: bool,
     pub cancelled: bool,
     pub rrules: Vec<RRule>,
-    pub rdates: Vec<CalDateTime>,
+    pub rdates: Vec<RDateEntry>,
     pub exdates: ExclusionSet,
     pub min_start_utc: i64,
     pub max_end_utc: Option<i64>,
@@ -267,8 +274,12 @@ pub struct MasterSeries {
 #[derive(Debug, Clone)]
 pub struct CompiledSeries {
     pub master: Option<MasterSeries>,
+    /// Single-instance `RECURRENCE-ID` overrides (without `RANGE=THISANDFUTURE`).
     pub overrides: Vec<OverrideEntry>,
-    pub this_and_future_cutoff: Option<i64>,
+    /// Chronologically sorted `RANGE=THISANDFUTURE` overrides.
+    pub this_and_future: Vec<OverrideEntry>,
+    /// Cutoff UTC timestamp where a `THISANDFUTURE` override carrying its own `RRULE` takes over.
+    pub rrule_split_cutoff: Option<i64>,
     pub min_start_utc: i64,
     pub max_end_utc: Option<i64>,
 }
@@ -281,28 +292,16 @@ impl CompiledSeries {
         reg: &TzRegistry,
         default_tz: &CalendarTimeZone,
     ) -> Result<Option<Self>, RRuleError> {
-        let mut overrides = Vec::with_capacity(override_comps.len());
-        let mut override_exclusions = ExclusionSet::default();
-        let mut this_and_future_cutoff: Option<i64> = None;
-
+        let mut all_overrides = Vec::with_capacity(override_comps.len());
         for &ov in override_comps {
-            if let Some(entry) = build_override(ov, reg, default_tz) {
-                override_exclusions
-                    .utc_instants
-                    .insert(entry.recurrence_id_utc);
-                if entry.is_this_and_future {
-                    this_and_future_cutoff = Some(match this_and_future_cutoff {
-                        Some(cur) => cur.min(entry.recurrence_id_utc),
-                        None => entry.recurrence_id_utc,
-                    });
-                }
-                overrides.push(entry);
+            if let Some(entry) = build_override(ov, reg, default_tz)? {
+                all_overrides.push(entry);
             }
         }
 
-        // Deduplicate overrides targeting the same RECURRENCE-ID by keeping highest SEQUENCE (or later).
-        overrides.sort_by_key(|o| (o.recurrence_id_utc, o.sequence, o.component_id.0));
-        overrides.dedup_by(|later, earlier| {
+        // Deduplicate overrides targeting the same RECURRENCE-ID by highest SEQUENCE (or later).
+        all_overrides.sort_by_key(|o| (o.recurrence_id_utc, o.sequence, o.component_id.0));
+        all_overrides.dedup_by(|later, earlier| {
             if later.recurrence_id_utc == earlier.recurrence_id_utc {
                 *earlier = later.clone();
                 true
@@ -311,13 +310,35 @@ impl CompiledSeries {
             }
         });
 
+        let mut single_overrides = Vec::new();
+        let mut this_and_future = Vec::new();
+        let mut override_exclusions = ExclusionSet::default();
+        let mut rrule_split_cutoff: Option<i64> = None;
+
+        for ov in all_overrides {
+            if ov.is_this_and_future {
+                if !ov.override_rrules.is_empty() {
+                    rrule_split_cutoff = Some(match rrule_split_cutoff {
+                        Some(cur) => cur.min(ov.recurrence_id_utc),
+                        None => ov.recurrence_id_utc,
+                    });
+                }
+                this_and_future.push(ov);
+            } else {
+                override_exclusions
+                    .utc_instants
+                    .insert(ov.recurrence_id_utc);
+                single_overrides.push(ov);
+            }
+        }
+
         let master = if let Some(mc) = master_comp {
             build_master(mc, reg, default_tz, override_exclusions)?
         } else {
             None
         };
 
-        if master.is_none() && overrides.is_empty() {
+        if master.is_none() && single_overrides.is_empty() && this_and_future.is_empty() {
             return Ok(None);
         }
 
@@ -331,17 +352,30 @@ impl CompiledSeries {
                 _ => None,
             };
         }
-        for o in &overrides {
+        for o in &single_overrides {
             min_start_utc = min_start_utc.min(o.start_utc);
             if let Some(cur_max) = max_end_utc {
                 max_end_utc = Some(cur_max.max(o.end_utc));
             }
         }
+        for tf in &this_and_future {
+            min_start_utc = min_start_utc.min(tf.start_utc);
+            if !tf.override_rrules.is_empty() {
+                // Bounded only if all override RRULEs have UNTIL; conservative unbounded if any lacks UNTIL.
+                if tf.override_rrules.iter().any(|r| r.until.is_none()) {
+                    max_end_utc = None;
+                }
+            } else if let Some(cur_max) = max_end_utc {
+                let shifted_max = cur_max + tf.time_shift_secs.max(0);
+                max_end_utc = Some(shifted_max.max(tf.end_utc));
+            }
+        }
 
         Ok(Some(Self {
             master,
-            overrides,
-            this_and_future_cutoff,
+            overrides: single_overrides,
+            this_and_future,
+            rrule_split_cutoff,
             min_start_utc,
             max_end_utc,
         }))
@@ -356,7 +390,7 @@ impl CompiledSeries {
         budget: IterationBudget,
         out: &mut Vec<Occurrence>,
     ) -> Result<(), RRuleError> {
-        if start_utc < self.min_start_utc && end_utc <= self.min_start_utc {
+        if end_utc <= self.min_start_utc {
             return Ok(());
         }
         if let Some(max_end) = self.max_end_utc {
@@ -365,7 +399,6 @@ impl CompiledSeries {
             }
         }
 
-        // Emit matching overrides
         for ov in &self.overrides {
             if skip_cancelled && ov.cancelled {
                 continue;
@@ -385,38 +418,70 @@ impl CompiledSeries {
             }
         }
 
-        let Some(master) = &self.master else {
-            return Ok(());
-        };
-        if skip_cancelled && master.cancelled {
-            return Ok(());
+        if let Some(master) = &self.master {
+            if !(skip_cancelled && master.cancelled) {
+                expand_master_window(
+                    master,
+                    &self.this_and_future,
+                    self.rrule_split_cutoff,
+                    skip_cancelled,
+                    start_utc,
+                    end_utc,
+                    budget,
+                    out,
+                )?;
+            }
         }
 
-        expand_master_window(
-            master,
-            self.this_and_future_cutoff,
-            start_utc,
-            end_utc,
-            budget,
-            out,
-        )
-    }
+        // Expand any THISANDFUTURE overrides that define their own replacement RRULE (or have no master).
+        for (idx, tf) in self.this_and_future.iter().enumerate() {
+            if skip_cancelled && tf.cancelled {
+                continue;
+            }
+            if tf.override_rrules.is_empty() {
+                if self.master.is_none()
+                    && overlaps_window(tf.start_utc, tf.end_utc, start_utc, end_utc)
+                {
+                    out.push(Occurrence {
+                        component_id: tf.component_id,
+                        kind: tf.kind.clone(),
+                        start_utc: tf.start_utc,
+                        end_utc: tf.end_utc,
+                        start_local: tf.start_local.clone(),
+                        end_local: tf.end_local.clone(),
+                        is_all_day: tf.is_all_day,
+                        recurrence_id_utc: Some(tf.recurrence_id_utc),
+                        parent_id: None,
+                    });
+                }
+                continue;
+            }
+            let next_split = self
+                .this_and_future
+                .get(idx + 1)
+                .map(|n| n.recurrence_id_utc);
+            expand_this_and_future_rrules(
+                tf,
+                next_split,
+                &self.overrides,
+                self.master.as_ref().map(|m| &m.exdates),
+                start_utc,
+                end_utc,
+                budget,
+                out,
+            )?;
+        }
 
-    /// Create a streaming chronological cursor yielding occurrences with `end_utc >= earliest_end_utc`
-    /// (or `start_utc >= earliest_end_utc` for zero-duration events).
-    pub fn into_stream(
-        &self,
-        earliest_end_utc: i64,
-        skip_cancelled: bool,
-        budget: IterationBudget,
-    ) -> SeriesStream<'_> {
-        SeriesStream::new(self, earliest_end_utc, skip_cancelled, budget)
+        Ok(())
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn expand_master_window(
     master: &MasterSeries,
-    cutoff: Option<i64>,
+    this_and_future: &[OverrideEntry],
+    rrule_split_cutoff: Option<i64>,
+    skip_cancelled: bool,
     start_utc: i64,
     end_utc: i64,
     budget: IterationBudget,
@@ -426,32 +491,45 @@ fn expand_master_window(
         SpanDuration::Days(d) => i64::from(d) * 86_400 + 86_400,
         SpanDuration::Seconds(s) => s,
     };
+    let max_back_shift = this_and_future
+        .iter()
+        .map(|tf| (-tf.time_shift_secs).max(0))
+        .max()
+        .unwrap_or(0);
     let ff_utc = start_utc
-        .saturating_sub(max_span_secs)
+        .saturating_sub(max_span_secs + max_back_shift)
         .max(master.min_start_utc);
     let ff_local = utc_to_local_approx(ff_utc, &master.tz);
-    let win_end_local = utc_to_local_approx(end_utc + 86_400, &master.tz);
+    let win_end_local = utc_to_local_approx(end_utc + max_back_shift + 86_400, &master.tz);
 
     let mut seen_instants: FxHashSet<i64> = FxHashSet::default();
 
-    let mut emit_candidate = |cand: &CalDateTime| {
+    let mut emit_candidate = |cand: &CalDateTime, custom_span: Option<SpanDuration>| {
         let s_utc = resolve_local_instant(cand, &master.tz);
-        if s_utc >= end_utc {
+        if rrule_split_cutoff.is_some_and(|cut| s_utc >= cut) {
             return;
         }
-        if is_excluded(master, cutoff, s_utc, cand.date, cand.time) {
+        if master.exdates.matches(s_utc, cand.date, cand.time) {
             return;
         }
         if !seen_instants.insert(s_utc) {
             return;
         }
-        let (e_utc, e_local) = compute_end_local(cand, s_utc, master.span, &master.tz);
-        if overlaps_window(s_utc, e_utc, start_utc, end_utc) {
-            out.push(make_master_occ(master, s_utc, e_utc, cand.clone(), e_local));
+        if let Some(occ) = apply_this_and_future_shift(
+            master,
+            this_and_future,
+            s_utc,
+            cand,
+            custom_span.unwrap_or(master.span),
+            skip_cancelled,
+        ) {
+            if overlaps_window(occ.start_utc, occ.end_utc, start_utc, end_utc) {
+                out.push(occ);
+            }
         }
     };
 
-    emit_candidate(&master.start_local);
+    emit_candidate(&master.start_local, None);
 
     let dtstart_ldt = LocalDateTime::new(master.start_local.date, master.start_local.time);
     for rule in &master.rrules {
@@ -469,283 +547,144 @@ fn expand_master_window(
                 tz: master.start_local.tz.clone(),
             };
             let s_utc = resolve_local_instant(&cand, &master.tz);
-            if until_utc.is_some_and(|u| s_utc > u) || s_utc >= end_utc {
+            if until_utc.is_some_and(|u| s_utc > u)
+                || rrule_split_cutoff.is_some_and(|cut| s_utc >= cut)
+                || s_utc >= end_utc + max_back_shift
+            {
                 break;
             }
-            emit_candidate(&cand);
+            emit_candidate(&cand, None);
         }
     }
 
     for rdt in &master.rdates {
-        emit_candidate(rdt);
+        emit_candidate(&rdt.start_local, rdt.custom_span);
     }
 
     Ok(())
 }
 
-/// Streaming chronological occurrence cursor for one [`CompiledSeries`].
-pub struct SeriesStream<'a> {
-    series: &'a CompiledSeries,
-    earliest_end_utc: i64,
-    skip_cancelled: bool,
-    rule_iters: Vec<RuleCursor<'a>>,
-    static_items: BinaryHeap<Reverse<OccurrenceKey>>,
-    seen_instants: FxHashSet<i64>,
-}
+#[allow(clippy::too_many_arguments)]
+fn expand_this_and_future_rrules(
+    tf: &OverrideEntry,
+    next_split_utc: Option<i64>,
+    single_overrides: &[OverrideEntry],
+    master_exdates: Option<&ExclusionSet>,
+    start_utc: i64,
+    end_utc: i64,
+    budget: IterationBudget,
+    out: &mut Vec<Occurrence>,
+) -> Result<(), RRuleError> {
+    let dtstart_ldt = LocalDateTime::new(tf.start_local.date, tf.start_local.time);
+    let max_span_secs = match tf.span {
+        SpanDuration::Days(d) => i64::from(d) * 86_400 + 86_400,
+        SpanDuration::Seconds(s) => s,
+    };
+    let ff_utc = start_utc.saturating_sub(max_span_secs).max(tf.start_utc);
+    let ff_local = utc_to_local_approx(ff_utc, &tf.tz);
+    let win_end_local = utc_to_local_approx(end_utc + 86_400, &tf.tz);
+    let mut seen: FxHashSet<i64> = FxHashSet::default();
 
-#[derive(Debug, Clone)]
-struct OccurrenceKey {
-    occ: Occurrence,
-    is_master: bool,
-}
-
-impl PartialEq for OccurrenceKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.occ.start_utc == other.occ.start_utc
-            && self.occ.end_utc == other.occ.end_utc
-            && self.occ.component_id.0 == other.occ.component_id.0
-    }
-}
-impl Eq for OccurrenceKey {}
-impl PartialOrd for OccurrenceKey {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for OccurrenceKey {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (
-            self.occ.start_utc,
-            self.occ.end_utc,
-            self.occ.component_id.0,
-        )
-            .cmp(&(
-                other.occ.start_utc,
-                other.occ.end_utc,
-                other.occ.component_id.0,
-            ))
-    }
-}
-
-struct RuleCursor<'a> {
-    iter: RRuleIter<'a>,
-    until_utc: Option<i64>,
-    next_occ: Option<Occurrence>,
-}
-
-impl<'a> SeriesStream<'a> {
-    fn new(
-        series: &'a CompiledSeries,
-        earliest_end_utc: i64,
-        skip_cancelled: bool,
-        budget: IterationBudget,
-    ) -> Self {
-        let mut static_items = BinaryHeap::new();
-        for ov in &series.overrides {
-            if skip_cancelled && ov.cancelled {
-                continue;
+    for rule in &tf.override_rrules {
+        let until_utc = resolve_until_utc(rule, &tf.tz);
+        let until_local = until_utc.map(|u| utc_to_local_approx(u + 86_400, &tf.tz));
+        for item in RRuleIter::new(rule, dtstart_ldt, until_local, Some(ff_local), budget) {
+            let ldt = item?;
+            if ldt > win_end_local {
+                break;
             }
-            if keeps_for_after(ov.start_utc, ov.end_utc, earliest_end_utc) {
-                static_items.push(Reverse(OccurrenceKey {
-                    occ: Occurrence {
-                        component_id: ov.component_id,
-                        kind: ov.kind.clone(),
-                        start_utc: ov.start_utc,
-                        end_utc: ov.end_utc,
-                        start_local: ov.start_local.clone(),
-                        end_local: ov.end_local.clone(),
-                        is_all_day: ov.is_all_day,
-                        recurrence_id_utc: Some(ov.recurrence_id_utc),
-                        parent_id: None,
-                    },
-                    is_master: false,
-                }));
-            }
-        }
-
-        let mut rule_iters = Vec::new();
-        if let Some(master) = &series.master {
-            if !(skip_cancelled && master.cancelled) {
-                let max_span_secs = match master.span {
-                    SpanDuration::Days(d) => i64::from(d) * 86_400 + 86_400,
-                    SpanDuration::Seconds(s) => s,
-                };
-                let ff_utc = earliest_end_utc
-                    .saturating_sub(max_span_secs)
-                    .max(master.min_start_utc);
-                let ff_local = utc_to_local_approx(ff_utc, &master.tz);
-                let dtstart_ldt =
-                    LocalDateTime::new(master.start_local.date, master.start_local.time);
-
-                if master.rrules.is_empty() {
-                    let s_utc = resolve_local_instant(&master.start_local, &master.tz);
-                    let (e_utc, e_loc) =
-                        compute_end_local(&master.start_local, s_utc, master.span, &master.tz);
-                    if keeps_for_after(s_utc, e_utc, earliest_end_utc)
-                        && !is_excluded(
-                            master,
-                            series.this_and_future_cutoff,
-                            s_utc,
-                            master.start_local.date,
-                            master.start_local.time,
-                        )
-                    {
-                        static_items.push(Reverse(OccurrenceKey {
-                            occ: make_master_occ(
-                                master,
-                                s_utc,
-                                e_utc,
-                                master.start_local.clone(),
-                                e_loc,
-                            ),
-                            is_master: true,
-                        }));
-                    }
-                }
-
-                for rdt in &master.rdates {
-                    let s_utc = resolve_local_instant(rdt, &master.tz);
-                    let (e_utc, e_loc) = compute_end_local(rdt, s_utc, master.span, &master.tz);
-                    if keeps_for_after(s_utc, e_utc, earliest_end_utc)
-                        && !is_excluded(
-                            master,
-                            series.this_and_future_cutoff,
-                            s_utc,
-                            rdt.date,
-                            rdt.time,
-                        )
-                    {
-                        static_items.push(Reverse(OccurrenceKey {
-                            occ: make_master_occ(master, s_utc, e_utc, rdt.clone(), e_loc),
-                            is_master: true,
-                        }));
-                    }
-                }
-
-                for rule in &master.rrules {
-                    let until_utc = resolve_until_utc(rule, &master.tz);
-                    let until_local =
-                        until_utc.map(|u| utc_to_local_approx(u + 86_400, &master.tz));
-                    let iter =
-                        RRuleIter::new(rule, dtstart_ldt, until_local, Some(ff_local), budget);
-                    rule_iters.push(RuleCursor {
-                        iter,
-                        until_utc,
-                        next_occ: None,
-                    });
-                }
-            }
-        }
-
-        Self {
-            series,
-            earliest_end_utc,
-            skip_cancelled,
-            rule_iters,
-            static_items,
-            seen_instants: FxHashSet::default(),
-        }
-    }
-
-    pub fn next_occurrence(&mut self) -> Result<Option<Occurrence>, RRuleError> {
-        loop {
-            if let Some(master) = &self.series.master {
-                if !(self.skip_cancelled && master.cancelled) {
-                    for cursor in &mut self.rule_iters {
-                        if cursor.next_occ.is_none() {
-                            cursor.next_occ = advance_cursor(
-                                cursor,
-                                master,
-                                self.series.this_and_future_cutoff,
-                                self.earliest_end_utc,
-                            )?;
-                        }
-                    }
-                }
-            }
-
-            let best_rule = self
-                .rule_iters
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, c)| c.next_occ.as_ref().map(|o| (idx, o.start_utc, o.end_utc)))
-                .min_by_key(|&(_, s, e)| (s, e));
-
-            let best_static = self.static_items.peek().map(|r| &r.0);
-
-            let chosen = match (best_rule, best_static) {
-                (None, None) => return Ok(None),
-                (Some((idx, _, _)), None) => {
-                    let occ = self.rule_iters[idx].next_occ.take().unwrap();
-                    (occ, true)
-                }
-                (None, Some(_)) => {
-                    let item = self.static_items.pop().unwrap().0;
-                    (item.occ, item.is_master)
-                }
-                (Some((idx, rs, re)), Some(st)) => {
-                    if (rs, re) < (st.occ.start_utc, st.occ.end_utc) {
-                        let occ = self.rule_iters[idx].next_occ.take().unwrap();
-                        (occ, true)
-                    } else {
-                        let item = self.static_items.pop().unwrap().0;
-                        (item.occ, item.is_master)
-                    }
-                }
+            let cand = CalDateTime {
+                date: ldt.date,
+                time: ldt.time,
+                tz: tf.start_local.tz.clone(),
             };
-
-            let (occ, is_master) = chosen;
-            if is_master && !self.seen_instants.insert(occ.start_utc) {
+            let s_utc = resolve_local_instant(&cand, &tf.tz);
+            if until_utc.is_some_and(|u| s_utc > u)
+                || next_split_utc.is_some_and(|n| s_utc >= n)
+                || s_utc >= end_utc
+            {
+                break;
+            }
+            if master_exdates.is_some_and(|ex| ex.matches(s_utc, ldt.date, ldt.time))
+                || single_overrides
+                    .iter()
+                    .any(|o| o.recurrence_id_utc == s_utc)
+                || !seen.insert(s_utc)
+            {
                 continue;
             }
-            return Ok(Some(occ));
+            let (e_utc, e_local) = compute_end_local(&cand, s_utc, tf.span, &tf.tz);
+            if overlaps_window(s_utc, e_utc, start_utc, end_utc) {
+                out.push(Occurrence {
+                    component_id: tf.component_id,
+                    kind: tf.kind.clone(),
+                    start_utc: s_utc,
+                    end_utc: e_utc,
+                    start_local: cand,
+                    end_local: e_local,
+                    is_all_day: tf.is_all_day,
+                    recurrence_id_utc: Some(s_utc),
+                    parent_id: None,
+                });
+            }
         }
     }
+    Ok(())
 }
 
-fn advance_cursor(
-    cursor: &mut RuleCursor<'_>,
+/// Apply the latest `THISANDFUTURE` override (`<= s_utc`) to a master occurrence.
+pub fn apply_this_and_future_shift(
     master: &MasterSeries,
-    cutoff: Option<i64>,
-    earliest_end_utc: i64,
-) -> Result<Option<Occurrence>, RRuleError> {
-    for item in &mut cursor.iter {
-        let ldt = item?;
-        let cand_local = CalDateTime {
+    this_and_future: &[OverrideEntry],
+    s_utc: i64,
+    cand_local: &CalDateTime,
+    base_span: SpanDuration,
+    skip_cancelled: bool,
+) -> Option<Occurrence> {
+    let idx = this_and_future.partition_point(|tf| tf.recurrence_id_utc <= s_utc);
+    if idx == 0 {
+        let (e_utc, e_local) = compute_end_local(cand_local, s_utc, base_span, &master.tz);
+        return Some(Occurrence {
+            component_id: master.component_id,
+            kind: master.kind.clone(),
+            start_utc: s_utc,
+            end_utc: e_utc,
+            start_local: cand_local.clone(),
+            end_local: e_local,
+            is_all_day: master.is_all_day,
+            recurrence_id_utc: Some(s_utc),
+            parent_id: None,
+        });
+    }
+
+    let tf = &this_and_future[idx - 1];
+    if skip_cancelled && tf.cancelled {
+        return None;
+    }
+
+    let shifted_utc = s_utc + tf.time_shift_secs;
+    let shifted_local = if tf.time_shift_secs == 0 && tf.is_all_day == master.is_all_day {
+        cand_local.clone()
+    } else {
+        let ldt = utc_to_local_approx(shifted_utc, &tf.tz);
+        CalDateTime {
             date: ldt.date,
             time: ldt.time,
-            tz: master.start_local.tz.clone(),
-        };
-        let occ_start_utc = resolve_local_instant(&cand_local, &master.tz);
-        if cursor.until_utc.is_some_and(|u| occ_start_utc > u) {
-            return Ok(None);
+            tz: tf.start_local.tz.clone(),
         }
-        if is_excluded(master, cutoff, occ_start_utc, ldt.date, ldt.time) {
-            continue;
-        }
-        let (occ_end_utc, end_local) =
-            compute_end_local(&cand_local, occ_start_utc, master.span, &master.tz);
-        if !keeps_for_after(occ_start_utc, occ_end_utc, earliest_end_utc) {
-            continue;
-        }
-        return Ok(Some(make_master_occ(
-            master,
-            occ_start_utc,
-            occ_end_utc,
-            cand_local,
-            end_local,
-        )));
-    }
-    Ok(None)
-}
-
-#[inline]
-const fn keeps_for_after(start_utc: i64, end_utc: i64, earliest_end_utc: i64) -> bool {
-    if end_utc > start_utc {
-        end_utc > earliest_end_utc
-    } else {
-        start_utc >= earliest_end_utc
-    }
+    };
+    let (e_utc, e_local) = compute_end_local(&shifted_local, shifted_utc, tf.span, &tf.tz);
+    Some(Occurrence {
+        component_id: tf.component_id,
+        kind: tf.kind.clone(),
+        start_utc: shifted_utc,
+        end_utc: e_utc,
+        start_local: shifted_local,
+        end_local: e_local,
+        is_all_day: tf.is_all_day,
+        recurrence_id_utc: Some(s_utc),
+        parent_id: None,
+    })
 }
 
 #[inline]
@@ -757,21 +696,7 @@ pub const fn overlaps_window(occ_start: i64, occ_end: i64, win_start: i64, win_e
     }
 }
 
-#[inline]
-fn is_excluded(
-    master: &MasterSeries,
-    this_and_future_cutoff: Option<i64>,
-    utc_ts: i64,
-    date: CalDate,
-    time: CalTime,
-) -> bool {
-    if this_and_future_cutoff.is_some_and(|cut| utc_ts >= cut) {
-        return true;
-    }
-    master.exdates.matches(utc_ts, date, time)
-}
-
-fn resolve_local_instant(dt: &CalDateTime, tz: &CalendarTimeZone) -> i64 {
+pub fn resolve_local_instant(dt: &CalDateTime, tz: &CalendarTimeZone) -> i64 {
     if matches!(dt.tz, TimeZoneRef::Utc) {
         return dt.to_naive_timestamp();
     }
@@ -781,12 +706,12 @@ fn resolve_local_instant(dt: &CalDateTime, tz: &CalendarTimeZone) -> i64 {
     }
 }
 
-fn utc_to_local_approx(utc_ts: i64, tz: &CalendarTimeZone) -> LocalDateTime {
+pub fn utc_to_local_approx(utc_ts: i64, tz: &CalendarTimeZone) -> LocalDateTime {
     let off = tz.offset_at_utc(utc_ts).unwrap_or(0);
     LocalDateTime::from_naive_timestamp(utc_ts + i64::from(off))
 }
 
-fn resolve_until_utc(rule: &RRule, tz: &CalendarTimeZone) -> Option<i64> {
+pub fn resolve_until_utc(rule: &RRule, tz: &CalendarTimeZone) -> Option<i64> {
     let u = rule.until.as_ref()?;
     Some(match u {
         UntilValue::Date(d) => {
@@ -813,32 +738,14 @@ fn resolve_until_utc(rule: &RRule, tz: &CalendarTimeZone) -> Option<i64> {
     })
 }
 
-fn make_master_occ(
-    master: &MasterSeries,
-    start_utc: i64,
-    end_utc: i64,
-    start_local: CalDateTime,
-    end_local: CalDateTime,
-) -> Occurrence {
-    Occurrence {
-        component_id: master.component_id,
-        kind: master.kind.clone(),
-        start_utc,
-        end_utc,
-        start_local,
-        end_local,
-        is_all_day: master.is_all_day,
-        recurrence_id_utc: Some(start_utc),
-        parent_id: None,
-    }
-}
-
 fn build_override(
     comp: ComponentRef<'_>,
     reg: &TzRegistry,
     default_tz: &CalendarTimeZone,
-) -> Option<OverrideEntry> {
-    let rid_prop = comp.property(&PropertyName::RecurrenceId)?;
+) -> Result<Option<OverrideEntry>, RRuleError> {
+    let Some(rid_prop) = comp.property(&PropertyName::RecurrenceId) else {
+        return Ok(None);
+    };
     let (rid_dt, rid_date) = match &rid_prop.value {
         PropertyValue::Date(d) => (
             CalDateTime {
@@ -853,14 +760,16 @@ fn build_override(
             *d,
         ),
         PropertyValue::DateTime(dt) => (dt.clone(), dt.date),
-        _ => return None,
+        _ => return Ok(None),
     };
     let (recurrence_id_utc, _) = resolve_datetime_with_fallback(&rid_dt, reg, default_tz);
     let is_this_and_future = rid_prop
         .param_first(&ParamName::Range)
         .is_some_and(|r| r.eq_ignore_ascii_case("THISANDFUTURE"));
 
-    let timing = extract_component_timing(comp, reg, default_tz)?;
+    let Some(timing) = extract_component_timing(comp, reg, default_tz) else {
+        return Ok(None);
+    };
     let (end_utc, end_local) = compute_end_local(
         &timing.start_local,
         timing.start_utc,
@@ -868,12 +777,19 @@ fn build_override(
         &timing.tz,
     );
 
+    let mut override_rrules = Vec::new();
+    for prop in comp.properties_named(&PropertyName::RRule) {
+        if let Some(raw) = prop.value.as_str() {
+            override_rrules.push(RRule::parse(raw)?);
+        }
+    }
+
     let sequence = match comp.property(&PropertyName::Sequence).map(|p| &p.value) {
         Some(PropertyValue::Integer(v)) => *v,
         _ => 0,
     };
 
-    Some(OverrideEntry {
+    Ok(Some(OverrideEntry {
         component_id: comp.id(),
         kind: comp.kind().clone(),
         recurrence_id_utc,
@@ -883,10 +799,91 @@ fn build_override(
         end_utc,
         start_local: timing.start_local,
         end_local,
+        span: timing.span,
+        tz: timing.tz,
+        time_shift_secs: timing.start_utc - recurrence_id_utc,
+        override_rrules,
         is_all_day: timing.is_all_day,
         cancelled: timing.cancelled,
         sequence,
-    })
+    }))
+}
+
+fn push_period_rdate(
+    period: &CalPeriod,
+    reg: &TzRegistry,
+    default_tz: &CalendarTimeZone,
+    out: &mut Vec<RDateEntry>,
+) {
+    match period {
+        CalPeriod::Explicit { start, end } => {
+            let (s_utc, _) = resolve_datetime_with_fallback(start, reg, default_tz);
+            let (e_utc, _) = resolve_datetime_with_fallback(end, reg, default_tz);
+            out.push(RDateEntry {
+                start_local: start.clone(),
+                custom_span: Some(SpanDuration::Seconds((e_utc - s_utc).max(0))),
+            });
+        }
+        CalPeriod::Duration { start, duration } => {
+            out.push(RDateEntry {
+                start_local: start.clone(),
+                custom_span: Some(SpanDuration::Seconds(duration.total_seconds().max(0))),
+            });
+        }
+    }
+}
+
+fn extract_rdates(
+    comp: ComponentRef<'_>,
+    default_start: &CalDateTime,
+    reg: &TzRegistry,
+    default_tz: &CalendarTimeZone,
+) -> Vec<RDateEntry> {
+    let mut rdates = Vec::new();
+    for prop in comp.properties_named(&PropertyName::RDate) {
+        match &prop.value {
+            PropertyValue::DateTimeList(list) => {
+                for dt in list {
+                    rdates.push(RDateEntry {
+                        start_local: dt.clone(),
+                        custom_span: None,
+                    });
+                }
+            }
+            PropertyValue::DateList(list) => {
+                for &d in list {
+                    rdates.push(RDateEntry {
+                        start_local: CalDateTime {
+                            date: d,
+                            time: default_start.time,
+                            tz: default_start.tz.clone(),
+                        },
+                        custom_span: None,
+                    });
+                }
+            }
+            PropertyValue::DateTime(dt) => rdates.push(RDateEntry {
+                start_local: dt.clone(),
+                custom_span: None,
+            }),
+            PropertyValue::Date(d) => rdates.push(RDateEntry {
+                start_local: CalDateTime {
+                    date: *d,
+                    time: default_start.time,
+                    tz: default_start.tz.clone(),
+                },
+                custom_span: None,
+            }),
+            PropertyValue::Period(p) => push_period_rdate(p, reg, default_tz, &mut rdates),
+            PropertyValue::PeriodList(list) => {
+                for p in list {
+                    push_period_rdate(p, reg, default_tz, &mut rdates);
+                }
+            }
+            _ => {}
+        }
+    }
+    rdates
 }
 
 fn build_master(
@@ -906,28 +903,7 @@ fn build_master(
         }
     }
 
-    let mut rdates = Vec::new();
-    for prop in comp.properties_named(&PropertyName::RDate) {
-        match &prop.value {
-            PropertyValue::DateTimeList(list) => rdates.extend(list.iter().cloned()),
-            PropertyValue::DateList(list) => {
-                for &d in list {
-                    rdates.push(CalDateTime {
-                        date: d,
-                        time: timing.start_local.time,
-                        tz: timing.start_local.tz.clone(),
-                    });
-                }
-            }
-            PropertyValue::DateTime(dt) => rdates.push(dt.clone()),
-            PropertyValue::Date(d) => rdates.push(CalDateTime {
-                date: *d,
-                time: timing.start_local.time,
-                tz: timing.start_local.tz.clone(),
-            }),
-            _ => {}
-        }
-    }
+    let rdates = extract_rdates(comp, &timing.start_local, reg, default_tz);
 
     for prop in comp.properties_named(&PropertyName::ExDate) {
         exdates.insert_exdate_value(&prop.value, reg, default_tz);
@@ -935,11 +911,10 @@ fn build_master(
 
     let mut min_start_utc = timing.start_utc;
     for rdt in &rdates {
-        let (u, _) = resolve_datetime_with_fallback(rdt, reg, default_tz);
+        let (u, _) = resolve_datetime_with_fallback(&rdt.start_local, reg, default_tz);
         min_start_utc = min_start_utc.min(u);
     }
 
-    // Determine conservative upper bound when no RRULE is unbounded.
     let max_end_utc = if rrules.is_empty() {
         let mut max_e = compute_end_local(
             &timing.start_local,
@@ -949,8 +924,9 @@ fn build_master(
         )
         .0;
         for rdt in &rdates {
-            let s = resolve_local_instant(rdt, &timing.tz);
-            let e = compute_end_local(rdt, s, timing.span, &timing.tz).0;
+            let s = resolve_local_instant(&rdt.start_local, &timing.tz);
+            let span = rdt.custom_span.unwrap_or(timing.span);
+            let e = compute_end_local(&rdt.start_local, s, span, &timing.tz).0;
             max_e = max_e.max(e);
         }
         Some(max_e)
@@ -972,8 +948,9 @@ fn build_master(
             }
         }
         for rdt in &rdates {
-            let s = resolve_local_instant(rdt, &timing.tz);
-            let e = compute_end_local(rdt, s, timing.span, &timing.tz).0;
+            let s = resolve_local_instant(&rdt.start_local, &timing.tz);
+            let span = rdt.custom_span.unwrap_or(timing.span);
+            let e = compute_end_local(&rdt.start_local, s, span, &timing.tz).0;
             max_e = max_e.max(e);
         }
         Some(max_e)
