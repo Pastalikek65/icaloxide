@@ -155,23 +155,7 @@ impl<'a> UnfoldIter<'a> {
                 line,
                 text: Cow::Borrowed(s),
             }),
-            Err(_) => match self.mode {
-                ParseMode::Strict => Err(ParseError::new(line, 1, ParseErrorKind::InvalidUtf8)),
-                ParseMode::Lenient => {
-                    if collect_warnings {
-                        warnings.push(ParseWarning {
-                            line,
-                            message: CompactString::const_new(
-                                "invalid UTF-8 bytes replaced with U+FFFD",
-                            ),
-                        });
-                    }
-                    Ok(UnfoldedLine {
-                        line,
-                        text: Cow::Owned(String::from_utf8_lossy(bytes).into_owned()),
-                    })
-                }
-            },
+            Err(_) => self.decode_non_utf8(line, bytes, warnings, collect_warnings),
         }
     }
 
@@ -186,23 +170,129 @@ impl<'a> UnfoldIter<'a> {
                 line,
                 text: Cow::Owned(s.to_owned()),
             }),
-            Err(_) => match self.mode {
-                ParseMode::Strict => Err(ParseError::new(line, 1, ParseErrorKind::InvalidUtf8)),
-                ParseMode::Lenient => {
-                    if collect_warnings {
-                        warnings.push(ParseWarning {
-                            line,
-                            message: CompactString::const_new(
-                                "invalid UTF-8 bytes in folded line replaced with U+FFFD",
-                            ),
-                        });
-                    }
-                    Ok(UnfoldedLine {
-                        line,
-                        text: Cow::Owned(String::from_utf8_lossy(&self.scratch).into_owned()),
-                    })
-                }
-            },
+            Err(_) => self.decode_non_utf8(line, &self.scratch, warnings, collect_warnings),
         }
     }
+
+    fn decode_non_utf8(
+        &self,
+        line: usize,
+        bytes: &[u8],
+        warnings: &mut Vec<ParseWarning>,
+        collect_warnings: bool,
+    ) -> Result<UnfoldedLine<'a>, ParseError> {
+        if let Some(decoded) = decode_legacy_charset(bytes) {
+            if collect_warnings {
+                warnings.push(ParseWarning {
+                    line,
+                    message: CompactString::const_new(
+                        "decoded non-UTF-8 line using declared CHARSET parameter",
+                    ),
+                });
+            }
+            return Ok(UnfoldedLine {
+                line,
+                text: Cow::Owned(decoded),
+            });
+        }
+        match self.mode {
+            ParseMode::Strict => Err(ParseError::new(line, 1, ParseErrorKind::InvalidUtf8)),
+            ParseMode::Lenient => {
+                if collect_warnings {
+                    warnings.push(ParseWarning {
+                        line,
+                        message: CompactString::const_new(
+                            "invalid UTF-8 bytes replaced with U+FFFD",
+                        ),
+                    });
+                }
+                Ok(UnfoldedLine {
+                    line,
+                    text: Cow::Owned(String::from_utf8_lossy(bytes).into_owned()),
+                })
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LegacyCharset {
+    Iso88591,
+    Windows1252,
+}
+
+const WIN1252_UPPER: [char; 32] = [
+    '\u{20AC}', '\u{FFFD}', '\u{201A}', '\u{0192}', '\u{201E}', '\u{2026}', '\u{2020}', '\u{2021}',
+    '\u{02C6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{FFFD}', '\u{017D}', '\u{FFFD}',
+    '\u{FFFD}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}', '\u{2022}', '\u{2013}', '\u{2014}',
+    '\u{02DC}', '\u{2122}', '\u{0161}', '\u{203A}', '\u{0153}', '\u{FFFD}', '\u{017E}', '\u{0178}',
+];
+
+fn detect_legacy_charset(bytes: &[u8]) -> Option<LegacyCharset> {
+    let mut in_quotes = false;
+    let mut colon_pos = bytes.len();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'"' {
+            in_quotes = !in_quotes;
+        } else if b == b':' && !in_quotes {
+            colon_pos = i;
+            break;
+        }
+    }
+    let header = &bytes[..colon_pos];
+    let semi = header.iter().position(|&b| b == b';')?;
+    for part in header[semi + 1..].split(|&b| b == b';') {
+        let trimmed = trim_ascii_bytes(part);
+        if trimmed.len() > 8 && trimmed[..8].eq_ignore_ascii_case(b"CHARSET=") {
+            let val = trim_ascii_bytes(&trimmed[8..]);
+            let unquoted = if val.len() >= 2 && val.starts_with(b"\"") && val.ends_with(b"\"") {
+                &val[1..val.len() - 1]
+            } else {
+                val
+            };
+            if unquoted.eq_ignore_ascii_case(b"ISO-8859-1")
+                || unquoted.eq_ignore_ascii_case(b"LATIN1")
+                || unquoted.eq_ignore_ascii_case(b"LATIN-1")
+            {
+                return Some(LegacyCharset::Iso88591);
+            }
+            if unquoted.eq_ignore_ascii_case(b"WINDOWS-1252")
+                || unquoted.eq_ignore_ascii_case(b"CP1252")
+            {
+                return Some(LegacyCharset::Windows1252);
+            }
+        }
+    }
+    None
+}
+
+fn trim_ascii_bytes(mut s: &[u8]) -> &[u8] {
+    while let Some((&b, rest)) = s.split_first() {
+        if b.is_ascii_whitespace() {
+            s = rest;
+        } else {
+            break;
+        }
+    }
+    while let Some((&b, rest)) = s.split_last() {
+        if b.is_ascii_whitespace() {
+            s = rest;
+        } else {
+            break;
+        }
+    }
+    s
+}
+
+fn decode_legacy_charset(bytes: &[u8]) -> Option<String> {
+    let charset = detect_legacy_charset(bytes)?;
+    let mut out = String::with_capacity(bytes.len() + 16);
+    for &b in bytes {
+        let ch = match (charset, b) {
+            (LegacyCharset::Windows1252, 0x80..=0x9F) => WIN1252_UPPER[(b - 0x80) as usize],
+            _ => char::from(b),
+        };
+        out.push(ch);
+    }
+    Some(out)
 }

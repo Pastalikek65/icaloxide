@@ -222,6 +222,14 @@ pub enum PropertyName {
     CalendarAddress,
     StructuredData,
     StyledDescription,
+    // RFC 9253 & RFC 9074 Alarm/Relationship Extensions
+    Link,
+    Concept,
+    RefId,
+    Acknowledged,
+    Proximity,
+    XMozLastAck,
+    XMozSnoozeTime,
     // Widely deployed vendor properties
     XWrCalName,
     XWrTimeZone,
@@ -294,6 +302,13 @@ impl PropertyName {
                 "CALENDAR-ADDRESS" => Self::CalendarAddress,
                 "STRUCTURED-DATA" => Self::StructuredData,
                 "STYLED-DESCRIPTION" => Self::StyledDescription,
+                "LINK" => Self::Link,
+                "CONCEPT" => Self::Concept,
+                "REFID" => Self::RefId,
+                "ACKNOWLEDGED" => Self::Acknowledged,
+                "PROXIMITY" => Self::Proximity,
+                "X-MOZ-LASTACK" => Self::XMozLastAck,
+                "X-MOZ-SNOOZE-TIME" => Self::XMozSnoozeTime,
                 "X-WR-CALNAME" => Self::XWrCalName,
                 "X-WR-TIMEZONE" => Self::XWrTimeZone,
                 "X-WR-CALDESC" => Self::XWrCalDesc,
@@ -364,6 +379,13 @@ impl PropertyName {
             Self::CalendarAddress => "CALENDAR-ADDRESS",
             Self::StructuredData => "STRUCTURED-DATA",
             Self::StyledDescription => "STYLED-DESCRIPTION",
+            Self::Link => "LINK",
+            Self::Concept => "CONCEPT",
+            Self::RefId => "REFID",
+            Self::Acknowledged => "ACKNOWLEDGED",
+            Self::Proximity => "PROXIMITY",
+            Self::XMozLastAck => "X-MOZ-LASTACK",
+            Self::XMozSnoozeTime => "X-MOZ-SNOOZE-TIME",
             Self::XWrCalName => "X-WR-CALNAME",
             Self::XWrTimeZone => "X-WR-TIMEZONE",
             Self::XWrCalDesc => "X-WR-CALDESC",
@@ -399,6 +421,8 @@ impl PropertyName {
             | Self::ParticipantType
             | Self::StyledDescription
             | Self::StructuredData
+            | Self::RefId
+            | Self::Proximity
             | Self::XWrCalName
             | Self::XWrTimeZone
             | Self::XWrCalDesc => ValueType::Text,
@@ -410,7 +434,9 @@ impl PropertyName {
             | Self::Url
             | Self::Source
             | Self::Image
-            | Self::Conference => ValueType::Uri,
+            | Self::Conference
+            | Self::Link
+            | Self::Concept => ValueType::Uri,
             Self::Attendee | Self::Organizer | Self::CalendarAddress => ValueType::CalAddress,
 
             Self::Completed
@@ -420,7 +446,10 @@ impl PropertyName {
             | Self::RecurrenceId
             | Self::Created
             | Self::DtStamp
-            | Self::LastModified => ValueType::DateTime,
+            | Self::LastModified
+            | Self::Acknowledged
+            | Self::XMozLastAck
+            | Self::XMozSnoozeTime => ValueType::DateTime,
 
             Self::ExDate | Self::RDate => ValueType::DateOrDateTimeList,
 
@@ -474,6 +503,9 @@ pub enum ParamName {
     Order,
     Schema,
     Derived,
+    Gap,
+    LinkRel,
+    Charset,
     /// Any `X-*` or custom parameter.
     Other(CompactString),
 }
@@ -511,6 +543,9 @@ impl ParamName {
                 "ORDER" => Self::Order,
                 "SCHEMA" => Self::Schema,
                 "DERIVED" => Self::Derived,
+                "GAP" => Self::Gap,
+                "LINKREL" => Self::LinkRel,
+                "CHARSET" => Self::Charset,
                 _ => Self::Other(CompactString::from(upper)),
             };
         }
@@ -547,6 +582,9 @@ impl ParamName {
             Self::Order => "ORDER",
             Self::Schema => "SCHEMA",
             Self::Derived => "DERIVED",
+            Self::Gap => "GAP",
+            Self::LinkRel => "LINKREL",
+            Self::Charset => "CHARSET",
             Self::Other(s) => s.as_str(),
         }
     }

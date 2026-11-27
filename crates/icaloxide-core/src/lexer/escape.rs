@@ -65,12 +65,22 @@ pub fn escape_text(text: &str) -> Cow<'_, str> {
 /// Split a comma-separated RFC 5545 `TEXT` list (e.g. `CATEGORIES`, `RESOURCES`),
 /// honoring `\,` escapes inside individual items.
 pub fn split_escaped_list(raw: &str) -> Vec<CompactString> {
+    split_escaped_delimited(raw, ',')
+}
+
+/// Split a semicolon-separated RFC 5545 structured `TEXT` value (e.g. `REQUEST-STATUS`),
+/// honoring `\;` escapes inside individual parts.
+pub fn split_escaped_semicolon_list(raw: &str) -> Vec<CompactString> {
+    split_escaped_delimited(raw, ';')
+}
+
+fn split_escaped_delimited(raw: &str, delim: char) -> Vec<CompactString> {
     if raw.is_empty() {
         return Vec::new();
     }
 
     if !raw.as_bytes().contains(&b'\\') {
-        return raw.split(',').map(CompactString::from).collect();
+        return raw.split(delim).map(CompactString::from).collect();
     }
 
     let mut items = Vec::new();
@@ -79,7 +89,7 @@ pub fn split_escaped_list(raw: &str) -> Vec<CompactString> {
 
     while let Some(c) = chars.next() {
         match c {
-            ',' => {
+            ch if ch == delim => {
                 items.push(CompactString::from(current.as_str()));
                 current.clear();
             }

@@ -5,6 +5,17 @@ All notable changes to `icaloxide` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-11-27
+
+### Added
+
+- **Upstream Bug Fixes & RFC Completeness Beyond `icalendar` / `recurring-ical-events`**
+  - Legacy `CHARSET=ISO-8859-1` / `WINDOWS-1252` line decoding in `UnfoldIter` before UTF-8 fallback (beats `icalendar` #2078).
+  - Proper semicolon-preserving `REQUEST-STATUS` parsing and serialization (`#2123`), stripped redundant `TZID` on `Z` UTC datetimes (`#2020`), and zero-length `PERIOD` strict validation (`#2087`).
+  - Fixed UTC/zoned `EXDATE` / `RECURRENCE-ID` collisions with unrelated local wall-clock times (`recurring-ical-events` #306), and distinguished nominal-day `P1D` vs exact `PT24H` durations across DST (`#2193`).
+  - Standalone component parsing (`Calendar::parse_component` / `Component.from_ical`), native Rust `busy_intervals()` & `free_intervals()`, `next_after()`, unbounded finite `count_all()`, and configurable DoS `max_iterations` / `max_periods` limits.
+  - Complete `compat` parity: `Pages`/`Page` cursor pagination (`next_page_id`, `latest_start`), all `DateArgument` forms (`int`, `str`, 1–6 element tuples), multi-calendar `of([cal1, cal2])`, `Timezone.from_tzid`/`from_tzinfo`/`to_tz`/`get_transitions`, RFC 9074 `Alarms` (snooze/acknowledge/`active`), RFC 6321 xCal (`to_xcal`, `from_xcal`), RFC 9253 (`LINK`, `CONCEPT`, `REFID`), occurrence mutation helpers (`cancel_occurrence`, `modify_occurrence`, `complete_occurrence`), `enums`, `errors`, and `icaloxide` CLI (`view`, `validate`, `query`, `convert`).
+
 ## [0.2.0] - 2026-11-27
 
 ### Added

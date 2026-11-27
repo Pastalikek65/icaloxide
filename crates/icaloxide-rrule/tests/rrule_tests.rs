@@ -447,3 +447,112 @@ END:VCALENDAR\r\n";
     assert_eq!(alarms[0].start_utc, utc_ts(2026, 1, 1, 9, 30, 0));
     assert_eq!(alarms[1].start_utc, utc_ts(2026, 1, 5, 11, 30, 0));
 }
+
+#[test]
+fn upstream_rrule_bug_regressions_and_busy_free_intervals() {
+    // #306: UTC EXDATE (2026-01-02T09:00:00Z) must NOT suppress a zoned 09:00 America/New_York (= 14:00Z) occurrence
+    // #2193: DURATION:P1D preserves wall-clock 09:00 across DST spring-forward, while PT24H adds exact 24 hours
+    // #310: lowercase RANGE=thisandfuture works
+    // #234: VALARM on all-day DATE event triggers cleanly
+    // #188: VTODO without DTSTART or DUE is skipped without error
+    let ics = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+PRODID:-//icaloxide//v03-rrule//EN\r\n\
+BEGIN:VEVENT\r\n\
+UID:dst-ny\r\n\
+DTSTART;TZID=America/New_York:20260308T010000\r\n\
+DURATION:P1D\r\n\
+SUMMARY:Nominal Day\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\n\
+UID:exact-24h\r\n\
+DTSTART;TZID=America/New_York:20260308T010000\r\n\
+DURATION:PT24H\r\n\
+TRANSP:TRANSPARENT\r\n\
+SUMMARY:Exact 24h Transparent\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\n\
+UID:ex-306\r\n\
+DTSTART;TZID=America/New_York:20260101T090000\r\n\
+DURATION:PT1H\r\n\
+RRULE:FREQ=DAILY;COUNT=2\r\n\
+EXDATE:20260102T090000Z\r\n\
+SUMMARY:No Collision\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\n\
+UID:all-day-alarm\r\n\
+DTSTART;VALUE=DATE:20260401\r\n\
+DURATION:P2D\r\n\
+SUMMARY:Vacation\r\n\
+BEGIN:VALARM\r\n\
+ACTION:DISPLAY\r\n\
+TRIGGER;RELATED=start:-PT30M\r\n\
+DESCRIPTION:Pack\r\n\
+END:VALARM\r\n\
+END:VEVENT\r\n\
+BEGIN:VTODO\r\n\
+UID:todo-no-time\r\n\
+SUMMARY:Someday\r\n\
+END:VTODO\r\n\
+END:VCALENDAR\r\n";
+
+    let cal = Arc::new(Calendar::parse_str(ics).unwrap());
+    let q = Arc::new(
+        CalendarQuery::new(
+            Arc::clone(&cal),
+            QueryOptions {
+                components: smallvec![ComponentKind::VEvent, ComponentKind::VTodo],
+                ..QueryOptions::default()
+            },
+        )
+        .unwrap(),
+    );
+
+    // #2193: Mar 8 01:00 EST = 06:00Z. P1D -> Mar 9 01:00 EDT = 05:00Z (23h elapsed); PT24H -> Mar 9 02:00 EDT = 06:00Z (24h elapsed)
+    let dst_occs = q
+        .between(utc_ts(2026, 3, 8, 0, 0, 0), utc_ts(2026, 3, 10, 0, 0, 0))
+        .unwrap();
+    assert_eq!(dst_occs.len(), 2);
+    assert_eq!(dst_occs[0].end_utc - dst_occs[0].start_utc, 23 * 3600);
+    assert_eq!(dst_occs[1].end_utc - dst_occs[1].start_utc, 24 * 3600);
+
+    // Busy intervals ignore TRANSP:TRANSPARENT (exact-24h), leaving only 23h Nominal Day
+    let busy = q
+        .busy_intervals(utc_ts(2026, 3, 8, 0, 0, 0), utc_ts(2026, 3, 10, 0, 0, 0))
+        .unwrap();
+    assert_eq!(busy.len(), 1);
+    assert_eq!(busy[0].end_utc - busy[0].start_utc, 23 * 3600);
+    let free = q
+        .free_intervals(utc_ts(2026, 3, 8, 0, 0, 0), utc_ts(2026, 3, 10, 0, 0, 0))
+        .unwrap();
+    assert_eq!(free.len(), 2);
+
+    // #306: both Jan 1 & Jan 2 at 09:00 NY (14:00Z) must survive because 09:00Z != 14:00Z
+    let jan = q
+        .between(utc_ts(2026, 1, 1, 0, 0, 0), utc_ts(2026, 1, 5, 0, 0, 0))
+        .unwrap();
+    assert_eq!(jan.len(), 2);
+
+    // count_all & next_after
+    assert_eq!(q.count_all().unwrap(), 5);
+    let nxt = q.next_after(utc_ts(2026, 1, 2, 0, 0, 0)).unwrap().unwrap();
+    assert_eq!(nxt.start_utc, utc_ts(2026, 1, 2, 14, 0, 0));
+
+    // #234 & #2197: VALARM on all-day DATE event triggers at 2026-03-31 23:30Z
+    let aq = Arc::new(
+        CalendarQuery::new(
+            Arc::clone(&cal),
+            QueryOptions {
+                components: smallvec![ComponentKind::VAlarm],
+                ..QueryOptions::default()
+            },
+        )
+        .unwrap(),
+    );
+    let al = aq
+        .between(utc_ts(2026, 3, 30, 0, 0, 0), utc_ts(2026, 4, 2, 0, 0, 0))
+        .unwrap();
+    assert_eq!(al.len(), 1);
+    assert_eq!(al[0].start_utc, utc_ts(2026, 3, 31, 23, 30, 0));
+}

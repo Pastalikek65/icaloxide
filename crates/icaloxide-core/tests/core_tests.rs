@@ -317,3 +317,57 @@ END:VCALENDAR\r\n";
     let issues = cal.validate();
     assert!(issues.iter().any(|w| w.message.contains("DTSTAMP")));
 }
+
+#[test]
+fn upstream_issue_regressions_charset_request_status_period_tzid_standalone() {
+    // #2078: Legacy CHARSET=ISO-8859-1 byte decoding without U+FFFD replacement
+    let mut latin1_ics = Vec::new();
+    latin1_ics.extend_from_slice(
+        b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\nSUMMARY;CHARSET=ISO-8859-1:Caf",
+    );
+    latin1_ics.push(0xE9); // Latin-1 'é'
+    latin1_ics.extend_from_slice(
+        b"\r\nREQUEST-STATUS:2.0;Success;Extra\\;Info\r\nDTSTART;TZID=UTC:20260601T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+    );
+    let cal = Calendar::parse_with_options(&latin1_ics, &ParseOptions::lenient()).unwrap();
+    let ev = cal.events().next().unwrap();
+    assert_eq!(ev.summary(), Some("Café"));
+
+    // #2123: REQUEST-STATUS preserves unescaped ';' field separators on round-trip
+    let serialized = cal.to_ical();
+    assert!(serialized.contains("REQUEST-STATUS:2.0;Success;Extra\\;Info"));
+    // #2020: TZID=UTC must NOT be serialized alongside trailing Z
+    assert!(serialized.contains("DTSTART:20260601T100000Z"));
+    assert!(!serialized.contains("DTSTART;TZID=UTC:20260601T100000Z"));
+
+    // #2087: Zero-length PERIOD rejected in Strict mode, tolerated with warning in Lenient
+    let zero_period_ics = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VFREEBUSY\r\nFREEBUSY:20260101T100000Z/PT0S\r\nEND:VFREEBUSY\r\nEND:VCALENDAR\r\n";
+    assert!(Calendar::parse_with_options(zero_period_ics, &ParseOptions::strict()).is_err());
+    let len_fb = Calendar::parse_with_options(zero_period_ics, &ParseOptions::lenient()).unwrap();
+    assert_ne!(len_fb.warnings(), []);
+
+    // Standalone component parsing without BEGIN:VCALENDAR
+    let ev_only = b"BEGIN:VEVENT\r\nUID:solo\r\nDTSTART:20260601T100000Z\r\nSUMMARY:Standalone\r\nEND:VEVENT\r\n";
+    let solo = Calendar::parse_component(ev_only, &ParseOptions::strict()).unwrap();
+    assert_eq!(solo.root().kind(), &ComponentKind::VEvent);
+    assert_eq!(solo.root().summary(), Some("Standalone"));
+
+    // #2111 & #2075: duplicate TZID inside VTIMEZONE & custom VTIMEZONE overrides global TZDB
+    let dup_vtz = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VTIMEZONE\r\nTZID:America/New_York\r\nTZID:America/New_York\r\nBEGIN:STANDARD\r\nDTSTART:19700101T000000\r\nTZOFFSETFROM:+0900\r\nTZOFFSETTO:+0900\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nEND:VCALENDAR\r\n";
+    let dup_cal = Calendar::parse_with_options(dup_vtz, &ParseOptions::strict()).unwrap();
+    let reg = dup_cal.tz_registry();
+    let resolved = reg.resolve("America/New_York").unwrap();
+    let r = resolved
+        .resolve_local(
+            icaloxide_core::CalDate::new(2026, 6, 1).unwrap(),
+            icaloxide_core::CalTime::new(12, 0, 0).unwrap(),
+            icaloxide_core::DstDisambiguation::Compatible,
+        )
+        .unwrap();
+    assert_eq!(r.offset_seconds, 9 * 3600);
+
+    // build_vtimezone_for_tzid works cleanly
+    let built =
+        icaloxide_core::tz::build_vtimezone_for_tzid("America/New_York", 2020, 2030).unwrap();
+    assert_eq!(built.root().kind(), &ComponentKind::VTimezone);
+}

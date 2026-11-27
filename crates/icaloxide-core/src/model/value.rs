@@ -2,7 +2,7 @@ use compact_str::CompactString;
 
 use crate::datetime::{CalDate, CalDateTime, CalDuration, CalPeriod, CalTime, UtcOffset};
 use crate::error::{DateTimeError, ParseError, ParseErrorKind, ParseMode, ParseWarning};
-use crate::lexer::{split_escaped_list, unescape_text};
+use crate::lexer::{split_escaped_list, split_escaped_semicolon_list, unescape_text};
 use crate::model::known::{PropertyName, ValueType};
 
 /// Typed RFC 5545 property value stored in the arena.
@@ -23,6 +23,7 @@ pub enum PropertyValue {
     Boolean(bool),
     UtcOffset(UtcOffset),
     Time(CalTime),
+    RequestStatus(Vec<CompactString>),
     Uri(CompactString),
     CalAddress(CompactString),
     Binary(CompactString),
@@ -62,6 +63,12 @@ pub fn parse_property_value(
     raw: &str,
     warnings: &mut Vec<ParseWarning>,
 ) -> Result<PropertyValue, ParseError> {
+    if matches!(name, PropertyName::RequestStatus) && explicit_value_type.is_none() {
+        return Ok(PropertyValue::RequestStatus(split_escaped_semicolon_list(
+            raw,
+        )));
+    }
+
     if matches!(name, PropertyName::ExDate | PropertyName::RDate) {
         return parse_date_or_datetime_or_period_list(
             ctx,
@@ -91,7 +98,7 @@ pub fn parse_property_value(
         );
     }
 
-    match parse_scalar_value(ctx, effective_vt, raw, warnings) {
+    match parse_scalar_value(ctx, name, effective_vt, raw, warnings) {
         Ok(val) => Ok(val),
         Err(detail) => fallback_or_err(ctx, name, raw, &detail, warnings),
     }
@@ -99,6 +106,7 @@ pub fn parse_property_value(
 
 fn parse_scalar_value(
     ctx: &ValueParseCtx<'_>,
+    name: &PropertyName,
     effective_vt: &ValueType,
     raw: &str,
     warnings: &mut Vec<ParseWarning>,
@@ -120,9 +128,12 @@ fn parse_scalar_value(
         ValueType::Duration => CalDuration::parse_bytes(raw.trim().as_bytes())
             .map(PropertyValue::Duration)
             .map_err(|e| e.to_string()),
-        ValueType::Period => CalPeriod::parse_bytes(raw.trim().as_bytes(), ctx.tzid)
-            .map(PropertyValue::Period)
-            .map_err(|e| e.to_string()),
+        ValueType::Period => {
+            let period = CalPeriod::parse_bytes(raw.trim().as_bytes(), ctx.tzid)
+                .map_err(|e| e.to_string())?;
+            check_period_non_zero(&period, ctx, name, warnings)?;
+            Ok(PropertyValue::Period(period))
+        }
         ValueType::Integer => raw
             .trim()
             .parse::<i64>()
@@ -223,7 +234,10 @@ fn parse_date_or_datetime_or_period_list(
         items
             .iter()
             .map(|item| {
-                CalPeriod::parse_bytes(item.as_bytes(), ctx.tzid).map_err(|e| e.to_string())
+                let period =
+                    CalPeriod::parse_bytes(item.as_bytes(), ctx.tzid).map_err(|e| e.to_string())?;
+                check_period_non_zero(&period, ctx, name, warnings)?;
+                Ok(period)
             })
             .collect::<Result<Vec<_>, _>>()
             .map(PropertyValue::PeriodList)
@@ -257,7 +271,12 @@ fn parse_period_list_or_single(
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         match CalPeriod::parse_bytes(item.as_bytes(), ctx.tzid) {
-            Ok(p) => out.push(p),
+            Ok(p) => {
+                if let Err(detail) = check_period_non_zero(&p, ctx, name, warnings) {
+                    return fallback_or_err(ctx, name, raw, &detail, warnings);
+                }
+                out.push(p);
+            }
             Err(e) => {
                 return fallback_or_err(ctx, name, raw, &e.to_string(), warnings);
             }
@@ -267,6 +286,32 @@ fn parse_period_list_or_single(
         Ok(PropertyValue::Period(out.into_iter().next().unwrap()))
     } else {
         Ok(PropertyValue::PeriodList(out))
+    }
+}
+
+fn check_period_non_zero(
+    period: &CalPeriod,
+    ctx: &ValueParseCtx<'_>,
+    name: &PropertyName,
+    warnings: &mut Vec<ParseWarning>,
+) -> Result<(), String> {
+    if !period.is_zero_or_negative() {
+        return Ok(());
+    }
+    match ctx.mode {
+        ParseMode::Strict => Err("PERIOD must have positive non-zero duration".to_owned()),
+        ParseMode::Lenient => {
+            if ctx.collect_warnings {
+                warnings.push(ParseWarning {
+                    line: ctx.line,
+                    message: CompactString::from(format!(
+                        "zero-length or negative PERIOD on {}",
+                        name.as_str()
+                    )),
+                });
+            }
+            Ok(())
+        }
     }
 }
 

@@ -12,6 +12,7 @@ use crate::model::{
 struct ParserState<'a> {
     options: &'a ParseOptions,
     allow_multiple: bool,
+    allow_any_root: bool,
     completed: Vec<Calendar>,
     arena: ComponentArena,
     stack: Vec<(ComponentId, ComponentKind)>,
@@ -20,10 +21,11 @@ struct ParserState<'a> {
 }
 
 impl<'a> ParserState<'a> {
-    fn new(options: &'a ParseOptions, allow_multiple: bool) -> Self {
+    fn new(options: &'a ParseOptions, allow_multiple: bool, allow_any_root: bool) -> Self {
         Self {
             options,
             allow_multiple,
+            allow_any_root,
             completed: Vec::new(),
             arena: ComponentArena::new(),
             stack: Vec::with_capacity(4),
@@ -99,7 +101,7 @@ impl<'a> ParserState<'a> {
                     return Ok(false);
                 }
             }
-            if kind != ComponentKind::VCalendar {
+            if !self.allow_any_root && kind != ComponentKind::VCalendar {
                 return Err(ParseError::new(
                     line_num,
                     1,
@@ -310,8 +312,18 @@ pub fn parse_calendar_with_options(
     input: &[u8],
     options: &ParseOptions,
 ) -> Result<Calendar, ParseError> {
-    let mut cals = parse_internal(input, options, false)?;
+    let mut cals = parse_internal(input, options, false, false)?;
     Ok(cals.pop().expect("at least one calendar"))
+}
+
+/// Parse a standalone component (such as `VEVENT`, `VTIMEZONE`, `VALARM`, or `VCALENDAR`)
+/// without requiring an outer `BEGIN:VCALENDAR` wrapper.
+pub fn parse_component_with_options(
+    input: &[u8],
+    options: &ParseOptions,
+) -> Result<Calendar, ParseError> {
+    let mut cals = parse_internal(input, options, false, true)?;
+    Ok(cals.pop().expect("at least one component"))
 }
 
 /// Parse a raw iCalendar byte stream containing one or more sequential `VCALENDAR` blocks.
@@ -319,16 +331,17 @@ pub fn parse_all_calendars_with_options(
     input: &[u8],
     options: &ParseOptions,
 ) -> Result<Vec<Calendar>, ParseError> {
-    parse_internal(input, options, true)
+    parse_internal(input, options, true, false)
 }
 
 fn parse_internal(
     input: &[u8],
     options: &ParseOptions,
     allow_multiple: bool,
+    allow_any_root: bool,
 ) -> Result<Vec<Calendar>, ParseError> {
     let mut unfolder = UnfoldIter::new(input, options.mode, options.max_line_bytes);
-    let mut state = ParserState::new(options, allow_multiple);
+    let mut state = ParserState::new(options, allow_multiple, allow_any_root);
 
     while let Some(line_res) = unfolder.next_line(&mut state.warnings, options.collect_warnings) {
         let logical_line = line_res?;

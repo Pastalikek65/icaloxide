@@ -170,6 +170,11 @@ impl Calendar {
         crate::parser::parse_all_calendars_with_options(input, options)
     }
 
+    /// Parse a standalone component (e.g. `VEVENT`, `VTIMEZONE`, `VALARM`) without a `VCALENDAR` wrapper.
+    pub fn parse_component(input: &[u8], options: &ParseOptions) -> Result<Self, ParseError> {
+        crate::parser::parse_component_with_options(input, options)
+    }
+
     /// Root `VCALENDAR` component ID.
     #[inline]
     pub const fn root_id(&self) -> ComponentId {

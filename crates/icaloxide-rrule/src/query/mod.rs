@@ -17,10 +17,18 @@ use crate::error::{IterationBudget, RRuleError};
 use crate::query::components::{expand_alarms_for_parent, extract_freebusy_occurrences};
 use crate::recurrence::series::{
     apply_this_and_future_shift, compute_end_local, extract_component_timing, overlaps_window,
-    resolve_local_instant, utc_to_local_approx, CompiledSeries, OverrideEntry,
+    resolve_datetime_with_fallback, resolve_local_instant, span_from_duration, utc_to_local_approx,
+    CompiledSeries, OverrideEntry,
 };
 use crate::recurrence::SpanDuration;
 use crate::rrule::{LocalDateTime, RRuleIter};
+
+/// Merged opaque busy or free UTC time span `[start_utc, end_utc)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BusyInterval {
+    pub start_utc: i64,
+    pub end_utc: i64,
+}
 
 /// A resolved calendar occurrence emitted by [`CalendarQuery`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,10 +272,19 @@ impl CalendarQuery {
         self.between(utc_ts, utc_ts + 1)
     }
 
-    /// Return the earliest occurrence across `[1900-01-01, 2100-12-31]`, if any.
+    /// Return the earliest occurrence in the calendar, if any.
     pub fn first(self: &Arc<Self>) -> Result<Option<Occurrence>, RRuleError> {
-        let floor_utc = i64::from(CalDate::new(1900, 1, 1).unwrap().to_days_since_epoch()) * 86_400;
+        let floor_utc = self.min_start_floor();
         match self.after(floor_utc).next() {
+            Some(Ok(occ)) => Ok(Some(occ)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    /// Return the first occurrence ending after `ts_utc`, if any.
+    pub fn next_after(self: &Arc<Self>, ts_utc: i64) -> Result<Option<Occurrence>, RRuleError> {
+        match self.after(ts_utc).next() {
             Some(Ok(occ)) => Ok(Some(occ)),
             Some(Err(e)) => Err(e),
             None => Ok(None),
@@ -279,6 +296,222 @@ impl CalendarQuery {
         let start_utc = i64::from(CalDate::new(1900, 1, 1).unwrap().to_days_since_epoch()) * 86_400;
         let end_utc = i64::from(CalDate::new(2100, 12, 31).unwrap().to_days_since_epoch()) * 86_400;
         self.between(start_utc, end_utc)
+    }
+
+    /// Count all finite occurrences across any year range, bounded by [`IterationBudget`].
+    pub fn count_all(self: &Arc<Self>) -> Result<usize, RRuleError> {
+        if self.series.iter().all(|s| s.max_end_utc.is_some())
+            && (!self.want_alarms
+                || self
+                    .alarm_parent_series
+                    .iter()
+                    .all(|s| s.max_end_utc.is_some()))
+        {
+            let Some((min_s, max_e)) = self.bounded_extents() else {
+                return Ok(0);
+            };
+            return self.count_between(min_s.saturating_sub(1), max_e.saturating_add(1));
+        }
+
+        let floor_utc = self.min_start_floor();
+        let mut count = 0_usize;
+        let max_budget = self.options.budget.max_periods;
+        for item in self.after(floor_utc) {
+            item?;
+            count += 1;
+            if count > max_budget {
+                return Err(RRuleError::BudgetExceeded);
+            }
+        }
+        Ok(count)
+    }
+
+    /// Compute sorted, merged opaque busy intervals overlapping `[start_utc, end_utc)`.
+    pub fn busy_intervals(
+        &self,
+        start_utc: i64,
+        end_utc: i64,
+    ) -> Result<Vec<BusyInterval>, RRuleError> {
+        if end_utc <= start_utc {
+            return Ok(Vec::new());
+        }
+        let occs = self.between(start_utc, end_utc)?;
+        let mut spans: Vec<BusyInterval> = Vec::with_capacity(occs.len());
+        for occ in occs {
+            if occ.kind == ComponentKind::VFreeBusy {
+                continue;
+            }
+            if let Some(comp) = self.cal.component(occ.component_id) {
+                if comp
+                    .property_text(&PropertyName::Transp)
+                    .is_some_and(|t| t.trim().eq_ignore_ascii_case("TRANSPARENT"))
+                {
+                    continue;
+                }
+                if comp
+                    .status()
+                    .is_some_and(|s| s.trim().eq_ignore_ascii_case("CANCELLED"))
+                {
+                    continue;
+                }
+            }
+            let s = occ.start_utc.max(start_utc);
+            let e = occ.end_utc.min(end_utc);
+            if e > s {
+                spans.push(BusyInterval {
+                    start_utc: s,
+                    end_utc: e,
+                });
+            }
+        }
+
+        if self.options.components.contains(&ComponentKind::VFreeBusy) {
+            self.collect_busy_freebusy_spans(start_utc, end_utc, &mut spans);
+        }
+
+        Ok(merge_intervals(spans))
+    }
+
+    /// Compute sorted non-busy (free) intervals inside `[start_utc, end_utc)`.
+    pub fn free_intervals(
+        &self,
+        start_utc: i64,
+        end_utc: i64,
+    ) -> Result<Vec<BusyInterval>, RRuleError> {
+        if end_utc <= start_utc {
+            return Ok(Vec::new());
+        }
+        let busy = self.busy_intervals(start_utc, end_utc)?;
+        let mut free = Vec::with_capacity(busy.len() + 1);
+        let mut cursor = start_utc;
+        for b in busy {
+            if b.start_utc > cursor {
+                free.push(BusyInterval {
+                    start_utc: cursor,
+                    end_utc: b.start_utc,
+                });
+            }
+            cursor = cursor.max(b.end_utc);
+        }
+        if cursor < end_utc {
+            free.push(BusyInterval {
+                start_utc: cursor,
+                end_utc,
+            });
+        }
+        Ok(free)
+    }
+
+    fn min_start_floor(&self) -> i64 {
+        let mut floor = i64::MAX;
+        if let Some(s) = self.singles.first() {
+            floor = floor.min(s.start_utc);
+        }
+        for ser in &self.series {
+            floor = floor.min(ser.min_start_utc);
+        }
+        if self.want_alarms {
+            if let Some(s) = self.alarm_parent_singles.first() {
+                floor = floor.min(s.start_utc.saturating_sub(self.max_alarm_pad_secs));
+            }
+            for ser in &self.alarm_parent_series {
+                floor = floor.min(ser.min_start_utc.saturating_sub(self.max_alarm_pad_secs));
+            }
+        }
+        if floor == i64::MAX {
+            0
+        } else {
+            floor.saturating_sub(86_400)
+        }
+    }
+
+    fn bounded_extents(&self) -> Option<(i64, i64)> {
+        let mut min_s = i64::MAX;
+        let mut max_e = i64::MIN;
+        let mut any = false;
+        for s in &self.singles {
+            any = true;
+            min_s = min_s.min(s.start_utc);
+            max_e = max_e.max(s.end_utc.max(s.start_utc));
+        }
+        for ser in &self.series {
+            any = true;
+            min_s = min_s.min(ser.min_start_utc);
+            max_e = max_e.max(ser.max_end_utc?);
+        }
+        if self.want_alarms {
+            for s in &self.alarm_parent_singles {
+                any = true;
+                min_s = min_s.min(s.start_utc.saturating_sub(self.max_alarm_pad_secs));
+                max_e = max_e.max(s.end_utc.saturating_add(self.max_alarm_pad_secs));
+            }
+            for ser in &self.alarm_parent_series {
+                any = true;
+                min_s = min_s.min(ser.min_start_utc.saturating_sub(self.max_alarm_pad_secs));
+                max_e = max_e.max(ser.max_end_utc?.saturating_add(self.max_alarm_pad_secs));
+            }
+        }
+        if any {
+            Some((min_s, max_e))
+        } else {
+            None
+        }
+    }
+
+    fn collect_busy_freebusy_spans(
+        &self,
+        start_utc: i64,
+        end_utc: i64,
+        out: &mut Vec<BusyInterval>,
+    ) {
+        use icaloxide_core::datetime::CalPeriod;
+        use icaloxide_core::model::ParamName;
+
+        for fb in self.cal.freebusies() {
+            for prop in fb.properties_named(&PropertyName::FreeBusy) {
+                let is_free = prop
+                    .param_first(&ParamName::FbType)
+                    .is_some_and(|v| v.trim().eq_ignore_ascii_case("FREE"));
+                if is_free {
+                    continue;
+                }
+                let mut push_period = |p: &CalPeriod| {
+                    let (ps, pe) = match p {
+                        CalPeriod::Explicit { start, end } => {
+                            let (s, _) =
+                                resolve_datetime_with_fallback(start, &self.reg, &self.default_tz);
+                            let (e, _) =
+                                resolve_datetime_with_fallback(end, &self.reg, &self.default_tz);
+                            (s, e)
+                        }
+                        CalPeriod::Duration { start, duration } => {
+                            let (s, tz) =
+                                resolve_datetime_with_fallback(start, &self.reg, &self.default_tz);
+                            let span = span_from_duration(*duration, false);
+                            let (e, _) = compute_end_local(start, s, span, &tz);
+                            (s, e)
+                        }
+                    };
+                    let cs = ps.max(start_utc);
+                    let ce = pe.min(end_utc);
+                    if ce > cs {
+                        out.push(BusyInterval {
+                            start_utc: cs,
+                            end_utc: ce,
+                        });
+                    }
+                };
+                match &prop.value {
+                    PropertyValue::Period(p) => push_period(p),
+                    PropertyValue::PeriodList(list) => {
+                        for p in list {
+                            push_period(p);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     /// Count occurrences intersecting `[start_utc, end_utc)`.
@@ -993,10 +1226,7 @@ fn advance_owned_cursor(
 ) -> Result<Option<Occurrence>, RRuleError> {
     let rule = &master.rrules[cursor.rule_idx];
     let dtstart_ldt = LocalDateTime::new(master.start_local.date, master.start_local.time);
-    let max_span_secs = match master.span {
-        SpanDuration::Days(d) => i64::from(d) * 86_400 + 86_400,
-        SpanDuration::Seconds(s) => s,
-    };
+    let max_span_secs = master.span.max_seconds();
     let max_back_shift = this_and_future
         .iter()
         .map(|tf| (-tf.time_shift_secs).max(0))
@@ -1089,10 +1319,7 @@ fn advance_split_cursor(
 ) -> Result<Option<Occurrence>, RRuleError> {
     let rule = &tf.override_rrules[cursor.rule_idx];
     let dtstart_ldt = LocalDateTime::new(tf.start_local.date, tf.start_local.time);
-    let max_span_secs = match tf.span {
-        SpanDuration::Days(d) => i64::from(d) * 86_400 + 86_400,
-        SpanDuration::Seconds(s) => s,
-    };
+    let max_span_secs = tf.span.max_seconds();
     let ff_utc = earliest_end_utc
         .saturating_sub(max_span_secs)
         .max(tf.start_utc);
@@ -1398,4 +1625,22 @@ fn partition_query_components<'a>(
     }
 
     (grouped, ungrouped)
+}
+
+fn merge_intervals(mut spans: Vec<BusyInterval>) -> Vec<BusyInterval> {
+    if spans.is_empty() {
+        return spans;
+    }
+    spans.sort_by_key(|s| (s.start_utc, s.end_utc));
+    let mut merged: Vec<BusyInterval> = Vec::with_capacity(spans.len());
+    for span in spans {
+        if let Some(last) = merged.last_mut() {
+            if span.start_utc <= last.end_utc {
+                last.end_utc = last.end_utc.max(span.end_utc);
+                continue;
+            }
+        }
+        merged.push(span);
+    }
+    merged
 }

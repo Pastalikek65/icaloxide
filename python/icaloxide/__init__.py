@@ -7,6 +7,9 @@ from icaloxide._icaloxide import (
     OccurrenceIterator,
     OccurrencePageIterator,
     __version__,
+    compile_vtimezone_transitions,
+    parse_component,
+    vtimezone_for_tzid,
 )
 
 __all__ = [
@@ -18,4 +21,7 @@ __all__ = [
     "OccurrenceIterator",
     "OccurrencePageIterator",
     "__version__",
+    "compile_vtimezone_transitions",
+    "parse_component",
+    "vtimezone_for_tzid",
 ]

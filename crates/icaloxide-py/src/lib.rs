@@ -5,12 +5,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use compact_str::CompactString;
+use icaloxide_core::tz::build_vtimezone_for_tzid;
 use icaloxide_core::{
     CalDate, CalDateTime, CalDuration, CalPeriod, CalTime, Calendar as CoreCalendar,
-    CalendarTimeZone, ComponentId, ComponentKind, DstDisambiguation, ParamName, Parameter,
-    ParseOptions, Property, PropertyName, PropertyValue, TimeZoneRef, TzRegistry, UtcOffset,
+    CalendarTimeZone, CompiledVTimezone, ComponentId, ComponentKind, DstDisambiguation, ParamName,
+    Parameter, ParseOptions, Property, PropertyName, PropertyValue, TimeZoneRef, TzRegistry,
+    UtcOffset,
 };
-use icaloxide_rrule::{AfterIter, CalendarQuery, Occurrence, QueryOptions, RRuleError};
+use icaloxide_rrule::{
+    AfterIter, CalendarQuery, IterationBudget, Occurrence, QueryOptions, RRuleError,
+};
 use pyo3::exceptions::{PyKeyError, PyOSError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::GILOnceCell;
@@ -244,7 +248,29 @@ fn property_value_to_py<'py>(
         PropertyValue::Boolean(b) => Ok(PyBool::new(py, *b).to_owned().into_any()),
         PropertyValue::UtcOffset(off) => utc_offset_to_py(py, *off),
         PropertyValue::Time(t) => cal_time_to_py(py, *t),
+        PropertyValue::RequestStatus(parts) => Ok(PyString::new(py, &parts.join(";")).into_any()),
     }
+}
+
+fn utc_ts_to_py(py: Python<'_>, utc_ts: i64) -> PyResult<Bound<'_, PyAny>> {
+    let types = dt_types(py)?;
+    let days = utc_ts.div_euclid(86_400) as i32;
+    let rem = utc_ts.rem_euclid(86_400) as u32;
+    let date = CalDate::from_days_since_epoch(days);
+    let hour = (rem / 3_600) as u8;
+    let minute = ((rem % 3_600) / 60) as u8;
+    let second = (rem % 60) as u8;
+    let tz = types.utc_tz.bind(py);
+    types.datetime_cls.bind(py).call1((
+        i32::from(date.year),
+        date.month,
+        date.day,
+        hour,
+        minute,
+        second,
+        0_u32,
+        tz,
+    ))
 }
 
 enum PyInputTemporal {
@@ -817,6 +843,7 @@ pub struct PyOccurrencePageIterator {
     tz_registry: Arc<OnceLock<TzRegistry>>,
     iter: AfterIter,
     page_size: usize,
+    latest_start_utc: Option<i64>,
     exhausted: bool,
 }
 
@@ -833,11 +860,17 @@ impl PyOccurrencePageIterator {
         let mut page = Vec::with_capacity(slf.page_size);
         for _ in 0..slf.page_size {
             match slf.iter.next() {
-                Some(Ok(occ)) => page.push(PyOccurrence {
-                    cal: Arc::clone(&slf.cal),
-                    tz_registry: Arc::clone(&slf.tz_registry),
-                    occ,
-                }),
+                Some(Ok(occ)) => {
+                    if slf.latest_start_utc.is_some_and(|cut| occ.start_utc > cut) {
+                        slf.exhausted = true;
+                        break;
+                    }
+                    page.push(PyOccurrence {
+                        cal: Arc::clone(&slf.cal),
+                        tz_registry: Arc::clone(&slf.tz_registry),
+                        occ,
+                    });
+                }
                 Some(Err(e)) => return Err(rrule_err_to_py(&e)),
                 None => {
                     slf.exhausted = true;
@@ -928,11 +961,12 @@ impl PyCalendarQuery {
         })
     }
 
-    #[pyo3(signature = (page_size, earliest_end=None))]
+    #[pyo3(signature = (page_size, earliest_end=None, latest_start=None))]
     fn paginate(
         &self,
         page_size: usize,
         earliest_end: Option<&Bound<'_, PyAny>>,
+        latest_start: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<PyOccurrencePageIterator> {
         if page_size == 0 {
             return Err(PyValueError::new_err("page_size must be >= 1"));
@@ -942,11 +976,20 @@ impl PyCalendarQuery {
         } else {
             i64::from(CalDate::new(1900, 1, 1).unwrap().to_days_since_epoch()) * 86_400
         };
+        let latest_start_utc = match latest_start {
+            Some(dt) => Some(py_time_bound_to_utc(
+                dt,
+                self.query.default_timezone(),
+                true,
+            )?),
+            None => None,
+        };
         Ok(PyOccurrencePageIterator {
             cal: Arc::clone(&self.cal),
             tz_registry: Arc::clone(&self.tz_registry),
             iter: self.query.after(anchor_utc),
             page_size,
+            latest_start_utc,
             exhausted: false,
         })
     }
@@ -954,6 +997,18 @@ impl PyCalendarQuery {
     fn first(&self, py: Python<'_>) -> PyResult<Option<PyOccurrence>> {
         let occ = py
             .allow_threads(|| self.query.first())
+            .map_err(|e| rrule_err_to_py(&e))?;
+        Ok(occ.map(|o| PyOccurrence {
+            cal: Arc::clone(&self.cal),
+            tz_registry: Arc::clone(&self.tz_registry),
+            occ: o,
+        }))
+    }
+
+    fn next_after(&self, py: Python<'_>, dt: &Bound<'_, PyAny>) -> PyResult<Option<PyOccurrence>> {
+        let ts_utc = py_time_bound_to_utc(dt, self.query.default_timezone(), false)?;
+        let occ = py
+            .allow_threads(|| self.query.next_after(ts_utc))
             .map_err(|e| rrule_err_to_py(&e))?;
         Ok(occ.map(|o| PyOccurrence {
             cal: Arc::clone(&self.cal),
@@ -986,6 +1041,53 @@ impl PyCalendarQuery {
         let end_utc = py_time_bound_to_utc(end, self.query.default_timezone(), true)?;
         py.allow_threads(|| self.query.count_between(start_utc, end_utc))
             .map_err(|e| rrule_err_to_py(&e))
+    }
+
+    fn count_all(&self, py: Python<'_>) -> PyResult<usize> {
+        py.allow_threads(|| self.query.count_all())
+            .map_err(|e| rrule_err_to_py(&e))
+    }
+
+    fn busy_intervals<'py>(
+        &self,
+        py: Python<'py>,
+        start: &Bound<'py, PyAny>,
+        end: &Bound<'py, PyAny>,
+    ) -> PyResult<Vec<(Bound<'py, PyAny>, Bound<'py, PyAny>)>> {
+        let start_utc = py_time_bound_to_utc(start, self.query.default_timezone(), false)?;
+        let end_utc = py_time_bound_to_utc(end, self.query.default_timezone(), true)?;
+        let spans = py
+            .allow_threads(|| self.query.busy_intervals(start_utc, end_utc))
+            .map_err(|e| rrule_err_to_py(&e))?;
+        let mut out = Vec::with_capacity(spans.len());
+        for sp in spans {
+            out.push((
+                utc_ts_to_py(py, sp.start_utc)?,
+                utc_ts_to_py(py, sp.end_utc)?,
+            ));
+        }
+        Ok(out)
+    }
+
+    fn free_intervals<'py>(
+        &self,
+        py: Python<'py>,
+        start: &Bound<'py, PyAny>,
+        end: &Bound<'py, PyAny>,
+    ) -> PyResult<Vec<(Bound<'py, PyAny>, Bound<'py, PyAny>)>> {
+        let start_utc = py_time_bound_to_utc(start, self.query.default_timezone(), false)?;
+        let end_utc = py_time_bound_to_utc(end, self.query.default_timezone(), true)?;
+        let spans = py
+            .allow_threads(|| self.query.free_intervals(start_utc, end_utc))
+            .map_err(|e| rrule_err_to_py(&e))?;
+        let mut out = Vec::with_capacity(spans.len());
+        for sp in spans {
+            out.push((
+                utc_ts_to_py(py, sp.start_utc)?,
+                utc_ts_to_py(py, sp.end_utc)?,
+            ));
+        }
+        Ok(out)
     }
 }
 
@@ -1029,6 +1131,17 @@ impl PyCalendar {
             inner: Arc::new(cal),
             tz_registry: Arc::new(OnceLock::new()),
         })
+    }
+
+    #[classmethod]
+    #[pyo3(signature = (data, *, strict=false))]
+    fn parse_component(
+        _cls: &Bound<'_, pyo3::types::PyType>,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        strict: bool,
+    ) -> PyResult<PyComponent> {
+        parse_component(py, data, strict)
     }
 
     #[classmethod]
@@ -1094,7 +1207,8 @@ impl PyCalendar {
         }
     }
 
-    #[pyo3(signature = (*, components=None, skip_cancelled=false, skip_bad_series=false, default_tz=None))]
+    #[pyo3(signature = (*, components=None, skip_cancelled=false, skip_bad_series=false, default_tz=None, max_iterations=None, max_periods=None))]
+    #[allow(clippy::too_many_arguments)]
     fn query(
         &self,
         py: Python<'_>,
@@ -1102,10 +1216,17 @@ impl PyCalendar {
         skip_cancelled: bool,
         skip_bad_series: bool,
         default_tz: Option<&str>,
+        max_iterations: Option<usize>,
+        max_periods: Option<usize>,
     ) -> PyResult<PyCalendarQuery> {
+        let mut budget = IterationBudget::default();
+        if let Some(mp) = max_periods.or(max_iterations) {
+            budget.max_periods = mp;
+        }
         let mut opts = QueryOptions {
             skip_cancelled,
             skip_bad_series,
+            budget,
             ..QueryOptions::default()
         };
         if let Some(list) = components {
@@ -1520,6 +1641,90 @@ impl PyCalendarBuilder {
     }
 }
 
+#[pyfunction]
+#[pyo3(signature = (data, *, strict=false))]
+fn parse_component(py: Python<'_>, data: &Bound<'_, PyAny>, strict: bool) -> PyResult<PyComponent> {
+    let source = extract_input_source(py, data)?;
+    let opts = if strict {
+        ParseOptions::strict()
+    } else {
+        ParseOptions::lenient()
+    };
+
+    let cal = py.allow_threads(|| -> PyResult<CoreCalendar> {
+        match source {
+            InputSource::Bytes(bytes) => {
+                CoreCalendar::parse_component(&bytes, &opts).map_err(|e| parse_err_to_py(&e))
+            }
+            InputSource::Path(path) => {
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| PyOSError::new_err(format!("{}: {e}", path.display())))?;
+                CoreCalendar::parse_component(&bytes, &opts).map_err(|e| parse_err_to_py(&e))
+            }
+        }
+    })?;
+
+    let root = cal.root_id();
+    Ok(PyComponent {
+        cal: Arc::new(cal),
+        tz_registry: Arc::new(OnceLock::new()),
+        id: root,
+    })
+}
+
+#[pyfunction]
+#[pyo3(signature = (tzid, start_year=1970, end_year=2038))]
+fn vtimezone_for_tzid<'py>(
+    py: Python<'py>,
+    tzid: &str,
+    start_year: i16,
+    end_year: i16,
+) -> Option<Bound<'py, PyBytes>> {
+    let cal = build_vtimezone_for_tzid(tzid, start_year, end_year)?;
+    let rendered = cal.to_ical();
+    Some(PyBytes::new(py, rendered.as_bytes()))
+}
+
+#[pyfunction]
+#[allow(clippy::type_complexity)]
+fn compile_vtimezone_transitions(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+) -> PyResult<Vec<(i64, i32, i32, bool, Option<String>)>> {
+    let source = extract_input_source(py, data)?;
+    let bytes = match source {
+        InputSource::Bytes(b) => b,
+        InputSource::Path(p) => {
+            std::fs::read(&p).map_err(|e| PyOSError::new_err(format!("{}: {e}", p.display())))?
+        }
+    };
+    let cal = CoreCalendar::parse_component(&bytes, &ParseOptions::lenient())
+        .map_err(|e| parse_err_to_py(&e))?;
+    let root = cal.root();
+    let vtz = if root.kind() == &ComponentKind::VTimezone {
+        root
+    } else {
+        cal.timezones()
+            .next()
+            .ok_or_else(|| PyValueError::new_err("no VTIMEZONE component found"))?
+    };
+    let compiled =
+        CompiledVTimezone::compile(vtz).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(compiled
+        .transitions
+        .into_iter()
+        .map(|t| {
+            (
+                t.utc_timestamp,
+                t.offset_from,
+                t.offset_to,
+                t.is_dst,
+                t.tzname.map(|s| s.to_string()),
+            )
+        })
+        .collect())
+}
+
 #[pymodule]
 fn _icaloxide(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
@@ -1530,5 +1735,8 @@ fn _icaloxide(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyOccurrence>()?;
     m.add_class::<PyOccurrenceIterator>()?;
     m.add_class::<PyOccurrencePageIterator>()?;
+    m.add_function(wrap_pyfunction!(parse_component, m)?)?;
+    m.add_function(wrap_pyfunction!(vtimezone_for_tzid, m)?)?;
+    m.add_function(wrap_pyfunction!(compile_vtimezone_transitions, m)?)?;
     Ok(())
 }

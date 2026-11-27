@@ -1,0 +1,123 @@
+"""Standard RFC 5545 / 7953 / 9253 enumerations matching ``icalendar.enums``."""
+
+from __future__ import annotations
+
+from enum import Enum
+
+
+class BUSYTYPE(str, Enum):
+    BUSY = "BUSY"
+    BUSY_UNAVAILABLE = "BUSY-UNAVAILABLE"
+    BUSY_TENTATIVE = "BUSY-TENTATIVE"
+
+
+class CLASS(str, Enum):
+    PUBLIC = "PUBLIC"
+    PRIVATE = "PRIVATE"
+    CONFIDENTIAL = "CONFIDENTIAL"
+
+
+class CUTYPE(str, Enum):
+    INDIVIDUAL = "INDIVIDUAL"
+    GROUP = "GROUP"
+    RESOURCE = "RESOURCE"
+    ROOM = "ROOM"
+    UNKNOWN = "UNKNOWN"
+
+
+class FBTYPE(str, Enum):
+    FREE = "FREE"
+    BUSY = "BUSY"
+    BUSY_UNAVAILABLE = "BUSY-UNAVAILABLE"
+    BUSY_TENTATIVE = "BUSY-TENTATIVE"
+
+
+class PARTSTAT(str, Enum):
+    NEEDS_ACTION = "NEEDS-ACTION"
+    ACCEPTED = "ACCEPTED"
+    DECLINED = "DECLINED"
+    TENTATIVE = "TENTATIVE"
+    DELEGATED = "DELEGATED"
+    COMPLETED = "COMPLETED"
+    IN_PROCESS = "IN-PROCESS"
+
+
+class RANGE(str, Enum):
+    THISANDFUTURE = "THISANDFUTURE"
+    THISANDPRIOR = "THISANDPRIOR"
+
+
+class RELATED(str, Enum):
+    START = "START"
+    END = "END"
+
+
+class RELTYPE(str, Enum):
+    PARENT = "PARENT"
+    CHILD = "CHILD"
+    SIBLING = "SIBLING"
+    FINISHTOSTART = "FINISHTOSTART"
+    FINISHTOFINISH = "FINISHTOFINISH"
+    STARTTOFINISH = "STARTTOFINISH"
+    STARTTOSTART = "STARTTOSTART"
+    FIRST = "FIRST"
+    NEXT = "NEXT"
+    DEPENDS_ON = "DEPENDS-ON"
+    REFID = "REFID"
+    CONCEPT = "CONCEPT"
+
+
+class ROLE(str, Enum):
+    CHAIR = "CHAIR"
+    REQ_PARTICIPANT = "REQ-PARTICIPANT"
+    OPT_PARTICIPANT = "OPT-PARTICIPANT"
+    NON_PARTICIPANT = "NON-PARTICIPANT"
+
+
+class STATUS(str, Enum):
+    TENTATIVE = "TENTATIVE"
+    CONFIRMED = "CONFIRMED"
+    CANCELLED = "CANCELLED"
+    NEEDS_ACTION = "NEEDS-ACTION"
+    COMPLETED = "COMPLETED"
+    IN_PROCESS = "IN-PROCESS"
+    DRAFT = "DRAFT"
+    FINAL = "FINAL"
+
+
+class TRANSP(str, Enum):
+    OPAQUE = "OPAQUE"
+    TRANSPARENT = "TRANSPARENT"
+
+
+class VALUE(str, Enum):
+    BINARY = "BINARY"
+    BOOLEAN = "BOOLEAN"
+    CAL_ADDRESS = "CAL-ADDRESS"
+    DATE = "DATE"
+    DATE_TIME = "DATE-TIME"
+    DURATION = "DURATION"
+    FLOAT = "FLOAT"
+    INTEGER = "INTEGER"
+    PERIOD = "PERIOD"
+    RECUR = "RECUR"
+    TEXT = "TEXT"
+    TIME = "TIME"
+    URI = "URI"
+    UTC_OFFSET = "UTC-OFFSET"
+
+
+__all__ = [
+    "BUSYTYPE",
+    "CLASS",
+    "CUTYPE",
+    "FBTYPE",
+    "PARTSTAT",
+    "RANGE",
+    "RELATED",
+    "RELTYPE",
+    "ROLE",
+    "STATUS",
+    "TRANSP",
+    "VALUE",
+]

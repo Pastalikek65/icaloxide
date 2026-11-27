@@ -471,6 +471,21 @@ impl CalPeriod {
             Ok(Self::Explicit { start, end })
         }
     }
+
+    /// Return `true` if this period has zero or negative duration.
+    #[inline]
+    pub fn is_zero_or_negative(&self) -> bool {
+        match self {
+            Self::Duration { duration, .. } => duration.total_seconds() <= 0,
+            Self::Explicit { start, end } => {
+                if start.tz == end.tz {
+                    end.to_naive_timestamp() <= start.to_naive_timestamp()
+                } else {
+                    false
+                }
+            }
+        }
+    }
 }
 
 impl fmt::Display for CalPeriod {

@@ -14,6 +14,48 @@ use crate::rrule::{LocalDateTime, RRule, RRuleIter, UntilValue};
 pub enum SpanDuration {
     Days(i32),
     Seconds(i64),
+    DaysAndSeconds { days: i32, secs: i64 },
+}
+
+impl SpanDuration {
+    /// Conservative upper-bound duration in seconds for fast-forward lower-bound adjustments.
+    #[inline]
+    pub const fn max_seconds(self) -> i64 {
+        match self {
+            Self::Days(d) => (d as i64) * 86_400 + 86_400,
+            Self::Seconds(s) => s,
+            Self::DaysAndSeconds { days, secs } => (days as i64) * 86_400 + secs + 86_400,
+        }
+    }
+}
+
+/// Convert an RFC 5545 `DURATION` value into [`SpanDuration`], preserving nominal-day vs exact-second DST semantics.
+pub fn span_from_duration(
+    dur: icaloxide_core::datetime::CalDuration,
+    is_all_day: bool,
+) -> SpanDuration {
+    if dur.negative {
+        return if is_all_day {
+            SpanDuration::Days(1)
+        } else {
+            SpanDuration::Seconds(0)
+        };
+    }
+    let nom_days = (dur.weeks * 7 + dur.days) as i32;
+    let exact_secs =
+        i64::from(dur.hours) * 3_600 + i64::from(dur.minutes) * 60 + i64::from(dur.seconds);
+    if is_all_day {
+        SpanDuration::Days((nom_days + (exact_secs / 86_400) as i32).max(1))
+    } else if nom_days > 0 && exact_secs == 0 {
+        SpanDuration::Days(nom_days)
+    } else if nom_days > 0 {
+        SpanDuration::DaysAndSeconds {
+            days: nom_days,
+            secs: exact_secs,
+        }
+    } else {
+        SpanDuration::Seconds(exact_secs)
+    }
 }
 
 /// An `RDATE` entry with optional custom duration (`RDATE;VALUE=PERIOD`).
@@ -64,7 +106,9 @@ impl ExclusionSet {
         reg: &TzRegistry,
         default_tz: &CalendarTimeZone,
     ) {
-        self.floating_wall.insert((dt.date, dt.time));
+        if matches!(dt.tz, TimeZoneRef::Floating) {
+            self.floating_wall.insert((dt.date, dt.time));
+        }
         let (utc_ts, _) = resolve_datetime_with_fallback(dt, reg, default_tz);
         self.utc_instants.insert(utc_ts);
     }
@@ -119,21 +163,44 @@ pub fn compute_end_local(
                 };
             (end_utc, end_dt)
         }
-        SpanDuration::Seconds(secs) => {
-            let end_utc = start_utc + secs;
-            let offset = tz.offset_at_utc(end_utc).unwrap_or(0);
-            let local_naive = end_utc + i64::from(offset);
-            let ldt = LocalDateTime::from_naive_timestamp(local_naive);
-            (
-                end_utc,
-                CalDateTime {
-                    date: ldt.date,
-                    time: ldt.time,
-                    tz: start_local.tz.clone(),
-                },
-            )
+        SpanDuration::Seconds(secs) => utc_instant_to_end(start_utc + secs, &start_local.tz, tz),
+        SpanDuration::DaysAndSeconds { days, secs } => {
+            let mid_date = start_local.date.add_days(days);
+            let mid_utc =
+                match tz.resolve_local(mid_date, start_local.time, DstDisambiguation::Compatible) {
+                    Ok(res) => res.utc_timestamp,
+                    Err(_) => CalDateTime {
+                        date: mid_date,
+                        time: start_local.time,
+                        tz: start_local.tz.clone(),
+                    }
+                    .to_naive_timestamp(),
+                };
+            utc_instant_to_end(mid_utc + secs, &start_local.tz, tz)
         }
     }
+}
+
+#[inline]
+fn utc_instant_to_end(
+    end_utc: i64,
+    tz_ref: &TimeZoneRef,
+    tz: &CalendarTimeZone,
+) -> (i64, CalDateTime) {
+    let offset = if matches!(tz_ref, TimeZoneRef::Utc) {
+        0
+    } else {
+        tz.offset_at_utc(end_utc).unwrap_or(0)
+    };
+    let ldt = LocalDateTime::from_naive_timestamp(end_utc + i64::from(offset));
+    (
+        end_utc,
+        CalDateTime {
+            date: ldt.date,
+            time: ldt.time,
+            tz: tz_ref.clone(),
+        },
+    )
 }
 
 /// Extracted start, duration, and flags for a single component instance.
@@ -218,13 +285,7 @@ fn default_span(comp: ComponentRef<'_>, is_all_day: bool) -> SpanDuration {
     if let Some(PropertyValue::Duration(dur)) =
         comp.property(&PropertyName::Duration).map(|p| &p.value)
     {
-        let secs = dur.total_seconds().max(0);
-        if is_all_day {
-            let days = (secs / 86_400).max(1) as i32;
-            SpanDuration::Days(days)
-        } else {
-            SpanDuration::Seconds(secs)
-        }
+        span_from_duration(*dur, is_all_day)
     } else if is_all_day {
         SpanDuration::Days(1)
     } else {
@@ -487,10 +548,7 @@ fn expand_master_window(
     budget: IterationBudget,
     out: &mut Vec<Occurrence>,
 ) -> Result<(), RRuleError> {
-    let max_span_secs = match master.span {
-        SpanDuration::Days(d) => i64::from(d) * 86_400 + 86_400,
-        SpanDuration::Seconds(s) => s,
-    };
+    let max_span_secs = master.span.max_seconds();
     let max_back_shift = this_and_future
         .iter()
         .map(|tf| (-tf.time_shift_secs).max(0))
@@ -576,10 +634,7 @@ fn expand_this_and_future_rrules(
     out: &mut Vec<Occurrence>,
 ) -> Result<(), RRuleError> {
     let dtstart_ldt = LocalDateTime::new(tf.start_local.date, tf.start_local.time);
-    let max_span_secs = match tf.span {
-        SpanDuration::Days(d) => i64::from(d) * 86_400 + 86_400,
-        SpanDuration::Seconds(s) => s,
-    };
+    let max_span_secs = tf.span.max_seconds();
     let ff_utc = start_utc.saturating_sub(max_span_secs).max(tf.start_utc);
     let ff_local = utc_to_local_approx(ff_utc, &tf.tz);
     let win_end_local = utc_to_local_approx(end_utc + 86_400, &tf.tz);
@@ -827,7 +882,7 @@ fn push_period_rdate(
         CalPeriod::Duration { start, duration } => {
             out.push(RDateEntry {
                 start_local: start.clone(),
-                custom_span: Some(SpanDuration::Seconds(duration.total_seconds().max(0))),
+                custom_span: Some(span_from_duration(*duration, false)),
             });
         }
     }
@@ -940,11 +995,7 @@ fn build_master(
         .0;
         for r in &rrules {
             if let Some(u) = resolve_until_utc(r, &timing.tz) {
-                let span_secs = match timing.span {
-                    SpanDuration::Days(d) => i64::from(d) * 86_400 + 86_400,
-                    SpanDuration::Seconds(s) => s,
-                };
-                max_e = max_e.max(u + span_secs);
+                max_e = max_e.max(u + timing.span.max_seconds());
             }
         }
         for rdt in &rdates {

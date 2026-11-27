@@ -403,3 +403,33 @@ fn timestamp_to_cal_datetime(naive_seconds: i64) -> CalDateTime {
         tz: TimeZoneRef::Floating,
     }
 }
+
+/// Build a standalone `VTIMEZONE`-rooted [`Calendar`] for `tzid` using the bundled IANA/Windows TZDB.
+pub fn build_vtimezone_for_tzid(tzid: &str, min_year: i16, max_year: i16) -> Option<Calendar> {
+    let registry = TzRegistry::default();
+    let canonical = registry.resolve_canonical_iana(tzid)?;
+    let iana_tz = if canonical == "UTC" {
+        TimeZone::UTC
+    } else {
+        TimeZone::get(canonical.as_str()).ok()?
+    };
+
+    let mut arena = crate::model::ComponentArena::new();
+    let vtz_id = arena.alloc(ComponentKind::VTimezone, None);
+    let mut cal = Calendar {
+        arena,
+        root: vtz_id,
+        warnings: Vec::new(),
+    };
+    if let Some(mut vtz) = cal.component_mut(vtz_id) {
+        vtz.add_property(Property::new(
+            PropertyName::TzId,
+            PropertyValue::Text(CompactString::from(tzid)),
+        ));
+    }
+    let groups = collect_observance_groups(&iana_tz, min_year, max_year);
+    for group in groups {
+        emit_observance_component(&mut cal, vtz_id, group);
+    }
+    Some(cal)
+}

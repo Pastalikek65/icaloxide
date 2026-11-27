@@ -8,7 +8,7 @@ pub mod recurrence;
 pub mod rrule;
 
 pub use error::{IterationBudget, RRuleError};
-pub use query::{AfterIter, CalendarQuery, Occurrence, QueryOptions};
+pub use query::{AfterIter, BusyInterval, CalendarQuery, Occurrence, QueryOptions};
 pub use rrule::{
     expand_rrule, ByWeekday, Frequency, LocalDateTime, RRule, RRuleIter, UntilValue, Weekday,
 };

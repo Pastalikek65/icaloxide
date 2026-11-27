@@ -53,9 +53,19 @@ pub fn write_component(
 fn format_property(prop: &Property, buf: &mut String) -> fmt::Result {
     buf.push_str(prop.name.as_str());
 
+    let is_utc_dt = match &prop.value {
+        PropertyValue::DateTime(dt) => matches!(dt.tz, TimeZoneRef::Utc),
+        PropertyValue::DateTimeList(list) => {
+            !list.is_empty() && list.iter().all(|dt| matches!(dt.tz, TimeZoneRef::Utc))
+        }
+        _ => false,
+    };
     let has_tzid_param = prop.params.iter().any(|p| p.name == ParamName::TzId);
 
     for param in &prop.params {
+        if is_utc_dt && param.name == ParamName::TzId {
+            continue;
+        }
         buf.push(';');
         buf.push_str(param.name.as_str());
         buf.push('=');
@@ -68,7 +78,7 @@ fn format_property(prop: &Property, buf: &mut String) -> fmt::Result {
     }
 
     // Ensure TZID carried on CalDateTime values is preserved if not already in params.
-    if !has_tzid_param {
+    if !has_tzid_param && !is_utc_dt {
         if let Some(tzid) = extract_tzid(&prop.value) {
             buf.push(';');
             buf.push_str("TZID=");
@@ -122,6 +132,14 @@ fn format_property(prop: &Property, buf: &mut String) -> fmt::Result {
         PropertyValue::Boolean(b) => buf.push_str(if *b { "TRUE" } else { "FALSE" }),
         PropertyValue::UtcOffset(off) => write!(buf, "{off}")?,
         PropertyValue::Time(t) => write!(buf, "{t}")?,
+        PropertyValue::RequestStatus(parts) => {
+            for (idx, part) in parts.iter().enumerate() {
+                if idx > 0 {
+                    buf.push(';');
+                }
+                buf.push_str(escape_text(part.as_str()).as_ref());
+            }
+        }
         PropertyValue::Uri(s)
         | PropertyValue::CalAddress(s)
         | PropertyValue::Binary(s)

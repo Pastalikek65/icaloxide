@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import bisect
 import copy
 import datetime
 import json
 from typing import Any, Iterable, Iterator, Optional, Sequence, Union
 
 import icaloxide as _ox
+from icaloxide.compat.xcal import component_to_xcal, xcal_to_jcal
 
 
 def _escape_text(text: str) -> str:
@@ -58,9 +60,11 @@ def _format_temporal(val: Any, params: dict[str, Any]) -> str:
         if val.tzinfo is not None:
             offset = val.utcoffset()
             tzname = val.tzinfo.tzname(val) if hasattr(val.tzinfo, "tzname") else None
+            # Fix #2020: never emit TZID alongside UTC 'Z'
             if offset == datetime.timedelta(0) and (
-                tzname in ("UTC", "Z", None) or "TZID" not in params
+                tzname in ("UTC", "Z", "Etc/UTC", None) or "TZID" not in params
             ):
+                params.pop("TZID", None)
                 return val.strftime("%Y%m%dT%H%M%SZ")
             if "TZID" not in params:
                 key = getattr(val.tzinfo, "key", None) or tzname
@@ -114,6 +118,58 @@ class Parameters(dict):  # type: ignore[type-arg]
 
     def get(self, key: str, default: Any = None) -> Any:
         return super().get(str(key).upper(), default)
+
+    def has_key(self, key: str) -> bool:
+        return key in self
+
+    def sorted_keys(self) -> list[str]:
+        return sorted(self.keys())
+
+    def sorted_items(self) -> list[tuple[str, Any]]:
+        return sorted(self.items(), key=lambda kv: kv[0])
+
+    def tzid(self) -> Optional[str]:
+        val = self.get("TZID")
+        if isinstance(val, (list, tuple)) and val:
+            return str(val[0])
+        return str(val) if val is not None else None
+
+    def is_utc(self) -> bool:
+        t = self.tzid()
+        return t is not None and t.upper() in ("UTC", "ETC/UTC", "Z")
+
+    def value(self) -> Optional[str]:
+        val = self.get("VALUE")
+        if isinstance(val, (list, tuple)) and val:
+            return str(val[0])
+        return str(val) if val is not None else None
+
+    def to_jcal(self, exclude_utc_tzid: bool = False) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for k, v in self.items():
+            kl = str(k).lower()
+            if kl == "value":
+                continue
+            if exclude_utc_tzid and kl == "tzid":
+                continue
+            out[kl] = v[0] if isinstance(v, (list, tuple)) and len(v) == 1 else v
+        return out
+
+    @classmethod
+    def from_jcal(cls, jcal_params: dict[str, Any]) -> Parameters:
+        return cls({str(k).upper(): v for k, v in dict(jcal_params).items()})
+
+    @classmethod
+    def from_ical(cls, raw: Union[str, bytes]) -> Parameters:
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+        out = cls()
+        for part in text.split(";"):
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            k, v = part.split("=", 1)
+            out[k.strip().upper()] = v.strip().strip('"')
+        return out
 
     def to_ical(self) -> bytes:
         parts = []
@@ -361,6 +417,71 @@ class vDatetime(vDDDTypes):
 
 class vTime(vDDDTypes):
     pass
+
+
+class vDDDLists:
+    """List of ``vDDDTypes`` temporals matching ``icalendar.prop.vDDDLists``."""
+
+    def __init__(
+        self,
+        dt_list: Iterable[Any],
+        params: Optional[dict[str, Any]] = None,
+    ) -> None:
+        self.params = Parameters(params) if params else Parameters()
+        self.dts = [x if isinstance(x, vDDDTypes) else vDDDTypes(x, params) for x in dt_list]
+
+    def to_ical(self) -> bytes:
+        return b",".join(d.to_ical() for d in self.dts)
+
+
+class vWeekday(vText):
+    pass
+
+
+class vFrequency(vText):
+    pass
+
+
+class vMonth(vInt):
+    pass
+
+
+class vSkip(vText):
+    pass
+
+
+class vUid(vText):
+    pass
+
+
+class vBroken(vText):
+    pass
+
+
+class vUnknown(vText):
+    pass
+
+
+class vXmlReference(vUri):
+    pass
+
+
+class Conference(vUri):
+    """RFC 7986 ``CONFERENCE`` wrapper."""
+
+
+class Image(vUri):
+    """RFC 7986 ``IMAGE`` wrapper."""
+
+
+def is_utc(dt: Any) -> bool:
+    if isinstance(dt, datetime.datetime) and dt.tzinfo is not None:
+        return dt.utcoffset() == datetime.timedelta(0)
+    return False
+
+
+def use_zoneinfo() -> None:
+    """Compatibility no-op: ``icaloxide`` always uses stdlib ``zoneinfo`` + embedded TZDB."""
 
 
 _TEMPORAL_KEYS = frozenset(
@@ -653,6 +774,100 @@ class Component:
         self._subcomponents.append(component)
 
     @property
+    def uid(self) -> Optional[str]:
+        v = self.decoded("UID")
+        return str(v) if v is not None else None
+
+    @property
+    def created(self) -> Any:
+        return self.decoded("CREATED")
+
+    @property
+    def last_modified(self) -> Any:
+        return self.decoded("LAST-MODIFIED")
+
+    @property
+    def links(self) -> list[vUri]:
+        val = self.get("LINK")
+        if val is None:
+            return []
+        items = val if isinstance(val, list) else [val]
+        return [v if isinstance(v, vUri) else vUri(v) for v in items]
+
+    @property
+    def concepts(self) -> list[vUri]:
+        val = self.get("CONCEPT")
+        if val is None:
+            return []
+        items = val if isinstance(val, list) else [val]
+        return [v if isinstance(v, vUri) else vUri(v) for v in items]
+
+    @property
+    def refids(self) -> list[str]:
+        val = self.decoded("REFID")
+        if val is None:
+            return []
+        items = val if isinstance(val, list) else [val]
+        return [str(v) for v in items]
+
+    @property
+    def related_to(self) -> list[str]:
+        val = self.decoded("RELATED-TO")
+        if val is None:
+            return []
+        items = val if isinstance(val, list) else [val]
+        return [str(v) for v in items]
+
+    @property
+    def comments(self) -> list[str]:
+        val = self.decoded("COMMENT")
+        if val is None:
+            return []
+        items = val if isinstance(val, list) else [val]
+        return [str(v) for v in items]
+
+    def is_empty(self) -> bool:
+        self._ensure_materialized()
+        return not self._props and not self._subcomponents
+
+    def with_uid(self, uid: str) -> list[Component]:
+        return [c for c in self.walk() if c.decoded("UID") == uid]
+
+    def stamp(self) -> None:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        self["DTSTAMP"] = now
+
+    def content_lines(self) -> list[str]:
+        return self.to_ical().decode("utf-8").splitlines()
+
+    def content_line(self, name: str, default: Any = None) -> Any:
+        return self.get(name, default)
+
+    @classmethod
+    def register(cls, comp_cls: type[Component]) -> type[Component]:
+        _COMPONENT_CLASS_MAP[comp_cls.name.upper()] = comp_cls
+        return comp_cls
+
+    @classmethod
+    def from_ical(
+        cls, st: _ox.InputData, multiple: bool = False, *, strict: bool = False
+    ) -> Union[Component, list[Component]]:
+        if multiple:
+            cals = _ox.Calendar.from_ical_multiple(st, strict=strict)
+            return [_wrap_rust_component_or_cal(c) for c in cals]
+        comp = _ox.parse_component(st, strict=strict)
+        return _wrap_rust_component(comp)
+
+    def to_xcal(self) -> str:
+        """Serialize this component into RFC 6321 xCal XML."""
+        return component_to_xcal(self)
+
+    @classmethod
+    def from_xcal(cls, xml_data: Union[str, bytes]) -> Component:
+        """Parse RFC 6321 xCal XML into a Component."""
+        return cls.from_jcal(xcal_to_jcal(xml_data))
+
+    @property
     def subcomponents(self) -> list[Component]:
         if not self._materialized:
             if self._rust_cal is not None:
@@ -768,7 +983,10 @@ class Component:
         if hasattr(val, "to_ical") and not isinstance(val, str):
             raw = val.to_ical()
             return raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
-        if key in ("RRULE", "ATTACH", "URL", "UID", "ATTENDEE", "ORGANIZER"):
+        if key == "REQUEST-STATUS":
+            parts = str(val).split(";")
+            return ";".join(_escape_text(p) for p in parts)
+        if key in ("RRULE", "ATTACH", "URL", "UID", "ATTENDEE", "ORGANIZER", "LINK", "CONCEPT"):
             return str(val)
         return _escape_text(str(val))
 
@@ -820,6 +1038,8 @@ def _prop_to_jcal(key: str, val: Any, raw_params: dict[str, Any]) -> list[Any]:
         return [pname, params, "date-time", _iso_temporal(val)]
     if isinstance(val, datetime.date):
         return [pname, params, "date", val.isoformat()]
+    if isinstance(val, datetime.time):
+        return [pname, params, "time", val.strftime("%H:%M:%S")]
     if isinstance(val, datetime.timedelta):
         return [pname, params, "duration", _format_temporal(val, {})]
     if isinstance(val, bool):
@@ -856,6 +1076,9 @@ def _jcal_values_to_py(pname: str, jtype: str, vals: list[Any], params: dict[str
     if jtype == "date-time":
         parsed_dt = [_parse_iso_dt(str(v), params) for v in vals]
         return parsed_dt[0] if len(parsed_dt) == 1 else parsed_dt
+    if jtype == "time":
+        parsed_t = [_parse_iso_time(str(v), params) for v in vals]
+        return parsed_t[0] if len(parsed_t) == 1 else parsed_t
     if jtype == "integer":
         return int(vals[0])
     if jtype == "float":
@@ -877,10 +1100,32 @@ def _parse_iso_dt(raw: str, params: dict[str, Any]) -> datetime.datetime:
         try:
             from zoneinfo import ZoneInfo
 
-            dt = dt.replace(tzinfo=ZoneInfo(str(params["TZID"])))
+            tzid_val = params["TZID"]
+            if isinstance(tzid_val, (list, tuple)) and tzid_val:
+                tzid_val = tzid_val[0]
+            dt = dt.replace(tzinfo=ZoneInfo(str(tzid_val)))
         except Exception:
             pass
     return dt
+
+
+def _parse_iso_time(raw: str, params: dict[str, Any]) -> datetime.time:
+    """Parse jCal ``time`` while preserving optional ``Z`` or ``TZID`` (#2154)."""
+    if raw.endswith(("Z", "z")):
+        t = datetime.time.fromisoformat(raw[:-1])
+        return t.replace(tzinfo=datetime.timezone.utc)
+    t = datetime.time.fromisoformat(raw)
+    if "TZID" in params and t.tzinfo is None:
+        try:
+            from zoneinfo import ZoneInfo
+
+            tzid_val = params["TZID"]
+            if isinstance(tzid_val, (list, tuple)) and tzid_val:
+                tzid_val = tzid_val[0]
+            t = t.replace(tzinfo=ZoneInfo(str(tzid_val)))  # type: ignore[arg-type]
+        except Exception:
+            pass
+    return t
 
 
 class _SpanMixin(Component):
@@ -1012,6 +1257,41 @@ class _SpanMixin(Component):
     def alarms(self) -> list[Alarm]:
         return [c for c in self.subcomponents if c.name == "VALARM"]  # type: ignore[misc]
 
+    @property
+    def classification(self) -> Optional[str]:
+        return self.decoded("CLASS")
+
+    @property
+    def transparency(self) -> Optional[str]:
+        return self.decoded("TRANSP")
+
+    @property
+    def url(self) -> Optional[str]:
+        return self.decoded("URL")
+
+    @property
+    def contacts(self) -> list[str]:
+        val = self.decoded("CONTACT")
+        if val is None:
+            return []
+        return list(val) if isinstance(val, list) else [str(val)]
+
+    @property
+    def conferences(self) -> list[Conference]:
+        val = self.get("CONFERENCE")
+        if val is None:
+            return []
+        items = val if isinstance(val, list) else [val]
+        return [v if isinstance(v, Conference) else Conference(v) for v in items]
+
+    @property
+    def images(self) -> list[Image]:
+        val = self.get("IMAGE")
+        if val is None:
+            return []
+        items = val if isinstance(val, list) else [val]
+        return [v if isinstance(v, Image) else Image(v) for v in items]
+
 
 class Event(_SpanMixin):
     name = "VEVENT"
@@ -1076,9 +1356,61 @@ class Todo(_SpanMixin):
 class Journal(_SpanMixin):
     name = "VJOURNAL"
 
+    @classmethod
+    def new(
+        cls,
+        *,
+        summary: Optional[str] = None,
+        start: Any = None,
+        uid: Optional[str] = None,
+        description: Optional[str] = None,
+    ) -> Journal:
+        jn = cls()
+        if uid is not None:
+            jn.add("UID", uid)
+        if summary is not None:
+            jn.add("SUMMARY", summary)
+        if start is not None:
+            jn.add("DTSTART", start)
+        if description is not None:
+            jn.add("DESCRIPTION", description)
+        return jn
+
+    @property
+    def descriptions(self) -> list[str]:
+        val = self.decoded("DESCRIPTION")
+        if val is None:
+            return []
+        return list(val) if isinstance(val, list) else [str(val)]
+
 
 class Alarm(Component):
     name = "VALARM"
+
+    @classmethod
+    def new(
+        cls,
+        *,
+        action: str = "DISPLAY",
+        trigger: Union[datetime.timedelta, datetime.datetime, None] = None,
+        description: Optional[str] = None,
+        summary: Optional[str] = None,
+        repeat: Optional[int] = None,
+        duration: Optional[datetime.timedelta] = None,
+    ) -> Alarm:
+        al = cls()
+        al.add("ACTION", action)
+        if trigger is not None:
+            al.add("TRIGGER", trigger)
+        if description is not None:
+            al.add("DESCRIPTION", description)
+        if summary is not None:
+            al.add("SUMMARY", summary)
+        if repeat is not None:
+            al.add("REPEAT", repeat)
+        if duration is not None:
+            al.add("DURATION", duration)
+        return al
 
     @classmethod
     def new_display(
@@ -1139,6 +1471,23 @@ class Alarm(Component):
         return self.decoded("TRIGGER")
 
     @property
+    def triggers(self) -> list[Any]:
+        t = self.trigger
+        return [] if t is None else (list(t) if isinstance(t, list) else [t])
+
+    @property
+    def description(self) -> Optional[str]:
+        return self.decoded("DESCRIPTION")
+
+    @property
+    def summary(self) -> Optional[str]:
+        return self.decoded("SUMMARY")
+
+    @property
+    def acknowledged(self) -> Any:
+        return self.decoded("ACKNOWLEDGED")
+
+    @property
     def repeat(self) -> int:
         return int(self.decoded("REPEAT", 0) or 0)
 
@@ -1147,12 +1496,176 @@ class Alarm(Component):
         return self.decoded("DURATION")
 
 
-class FreeBusy(Component):
+class FreeBusy(_SpanMixin):
     name = "VFREEBUSY"
+
+    @classmethod
+    def new(
+        cls,
+        *,
+        start: Any = None,
+        end: Any = None,
+        uid: Optional[str] = None,
+        organizer: Optional[str] = None,
+    ) -> FreeBusy:
+        fb = cls()
+        if uid is not None:
+            fb.add("UID", uid)
+        if start is not None:
+            fb.add("DTSTART", start)
+        if end is not None:
+            fb.add("DTEND", end)
+        if organizer is not None:
+            fb.add("ORGANIZER", organizer)
+        return fb
+
+
+class _CompiledVTimezoneTzInfo(datetime.tzinfo):
+    """``datetime.tzinfo`` backed by Rust ``CompiledVTimezone`` transitions."""
+
+    def __init__(
+        self,
+        name: str,
+        transitions: list[tuple[int, int, int, bool, Optional[str]]],
+    ) -> None:
+        self._name = name
+        self._transitions = transitions
+        self._trans_utc = [t[0] for t in transitions]
+
+    def _resolve(self, dt: Optional[datetime.datetime]) -> tuple[int, int, str]:
+        if not self._transitions:
+            return 0, 0, self._name
+        if dt is None:
+            _, _, off_to, is_dst, abbr = self._transitions[0]
+            return off_to, (3600 if is_dst else 0), abbr or self._name
+
+        naive_ts = int(dt.replace(tzinfo=None).timestamp()) if dt.year >= 1970 else (
+            (dt.date() - datetime.date(1970, 1, 1)).days * 86400
+            + dt.hour * 3600
+            + dt.minute * 60
+            + dt.second
+        )
+        # Converge local wall-clock timestamp against sorted UTC transitions
+        est_off = self._transitions[0][1]
+        idx = bisect.bisect_right(self._trans_utc, naive_ts - est_off)
+        for _ in range(2):
+            chosen = self._transitions[idx - 1] if idx > 0 else self._transitions[0]
+            est_off = chosen[2] if idx > 0 else chosen[1]
+            idx = bisect.bisect_right(self._trans_utc, naive_ts - est_off)
+        if idx == 0:
+            _, off_from, _, _, abbr = self._transitions[0]
+            return off_from, 0, abbr or self._name
+        _, off_from, off_to, is_dst, abbr = self._transitions[idx - 1]
+        dst_secs = (off_to - off_from) if is_dst and off_to > off_from else (3600 if is_dst else 0)
+        return off_to, dst_secs, abbr or self._name
+
+    def utcoffset(self, dt: Optional[datetime.datetime]) -> datetime.timedelta:
+        off, _, _ = self._resolve(dt)
+        return datetime.timedelta(seconds=off)
+
+    def dst(self, dt: Optional[datetime.datetime]) -> datetime.timedelta:
+        _, dst_s, _ = self._resolve(dt)
+        return datetime.timedelta(seconds=dst_s)
+
+    def tzname(self, dt: Optional[datetime.datetime]) -> str:
+        _, _, abbr = self._resolve(dt)
+        return abbr
 
 
 class Timezone(Component):
     name = "VTIMEZONE"
+    DEFAULT_FIRST_DATE = datetime.date(1970, 1, 1)
+    DEFAULT_LAST_DATE = datetime.date(2038, 1, 1)
+
+    @property
+    def tz_name(self) -> Optional[str]:
+        v = self.decoded("TZID")
+        return str(v) if v is not None else None
+
+    @property
+    def standard(self) -> list[TimezoneStandard]:
+        return self.walk("STANDARD")  # type: ignore[return-value]
+
+    @property
+    def daylight(self) -> list[TimezoneDaylight]:
+        return self.walk("DAYLIGHT")  # type: ignore[return-value]
+
+    @classmethod
+    def from_tzid(
+        cls,
+        tzid: str,
+        first_date: datetime.date = DEFAULT_FIRST_DATE,
+        last_date: datetime.date = DEFAULT_LAST_DATE,
+    ) -> Timezone:
+        raw = _ox.vtimezone_for_tzid(tzid, first_date.year, last_date.year)
+        if raw is None:
+            raise ValueError(f"unknown timezone identifier: {tzid!r}")
+        comp = cls.from_ical(raw)
+        assert isinstance(comp, Timezone)
+        return comp
+
+    @classmethod
+    def from_tzinfo(
+        cls,
+        tzinfo: datetime.tzinfo,
+        tzid: Optional[str] = None,
+        first_date: datetime.date = DEFAULT_FIRST_DATE,
+        last_date: datetime.date = DEFAULT_LAST_DATE,
+    ) -> Timezone:
+        key = tzid or getattr(tzinfo, "key", None) or getattr(tzinfo, "zone", None)
+        if key:
+            try:
+                return cls.from_tzid(str(key), first_date=first_date, last_date=last_date)
+            except ValueError:
+                pass
+        sample = datetime.datetime(2020, 1, 1)
+        off = tzinfo.utcoffset(sample) or datetime.timedelta(0)
+        name = str(key or (tzinfo.tzname(sample) if hasattr(tzinfo, "tzname") else None) or "CUSTOM")
+        tz_comp = cls()
+        tz_comp.add("TZID", name)
+        std = TimezoneStandard()
+        std.add("DTSTART", datetime.datetime(1970, 1, 1, 0, 0, 0))
+        std.add("TZOFFSETFROM", vUTCOffset(off))
+        std.add("TZOFFSETTO", vUTCOffset(off))
+        tz_comp.add_component(std)
+        return tz_comp
+
+    def get_transitions(
+        self,
+    ) -> tuple[list[datetime.datetime], list[tuple[datetime.timedelta, datetime.timedelta, str]]]:
+        zone = self.tz_name or "VTIMEZONE"
+        rows = _ox.compile_vtimezone_transitions(self.to_ical())
+        times: list[datetime.datetime] = []
+        infos: list[tuple[datetime.timedelta, datetime.timedelta, str]] = []
+        for utc_ts, off_from, off_to, is_dst, abbr in rows:
+            times.append(
+                datetime.datetime.fromtimestamp(utc_ts, tz=datetime.timezone.utc).replace(
+                    tzinfo=None
+                )
+            )
+            dst_s = (off_to - off_from) if is_dst and off_to > off_from else (3600 if is_dst else 0)
+            infos.append(
+                (
+                    datetime.timedelta(seconds=off_to),
+                    datetime.timedelta(seconds=dst_s),
+                    abbr or zone,
+                )
+            )
+        return times, infos
+
+    def to_tz(self, tzp: Any = None, lookup_tzid: bool = True) -> datetime.tzinfo:
+        _ = tzp
+        if lookup_tzid and self.tz_name:
+            if self.tz_name.upper() in ("UTC", "ETC/UTC"):
+                return datetime.timezone.utc
+            try:
+                from zoneinfo import ZoneInfo
+
+                return ZoneInfo(self.tz_name)
+            except Exception:
+                pass
+        rows = _ox.compile_vtimezone_transitions(self.to_ical())
+        return _CompiledVTimezoneTzInfo(self.tz_name or "VTIMEZONE", rows)
 
 
 class TimezoneStandard(Component):
@@ -1163,12 +1676,66 @@ class TimezoneDaylight(Component):
     name = "DAYLIGHT"
 
 
-class Availability(Component):
+class Availability(_SpanMixin):
     name = "VAVAILABILITY"
+
+    @classmethod
+    def new(
+        cls,
+        *,
+        summary: Optional[str] = None,
+        start: Any = None,
+        end: Any = None,
+        busy_type: Optional[str] = None,
+        uid: Optional[str] = None,
+    ) -> Availability:
+        av = cls()
+        if uid is not None:
+            av.add("UID", uid)
+        if summary is not None:
+            av.add("SUMMARY", summary)
+        if start is not None:
+            av.add("DTSTART", start)
+        if end is not None:
+            av.add("DTEND", end)
+        if busy_type is not None:
+            av.add("BUSYTYPE", busy_type)
+        return av
+
+    @property
+    def available(self) -> list[Available]:
+        return [c for c in self.subcomponents if c.name == "AVAILABLE"]  # type: ignore[misc]
+
+    @property
+    def busy_type(self) -> Optional[str]:
+        return self.decoded("BUSYTYPE")
 
 
 class Available(_SpanMixin):
     name = "AVAILABLE"
+
+    @classmethod
+    def new(
+        cls,
+        *,
+        summary: Optional[str] = None,
+        start: Any = None,
+        end: Any = None,
+        duration: Optional[datetime.timedelta] = None,
+        uid: Optional[str] = None,
+    ) -> Available:
+        av = cls()
+        if uid is not None:
+            av.add("UID", uid)
+        if summary is not None:
+            av.add("SUMMARY", summary)
+        if start is not None:
+            av.add("DTSTART", start)
+        if end is not None:
+            av.add("DTEND", end)
+        if duration is not None:
+            av.add("DURATION", duration)
+        return av
 
 
 _COMPONENT_CLASS_MAP: dict[str, type[Component]] = {
@@ -1193,6 +1760,10 @@ def _wrap_rust_component(
 ) -> Component:
     cls = _COMPONENT_CLASS_MAP.get(comp.name, Component)
     return cls(_rust_comp=comp, _keep_recurrence=keep_recurrence)
+
+
+def _wrap_rust_component_or_cal(cal: _ox.Calendar) -> Component:
+    return Calendar(_rust_cal=cal)
 
 
 class Calendar(Component):
@@ -1227,12 +1798,132 @@ class Calendar(Component):
         *,
         prodid: Optional[str] = None,
         name: Optional[str] = None,
+        calscale: Optional[str] = "GREGORIAN",
+        version: str = "2.0",
     ) -> Calendar:
-        return cls(_rust_cal=_ox.Calendar.new(prodid=prodid, name=name))
+        cal = cls(_rust_cal=_ox.Calendar.new(prodid=prodid, name=name))
+        if calscale is not None and calscale != "GREGORIAN":
+            cal["CALSCALE"] = calscale
+        if version != "2.0":
+            cal["VERSION"] = version
+        return cal
 
     @property
     def calendar_name(self) -> Optional[str]:
         return self.decoded("NAME") or self.decoded("X-WR-CALNAME")
+
+    @property
+    def prodid(self) -> Optional[str]:
+        return self.decoded("PRODID")
+
+    @property
+    def version(self) -> Optional[str]:
+        return self.decoded("VERSION")
+
+    @property
+    def calscale(self) -> Optional[str]:
+        return self.decoded("CALSCALE")
+
+    @property
+    def method(self) -> Optional[str]:
+        return self.decoded("METHOD")
+
+    @property
+    def color(self) -> Optional[str]:
+        return self.decoded("COLOR")
+
+    @property
+    def description(self) -> Optional[str]:
+        return self.decoded("DESCRIPTION") or self.decoded("X-WR-CALDESC")
+
+    @property
+    def categories(self) -> list[str]:
+        val = self.decoded("CATEGORIES")
+        if val is None:
+            return []
+        return list(val) if isinstance(val, list) else [str(val)]
+
+    @property
+    def source(self) -> Optional[str]:
+        return self.decoded("SOURCE")
+
+    @property
+    def refresh_interval(self) -> Any:
+        return self.decoded("REFRESH-INTERVAL")
+
+    @property
+    def url(self) -> Optional[str]:
+        return self.decoded("URL")
+
+    @property
+    def images(self) -> list[Image]:
+        val = self.get("IMAGE")
+        if val is None:
+            return []
+        items = val if isinstance(val, list) else [val]
+        return [v if isinstance(v, Image) else Image(v) for v in items]
+
+    def cancel_occurrence(self, uid: str, recurrence_id: Any) -> Calendar:
+        """Exclude a specific occurrence of ``uid`` by adding an ``EXDATE`` to its master component."""
+        self._ensure_materialized()
+        for comp in self._subcomponents:
+            if comp.uid == uid and "RECURRENCE-ID" not in comp:
+                comp.add("EXDATE", recurrence_id)
+                return self
+        raise KeyError(f"master component with UID={uid!r} not found")
+
+    def modify_occurrence(
+        self,
+        uid: str,
+        recurrence_id: Any,
+        *,
+        range_this_and_future: bool = False,
+        **updates: Any,
+    ) -> Component:
+        """Create or update a ``RECURRENCE-ID`` override component for ``uid``."""
+        self._ensure_materialized()
+        master = next(
+            (c for c in self._subcomponents if c.uid == uid and "RECURRENCE-ID" not in c),
+            None,
+        )
+        if master is None:
+            raise KeyError(f"master component with UID={uid!r} not found")
+        ov = master.copy()
+        for rec_key in ("RRULE", "RDATE", "EXDATE", "RECURRENCE-ID"):
+            if rec_key in ov:
+                del ov[rec_key]
+        rid_params = {"RANGE": "THISANDFUTURE"} if range_this_and_future else None
+        ov.add("RECURRENCE-ID", recurrence_id, parameters=rid_params)
+        if "start" in updates:
+            ov["DTSTART"] = updates.pop("start")
+        if "end" in updates:
+            end_key = "DUE" if ov.name == "VTODO" else "DTEND"
+            ov[end_key] = updates.pop("end")
+        if "duration" in updates:
+            ov["DURATION"] = updates.pop("duration")
+        for k, v in updates.items():
+            ov[k.upper()] = v
+        seq = int(ov.decoded("SEQUENCE", 0) or 0) + 1
+        ov["SEQUENCE"] = seq
+        self.add_component(ov)
+        return ov
+
+    def complete_occurrence(
+        self,
+        uid: str,
+        recurrence_id: Any,
+        *,
+        completed_at: Optional[datetime.datetime] = None,
+    ) -> Component:
+        """Mark one occurrence of a recurring ``VTODO`` as ``COMPLETED`` via an override."""
+        ts = completed_at or datetime.datetime.now(datetime.timezone.utc)
+        return self.modify_occurrence(
+            uid,
+            recurrence_id,
+            status="COMPLETED",
+            completed=ts,
+            percent_complete=100,
+        )
 
     @property
     def events(self) -> list[Event]:
@@ -1301,6 +1992,7 @@ class Calendar(Component):
 
 
 _COMPONENT_CLASS_MAP["VCALENDAR"] = Calendar
+LazyCalendar = Calendar
 
 
 __all__ = [
@@ -1309,29 +2001,43 @@ __all__ = [
     "Available",
     "Calendar",
     "Component",
+    "Conference",
     "Event",
     "FreeBusy",
+    "Image",
     "Journal",
+    "LazyCalendar",
     "Parameters",
     "Timezone",
     "TimezoneDaylight",
     "TimezoneStandard",
     "Todo",
+    "is_utc",
+    "use_zoneinfo",
     "vBinary",
     "vBoolean",
+    "vBroken",
     "vCalAddress",
     "vCategory",
+    "vDDDLists",
     "vDDDTypes",
     "vDate",
     "vDatetime",
     "vDuration",
     "vFloat",
+    "vFrequency",
     "vGeo",
     "vInt",
+    "vMonth",
     "vPeriod",
     "vRecur",
+    "vSkip",
     "vText",
     "vTime",
     "vUTCOffset",
+    "vUid",
+    "vUnknown",
     "vUri",
+    "vWeekday",
+    "vXmlReference",
 ]
