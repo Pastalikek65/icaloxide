@@ -8,6 +8,7 @@ from icaloxide._icaloxide import (
     OccurrencePageIterator,
     __version__,
     compile_vtimezone_transitions,
+    fold_ical_lines,
     parse_component,
     vtimezone_for_tzid,
 )
@@ -22,6 +23,7 @@ __all__ = [
     "OccurrencePageIterator",
     "__version__",
     "compile_vtimezone_transitions",
+    "fold_ical_lines",
     "parse_component",
     "vtimezone_for_tzid",
 ]

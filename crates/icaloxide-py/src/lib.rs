@@ -6,6 +6,7 @@ use std::sync::{Arc, OnceLock};
 
 use compact_str::CompactString;
 use icaloxide_core::tz::build_vtimezone_for_tzid;
+use icaloxide_core::writer::write_folded_line;
 use icaloxide_core::{
     CalDate, CalDateTime, CalDuration, CalPeriod, CalTime, Calendar as CoreCalendar,
     CalendarTimeZone, CompiledVTimezone, ComponentId, ComponentKind, DstDisambiguation, ParamName,
@@ -31,6 +32,8 @@ struct PyDateTimeTypes {
     timezone_cls: Py<PyAny>,
     utc_tz: Py<PyAny>,
     zoneinfo_cls: Option<Py<PyAny>>,
+    zoneinfo_cache: Py<PyDict>,
+    fixed_tz_cache: Py<PyDict>,
 }
 
 static DATETIME_TYPES: GILOnceCell<PyDateTimeTypes> = GILOnceCell::new();
@@ -53,6 +56,8 @@ fn dt_types(py: Python<'_>) -> PyResult<&PyDateTimeTypes> {
             timezone_cls: tz_cls.unbind(),
             utc_tz,
             zoneinfo_cls,
+            zoneinfo_cache: PyDict::new(py).unbind(),
+            fixed_tz_cache: PyDict::new(py).unbind(),
         })
     })
 }
@@ -84,11 +89,19 @@ fn fixed_tz_to_py<'py>(
     name: &str,
 ) -> PyResult<Bound<'py, PyAny>> {
     let types = dt_types(py)?;
+    let cache = types.fixed_tz_cache.bind(py);
+    if let Some(cached) = cache.get_item((offset_seconds, name))? {
+        return Ok(cached);
+    }
     let delta = types
         .timedelta_cls
         .bind(py)
         .call1((0_i32, offset_seconds))?;
-    types.timezone_cls.bind(py).call1((delta, name))
+    let tz = types.timezone_cls.bind(py).call1((delta, name))?;
+    if cache.len() < 256 {
+        cache.set_item((offset_seconds, name), &tz)?;
+    }
+    Ok(tz)
 }
 
 fn tzref_to_py<'py>(
@@ -123,8 +136,15 @@ fn tzref_to_py<'py>(
             }
 
             let lookup_key = canonical.as_deref().unwrap_or(id.as_str());
+            let zi_cache = types.zoneinfo_cache.bind(py);
+            if let Some(cached) = zi_cache.get_item(lookup_key)? {
+                return Ok(Some(cached));
+            }
             if let Some(zi_cls) = &types.zoneinfo_cls {
                 if let Ok(zi) = zi_cls.bind(py).call1((lookup_key,)) {
+                    if zi_cache.len() < 1024 {
+                        zi_cache.set_item(lookup_key, &zi)?;
+                    }
                     return Ok(Some(zi));
                 }
             }
@@ -548,6 +568,27 @@ impl PyComponent {
             .map(|prop| {
                 let val = property_value_to_py(py, reg, &prop.value)?.unbind();
                 let params = prop_params_to_py_dict(py, &prop.params)?;
+                Ok((prop.name.as_str().to_owned(), val, params))
+            })
+            .collect()
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn raw_properties_compact<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Vec<(String, PyObject, Option<Bound<'py, PyDict>>)>> {
+        let comp = self.node_ref()?;
+        let reg = self.registry();
+        comp.properties()
+            .iter()
+            .map(|prop| {
+                let val = property_value_to_py(py, reg, &prop.value)?.unbind();
+                let params = if prop.params.is_empty() {
+                    None
+                } else {
+                    Some(prop_params_to_py_dict(py, &prop.params)?)
+                };
                 Ok((prop.name.as_str().to_owned(), val, params))
             })
             .collect()
@@ -1894,6 +1935,21 @@ fn compile_vtimezone_transitions(
         .collect())
 }
 
+#[pyfunction]
+fn fold_ical_lines<'py>(
+    py: Python<'py>,
+    lines: &Bound<'py, PyList>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let mut out = String::with_capacity(lines.len().saturating_mul(48));
+    for item in lines.iter() {
+        let s = item.downcast::<PyString>()?;
+        let text = s.to_cow()?;
+        write_folded_line(text.as_ref(), &mut out)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    }
+    Ok(PyBytes::new(py, out.as_bytes()))
+}
+
 #[pymodule]
 fn _icaloxide(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
@@ -1907,5 +1963,6 @@ fn _icaloxide(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_component, m)?)?;
     m.add_function(wrap_pyfunction!(vtimezone_for_tzid, m)?)?;
     m.add_function(wrap_pyfunction!(compile_vtimezone_transitions, m)?)?;
+    m.add_function(wrap_pyfunction!(fold_ical_lines, m)?)?;
     Ok(())
 }

@@ -10,7 +10,10 @@ from typing import Any, Iterator, Optional, Sequence, Tuple, Union
 import icaloxide as _ox
 from icaloxide.compat.errors import BadRuleStringFormat, PeriodEndBeforeStart
 from icaloxide.compat.icalendar import Calendar as CompatCalendar
-from icaloxide.compat.icalendar import Component, _wrap_rust_component
+from icaloxide.compat.icalendar import (
+    Component,
+    _wrap_rust_occurrence_fast,
+)
 
 DATE_MIN = datetime.date(1970, 1, 1)
 DATE_MAX = datetime.date(9999, 12, 31)
@@ -100,6 +103,34 @@ class OccurrenceID:
     def __repr__(self) -> str:
         return f"OccurrenceID({self.to_string()!r})"
 
+    def _as_tuple(self) -> tuple[str, str, Any, Any]:
+        return (self.name, self.uid, self.recurrence_id, self.start)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, OccurrenceID):
+            return self._as_tuple() == other._as_tuple()
+        if isinstance(other, tuple):
+            return self._as_tuple() == other
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self._as_tuple())
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self._as_tuple())
+
+    def __len__(self) -> int:
+        return 4
+
+    def __getitem__(self, idx: Any) -> Any:
+        return self._as_tuple()[idx]
+
+    def count(self, value: Any) -> int:
+        return self._as_tuple().count(value)
+
+    def index(self, value: Any, start: int = 0, stop: int = 4) -> int:
+        return self._as_tuple().index(value, start, stop)
+
 
 class ComponentsWithName:
     """Compatibility selector for named components matching ``recurring_ical_events``."""
@@ -122,10 +153,24 @@ class ComponentAdapter:
     """Base adapter for standard or custom (``X-*``) components in ``recurring_ical_events``."""
 
     name: str = "COMPONENT"
+    ATTRIBUTES_TO_DELETE_ON_COPY = ("RRULE", "RDATE", "EXDATE", "RECURRENCE-ID")
+
+    def __init__(self, component: Component) -> None:
+        self.component = component
 
     @classmethod
     def component_name(cls) -> str:
         return cls.name.upper()
+
+    @classmethod
+    def collect_series_from(
+        cls,
+        calendar: CompatCalendar,
+        suppress_errors: tuple[type[Exception], ...] = (),
+    ) -> list[Series]:
+        _ = suppress_errors
+        comps = calendar.walk(cls.component_name())
+        return [Series([c]) for c in comps]
 
     @classmethod
     def collect_components_from(
@@ -156,6 +201,120 @@ class ComponentAdapter:
             else:
                 end = start
         return start, end
+
+    @property
+    def raw_start(self) -> Any:
+        return self.component.decoded("DTSTART", None) or self.component.decoded("DUE", None)
+
+    @property
+    def raw_end(self) -> Any:
+        return self.component.decoded("DTEND", None) or self.component.decoded("DUE", None)
+
+    @property
+    def start(self) -> Any:
+        return self.component_bounds(self.component)[0]
+
+    @property
+    def end(self) -> Any:
+        return self.component_bounds(self.component)[1]
+
+    @property
+    def duration(self) -> Optional[datetime.timedelta]:
+        s, e = self.component_bounds(self.component)
+        if s is not None and e is not None:
+            return e - s
+        return None
+
+    @property
+    def end_property(self) -> Optional[str]:
+        if "DUE" in self.component:
+            return "DUE"
+        if "DTEND" in self.component:
+            return "DTEND"
+        return None
+
+    @property
+    def uid(self) -> str:
+        return str(self.component.decoded("UID", "") or "")
+
+    @property
+    def sequence(self) -> int:
+        return int(self.component.decoded("SEQUENCE", 0) or 0)
+
+    @property
+    def rrules(self) -> list[Any]:
+        val = self.component.decoded("RRULE", None)
+        if val is None:
+            return []
+        return list(val) if isinstance(val, list) else [val]
+
+    @property
+    def rdates(self) -> list[Any]:
+        val = self.component.decoded("RDATE", None)
+        if val is None:
+            return []
+        return list(val) if isinstance(val, list) else [val]
+
+    @property
+    def exdates(self) -> list[Any]:
+        val = self.component.decoded("EXDATE", None)
+        if val is None:
+            return []
+        return list(val) if isinstance(val, list) else [val]
+
+    @property
+    def span(self) -> tuple[Any, Any]:
+        return self.component_bounds(self.component)
+
+    @property
+    def alarms(self) -> list[Component]:
+        return self.component.walk("VALARM")
+
+    @property
+    def recurrence_ids(self) -> tuple[Any, ...]:
+        rid = self.component.decoded("RECURRENCE-ID", None) or self.start
+        return (rid,)
+
+    def has_recurrence_rules(self) -> bool:
+        return bool("RRULE" in self.component or "RDATE" in self.component)
+
+    def is_modification(self) -> bool:
+        return "RECURRENCE-ID" in self.component
+
+    def this_and_future(self) -> bool:
+        if "RECURRENCE-ID" not in self.component:
+            return False
+        prop = self.component.get("RECURRENCE-ID")
+        params = getattr(prop, "params", {})
+        return str(params.get("RANGE", "")).upper() == "THISANDFUTURE"
+
+    @staticmethod
+    def extend_query_span_by(span: Any) -> Any:
+        return span
+
+    @staticmethod
+    def move_recurrences_by(recurrences: Any, delta: datetime.timedelta) -> Any:
+        return [r + delta for r in recurrences]
+
+    def is_in_span(self, span_start: Any, span_stop: Any) -> bool:
+        s, e = self.span
+        if s is None:
+            return False
+        su = _as_cmp_utc(s)
+        eu = _as_cmp_utc(e)
+        ws = _as_cmp_utc(span_start)
+        we = _as_cmp_utc(span_stop)
+        return (su < we and eu > ws) if eu > su else (ws <= su < we)
+
+    def as_component(self, *, keep_recurrence_attributes: bool = False) -> Component:
+        if keep_recurrence_attributes or not any(
+            k in self.component for k in self.ATTRIBUTES_TO_DELETE_ON_COPY
+        ):
+            return self.component
+        dup = self.component.copy()
+        for attr in self.ATTRIBUTES_TO_DELETE_ON_COPY:
+            dup.pop(attr, None)
+        return dup
 
 
 class EventAdapter(ComponentAdapter):
@@ -200,9 +359,49 @@ class Occurrence:
         )
         self.recurrence_id = recurrence_id
 
+    @property
+    def component_name(self) -> str:
+        return self.component.name
+
+    @property
+    def uid(self) -> str:
+        return str(self.component.decoded("UID", "") or "")
+
+    @property
+    def id(self) -> OccurrenceID:
+        return OccurrenceID(
+            self.component_name,
+            self.uid,
+            self.recurrence_id if self.recurrence_id is not None else self.start,
+            self.start,
+        )
+
+    @property
+    def has_alarm(self) -> bool:
+        return bool(self.component.walk("VALARM"))
+
+    @property
+    def recurrence_ids(self) -> tuple[Any, ...]:
+        return (self.recurrence_id,) if self.recurrence_id is not None else (self.start,)
+
+    def is_in_span(self, span_start: Any, span_stop: Any) -> bool:
+        if self.start is None:
+            return False
+        su = _as_cmp_utc(self.start)
+        eu = _as_cmp_utc(self.end)
+        ws = _as_cmp_utc(span_start)
+        we = _as_cmp_utc(span_stop)
+        return (su < we and eu > ws) if eu > su else (ws <= su < we)
+
     def as_component(self, *, keep_recurrence_attributes: bool = False) -> Component:
-        _ = keep_recurrence_attributes
-        return self.component
+        if keep_recurrence_attributes or not any(
+            k in self.component for k in ComponentAdapter.ATTRIBUTES_TO_DELETE_ON_COPY
+        ):
+            return self.component
+        dup = self.component.copy()
+        for attr in ComponentAdapter.ATTRIBUTES_TO_DELETE_ON_COPY:
+            dup.pop(attr, None)
+        return dup
 
 
 class Series:
@@ -488,13 +687,15 @@ class Pages:
                 break
         self._next_occ = next_peek
         token = _encode_cursor(next_peek) if next_peek is not None else ""
-        comps = [
-            _localize_floating_occ(
-                _wrap_rust_component(o, keep_recurrence=self._keep_recurrence),
-                self._default_tz_obj,
-            )
-            for o in batch
-        ]
+        keep = self._keep_recurrence
+        tz_obj = self._default_tz_obj
+        if tz_obj is None:
+            comps = [_wrap_rust_occurrence_fast(o, keep) for o in batch]
+        else:
+            comps = [
+                _localize_floating_occ(_wrap_rust_occurrence_fast(o, keep), tz_obj)
+                for o in batch
+            ]
         return Page(comps, next_page_id=token)
 
 
@@ -519,6 +720,8 @@ def _split_component_selectors(
 
 class UnfoldableCalendar:
     """Drop-in replacement for ``recurring_ical_events.CalendarQuery``."""
+
+    ComponentsWithName = ComponentsWithName
 
     def __init__(
         self,
@@ -548,7 +751,7 @@ class UnfoldableCalendar:
             raise BadRuleStringFormat(str(exc)) from exc
 
     def _wrap_occ(self, occ: _ox.Occurrence) -> Component:
-        comp = _wrap_rust_component(occ, keep_recurrence=self._keep_recurrence)
+        comp = _wrap_rust_occurrence_fast(occ, self._keep_recurrence)
         if self._default_zi is not None:
             return _localize_floating_occ(comp, self._default_zi)
         return comp
@@ -634,14 +837,26 @@ class UnfoldableCalendar:
         else:
             e_val = _to_point(stop)
         occs = self._query_for(s_val).between(s_val, e_val)
-        res = [self._wrap_occ(o) for o in occs]
-        res.extend(self._custom_components_in(s_val, e_val))
+        keep = self._keep_recurrence
+        tz_obj = self._default_zi
+        if tz_obj is None:
+            res = [_wrap_rust_occurrence_fast(o, keep) for o in occs]
+        else:
+            res = [
+                _localize_floating_occ(_wrap_rust_occurrence_fast(o, keep), tz_obj)
+                for o in occs
+            ]
+        if self._custom_adapters:
+            res.extend(self._custom_components_in(s_val, e_val))
         return res
 
     def after(self, earliest_end: DateArgument) -> Iterator[Component]:
         pt = _to_point(earliest_end)
+        keep = self._keep_recurrence
+        tz_obj = self._default_zi
         for occ in self._query_for(pt).after(pt):
-            yield self._wrap_occ(occ)
+            comp = _wrap_rust_occurrence_fast(occ, keep)
+            yield _localize_floating_occ(comp, tz_obj) if tz_obj is not None else comp
         for comp in self._custom_components_in(pt, DATE_MAX):
             yield comp
 
@@ -684,8 +899,18 @@ class UnfoldableCalendar:
         return self._wrap_occ(occ)
 
     def all(self) -> list[Component]:
-        res = [self._wrap_occ(o) for o in self._query.all()]
-        res.extend(self._custom_components_in(DATE_MIN, DATE_MAX))
+        keep = self._keep_recurrence
+        tz_obj = self._default_zi
+        occs = self._query.all()
+        if tz_obj is None:
+            res = [_wrap_rust_occurrence_fast(o, keep) for o in occs]
+        else:
+            res = [
+                _localize_floating_occ(_wrap_rust_occurrence_fast(o, keep), tz_obj)
+                for o in occs
+            ]
+        if self._custom_adapters:
+            res.extend(self._custom_components_in(DATE_MIN, DATE_MAX))
         return res
 
     def count(

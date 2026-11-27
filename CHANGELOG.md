@@ -5,6 +5,24 @@ All notable changes to `icaloxide` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-11-27
+
+### Performance & Parity
+
+- **PyO3 & Compat Hot-Path Acceleration (`icaloxide-py`, `icaloxide.compat`)**:
+  - Cached `ZoneInfo` and fixed-offset `datetime.timezone` instances inside `PyDateTimeTypes` so repeated timezone conversions reuse cached Python tzinfo objects.
+  - Added `Component.raw_properties_compact()` (returning `None` for param-less properties) and `fold_ical_lines()` backed by Rust's RFC 5545 75-octet folder.
+  - Eliminated eager `list`/`_TrackedSubcomponents`/`Parameters` allocations on lazy `Component`/`Occurrence` construction via `_wrap_rust_occurrence_fast` and lazy `None` parameters; cut `compat.between()` (9,133 occurrences) from 16.68 ms to **10.51 ms** (**48.4x** vs upstream) and `Parse + Mutate 1,000 events + to_ical` from 39.97 ms to **21.81 ms** (**13.5x** vs upstream).
+- **RFC 5545 Span Semantics & Full `icalendar 7.x` Constructors (`icaloxide.compat.icalendar`)**:
+  - Fixed `Event.end` and `Event.duration` when `DTEND`/`DURATION` are omitted (`start + 1 day` / `timedelta(days=1)` for all-day `VALUE=DATE`; `start` / `timedelta(0)` for timed events), and enforced mutual exclusion between `DTEND`/`DUE` and `DURATION` on `.end` / `.duration` / `.set_end()` / `.set_duration()`.
+  - Expanded `.new(...)` constructors across `Component`, `Calendar`, `Event`, `Todo`, `Journal`, `Alarm`, `FreeBusy`, `Availability`, and `Available` to accept `icalendar 7.x` keyword arguments (`organization`/`language` PRODID synthesis, `uuid.UUID`, `categories`, `status`, `stamp`, `subcomponents`, `components`, etc.).
+  - Added `vCalAddress.new(...)` plus `email`, `name`, `CN`, `CUTYPE`, `DELEGATED_FROM`, `DELEGATED_TO`, `DIR`, `PARTSTAT`, `ROLE`, `RSVP`, `SENT_BY`; `vUri` param properties & `uri`; `vWeekday` (`relative`, `weekday`, `week_days`); `vDatetime.is_utc()` / `vTime.is_utc()`; `vMonth.leap`; `vPeriod` params & `ical_value`; `vDDDTypes.dts` / `to_property_type()`; `vBoolean.BOOL_MAP` and `.ical_value` across scalar/compound value wrappers.
+- **`recurring_ical_events` Adapter & Occurrence Parity (`icaloxide.compat.recurring_ical_events`)**:
+  - Added tuple/equality/hash support (`count`, `index`, `__iter__`, `__eq__`, `__hash__`) to `OccurrenceID`.
+  - Added `component_name`, `uid`, `id`, `has_alarm`, `recurrence_ids`, `is_in_span`, and recurrence-stripping `as_component()` to `Occurrence`.
+  - Expanded `ComponentAdapter(component)` instance API (`ATTRIBUTES_TO_DELETE_ON_COPY`, `start`, `end`, `raw_start`, `raw_end`, `duration`, `uid`, `sequence`, `rrules`, `rdates`, `exdates`, `span`, `alarms`, `has_recurrence_rules()`, `is_modification()`, `this_and_future()`, `is_in_span()`, `as_component()`, `collect_series_from()`) and exposed `CalendarQuery.ComponentsWithName`.
+- **Verification**: Added `tests/test_red_team_v07.py` and refreshed `benchmarks/RESULTS.md` with release measurements.
+
 ## [0.6.0] - 2026-11-27
 
 ### Fixed & Added

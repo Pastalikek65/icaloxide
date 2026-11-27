@@ -68,15 +68,15 @@ def _format_temporal(val: Any, params: dict[str, Any]) -> str:
                 tzname in ("UTC", "Z", "Etc/UTC", None) or "TZID" not in params
             ):
                 params.pop("TZID", None)
-                return val.strftime("%Y%m%dT%H%M%SZ")
+                return f"{val.year:04d}{val.month:02d}{val.day:02d}T{val.hour:02d}{val.minute:02d}{val.second:02d}Z"
             if "TZID" not in params:
                 key = getattr(val.tzinfo, "key", None) or tzname
                 if key:
                     params["TZID"] = key
-        return val.strftime("%Y%m%dT%H%M%S")
+        return f"{val.year:04d}{val.month:02d}{val.day:02d}T{val.hour:02d}{val.minute:02d}{val.second:02d}"
     if isinstance(val, datetime.date):
         params.setdefault("VALUE", "DATE")
-        return val.strftime("%Y%m%d")
+        return f"{val.year:04d}{val.month:02d}{val.day:02d}"
     if isinstance(val, datetime.timedelta):
         total = int(val.total_seconds())
         sign = "-" if total < 0 else ""
@@ -97,7 +97,7 @@ def _format_temporal(val: Any, params: dict[str, Any]) -> str:
                 parts.append(f"{secs}S")
         return "".join(parts)
     if isinstance(val, datetime.time):
-        return val.strftime("%H%M%S")
+        return f"{val.hour:02d}{val.minute:02d}{val.second:02d}"
     return str(val)
 
 
@@ -387,6 +387,24 @@ class vDDDTypes:
         val = self.params.get("RANGE")
         return str(val) if val is not None else None
 
+    @property
+    def dts(self) -> list[vDDDTypes]:
+        return [self]
+
+    def to_property_type(self) -> Any:
+        val = self._dt
+        if isinstance(val, datetime.datetime):
+            return vDatetime(val, params=self.params)
+        if isinstance(val, datetime.date):
+            return vDate(val, params=self.params)
+        if isinstance(val, datetime.time):
+            return vTime(val, params=self.params)
+        if isinstance(val, datetime.timedelta):
+            return vDuration(val, params=self.params)
+        if isinstance(val, tuple) and len(val) == 2:
+            return vPeriod(val, params=self.params)
+        return self
+
     def __deepcopy__(self, memo: dict[int, Any]) -> vDDDTypes:
         return self.__class__(
             copy.deepcopy(self._dt, memo),
@@ -501,6 +519,26 @@ class vRecur(dict):  # type: ignore[type-arg]
 
     params: Parameters
     frequencies = ("YEARLY", "MONTHLY", "WEEKLY", "DAILY", "HOURLY", "MINUTELY", "SECONDLY")
+    canonical_order = (
+        "FREQ",
+        "UNTIL",
+        "COUNT",
+        "INTERVAL",
+        "BYSECOND",
+        "BYMINUTE",
+        "BYHOUR",
+        "BYDAY",
+        "BYMONTHDAY",
+        "BYYEARDAY",
+        "BYWEEKNO",
+        "BYMONTH",
+        "BYSETPOS",
+        "WKST",
+    )
+
+    @property
+    def ical_value(self) -> dict[str, Any]:
+        return dict(self)
 
     def __init__(
         self,
@@ -668,11 +706,33 @@ def _parse_until_str(raw: str) -> Any:
     return raw
 
 
+def _str_param_prop(param_name: str, *, upper_val: bool = False) -> property:
+    def fget(self: Any) -> Optional[str]:
+        v = self.params.get(param_name)
+        return str(v) if v is not None else None
+
+    def fset(self: Any, value: Optional[str]) -> None:
+        if value is None:
+            self.params.pop(param_name, None)
+        else:
+            s = str(value)
+            self.params[param_name] = s.upper() if upper_val else s
+
+    def fdel(self: Any) -> None:
+        self.params.pop(param_name, None)
+
+    return property(fget, fset, fdel)
+
+
 class vGeo:
     def __init__(self, geo: tuple[float, float], params: Optional[dict[str, Any]] = None) -> None:
         self.latitude = float(geo[0])
         self.longitude = float(geo[1])
         self.params = _ensure_parameters(params)
+
+    @property
+    def ical_value(self) -> tuple[float, float]:
+        return (self.latitude, self.longitude)
 
     def to_ical(self) -> bytes:
         return f"{self.latitude};{self.longitude}".encode("utf-8")
@@ -694,19 +754,108 @@ class vGeo:
 
 
 class vCalAddress(vText):
+    @classmethod
+    def new(
+        cls,
+        email: str,
+        *,
+        cn: Optional[str] = None,
+        cutype: Optional[str] = None,
+        delegated_from: Optional[str] = None,
+        delegated_to: Optional[str] = None,
+        dir: Optional[str] = None,
+        partstat: Optional[str] = None,
+        role: Optional[str] = None,
+        rsvp: Optional[bool] = None,
+        sent_by: Optional[str] = None,
+    ) -> vCalAddress:
+        addr = str(email)
+        if ":" not in addr and "@" in addr:
+            addr = f"mailto:{addr}"
+        params: dict[str, Any] = {}
+        if cn is not None:
+            params["CN"] = cn
+        if cutype is not None:
+            params["CUTYPE"] = str(cutype)
+        if delegated_from is not None:
+            params["DELEGATED-FROM"] = delegated_from
+        if delegated_to is not None:
+            params["DELEGATED-TO"] = delegated_to
+        if dir is not None:
+            params["DIR"] = dir
+        if partstat is not None:
+            params["PARTSTAT"] = str(partstat)
+        if role is not None:
+            params["ROLE"] = str(role)
+        if rsvp is not None:
+            params["RSVP"] = "TRUE" if rsvp else "FALSE"
+        if sent_by is not None:
+            params["SENT-BY"] = sent_by
+        return cls(addr, params=params)
+
+    @property
+    def email(self) -> str:
+        s = str(self)
+        return s[7:] if s.lower().startswith("mailto:") else s
+
+    CN = _str_param_prop("CN")
+    CUTYPE = _str_param_prop("CUTYPE")
+    DELEGATED_FROM = _str_param_prop("DELEGATED-FROM")
+    DELEGATED_TO = _str_param_prop("DELEGATED-TO")
+    DIR = _str_param_prop("DIR")
+    PARTSTAT = _str_param_prop("PARTSTAT")
+    ROLE = _str_param_prop("ROLE")
+    SENT_BY = _str_param_prop("SENT-BY")
+    name = CN
+
+    @property
+    def RSVP(self) -> Optional[bool]:
+        v = self.params.get("RSVP")
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            return v
+        return str(v).strip().upper() == "TRUE"
+
+    @RSVP.setter
+    def RSVP(self, value: Optional[bool]) -> None:
+        if value is None:
+            self.params.pop("RSVP", None)
+        else:
+            self.params["RSVP"] = "TRUE" if value else "FALSE"
+
+    @RSVP.deleter
+    def RSVP(self) -> None:
+        self.params.pop("RSVP", None)
+
     def to_jcal(self, name: str = "attendee") -> list[Any]:
         return [name.lower(), self.params.to_jcal(), "cal-address", str(self)]
 
 
 class vUri(vText):
+    @property
+    def uri(self) -> str:
+        return str(self)
+
+    FMTTYPE = _str_param_prop("FMTTYPE")
+    GAP = _str_param_prop("GAP")
+    LABEL = _str_param_prop("LABEL")
+    LINKREL = _str_param_prop("LINKREL")
+
     def to_jcal(self, name: str = "url") -> list[Any]:
         return [name.lower(), self.params.to_jcal(), "uri", str(self)]
 
 
 class vBoolean:
+    BOOL_MAP = {"TRUE": True, "FALSE": False}
+
     def __init__(self, val: bool, params: Optional[dict[str, Any]] = None) -> None:
         self.val = bool(val)
         self.params = Parameters(params) if params else Parameters()
+
+    @property
+    def ical_value(self) -> bool:
+        return self.val
 
     def to_ical(self) -> bytes:
         return b"TRUE" if self.val else b"FALSE"
@@ -740,6 +889,10 @@ class vInt(int):
         obj.params = _ensure_parameters(params)
         return obj
 
+    @property
+    def ical_value(self) -> int:
+        return int(self)
+
     def to_ical(self) -> bytes:
         return str(int(self)).encode("utf-8")
 
@@ -764,6 +917,10 @@ class vFloat(float):
         obj = super().__new__(cls, float(val))
         obj.params = _ensure_parameters(params)
         return obj
+
+    @property
+    def ical_value(self) -> float:
+        return float(self)
 
     def to_ical(self) -> bytes:
         return str(float(self)).encode("utf-8")
@@ -815,6 +972,16 @@ class vPeriod:
     @property
     def dt(self) -> tuple[Any, Any]:
         return (self.start, self.end_or_dur)
+
+    @property
+    def ical_value(self) -> tuple[Any, Any]:
+        return (self.start, self.end_or_dur)
+
+    FBTYPE = _str_param_prop("FBTYPE")
+    RANGE = _str_param_prop("RANGE")
+    RELATED = _str_param_prop("RELATED")
+    TZID = _str_param_prop("TZID")
+    VALUE = _str_param_prop("VALUE")
 
     def overlaps(self, other: vPeriod) -> bool:
         s1 = self.start
@@ -911,6 +1078,10 @@ class vCategory:
     def __repr__(self) -> str:
         return f"vCategory({[str(c) for c in self.cats]!r})"
 
+    @property
+    def ical_value(self) -> list[str]:
+        return [str(c) for c in self.cats]
+
     def to_ical(self) -> bytes:
         return ",".join(_escape_text(str(c)) for c in self.cats).encode("utf-8")
 
@@ -981,11 +1152,22 @@ class vDate(vDDDTypes):
 
 
 class vDatetime(vDDDTypes):
+    def is_utc(self) -> bool:
+        return is_utc(self.dt)
+
     def to_jcal(self, name: str = "dtstart") -> list[Any]:
         return _prop_to_jcal(name.upper(), self.dt, dict(self.params))
 
 
 class vTime(vDDDTypes):
+    def is_utc(self) -> bool:
+        t = self.dt
+        return (
+            isinstance(t, datetime.time)
+            and t.tzinfo is not None
+            and t.utcoffset() == datetime.timedelta(0)
+        )
+
     @classmethod
     def from_ical(
         cls,
@@ -1062,16 +1244,48 @@ class vDDDLists:
         return f"vDDDLists({[d.dt for d in self.dts]!r})"
 
 
+_WEEKDAY_RE = re.compile(r"^([+-]?\d+)?([A-Z]{2})$")
+
+
 class vWeekday(vText):
-    pass
+    week_days = {"SU": 0, "MO": 1, "TU": 2, "WE": 3, "TH": 4, "FR": 5, "SA": 6}
+
+    @property
+    def relative(self) -> Optional[int]:
+        m = _WEEKDAY_RE.match(str(self).strip().upper())
+        if m and m.group(1):
+            return int(m.group(1))
+        return None
+
+    @property
+    def weekday(self) -> str:
+        m = _WEEKDAY_RE.match(str(self).strip().upper())
+        if m:
+            return m.group(2)
+        return str(self).strip().upper()
 
 
 class vFrequency(vText):
-    pass
+    frequencies = ("SECONDLY", "MINUTELY", "HOURLY", "DAILY", "WEEKLY", "MONTHLY", "YEARLY")
 
 
 class vMonth(vInt):
-    pass
+    _leap: bool = False
+
+    def __new__(cls, val: Any, params: Optional[dict[str, Any]] = None) -> vMonth:
+        s = str(val).strip()
+        is_leap = s.upper().endswith("L")
+        num_val = int(s[:-1]) if is_leap else int(val)
+        obj = super().__new__(cls, num_val, params=params)
+        obj._leap = is_leap
+        return obj  # type: ignore[return-value]
+
+    @property
+    def leap(self) -> bool:
+        return self._leap
+
+    def to_ical(self) -> bytes:
+        return f"{int(self)}{'L' if self._leap else ''}".encode("utf-8")
 
 
 class vSkip(vText):
@@ -1265,6 +1479,9 @@ _TEMPORAL_KEYS = frozenset(
 )
 _CAL_ADDRESS_KEYS = frozenset({"ATTENDEE", "ORGANIZER"})
 _URI_KEYS = frozenset({"URL", "ATTACH", "TZURL", "SOURCE", "IMAGE", "CONFERENCE", "LINK"})
+_RAW_STR_KEYS = frozenset(
+    {"RRULE", "ATTACH", "URL", "UID", "ATTENDEE", "ORGANIZER", "LINK", "CONCEPT"}
+)
 _MISSING = object()
 
 
@@ -1478,10 +1695,15 @@ class Component:
         self._keep_recurrence = _keep_recurrence
         self._parent = _parent
         self._children_cache: Optional[_TrackedSubcomponents] = None
-        self._props: list[tuple[str, Any, Parameters]] = []
-        self._subcomponents: _TrackedSubcomponents = _TrackedSubcomponents(self)
         self._errors: Optional[list[Any]] = None
-        self._materialized = _rust_comp is None and _rust_cal is None
+        materialized = _rust_comp is None and _rust_cal is None
+        self._materialized = materialized
+        if materialized:
+            self._props: Optional[list[tuple[str, Any, Optional[Parameters]]]] = []
+            self._subcomponents: Optional[_TrackedSubcomponents] = _TrackedSubcomponents(self)
+        else:
+            self._props = None
+            self._subcomponents = None
         if _rust_comp is not None:
             self.name = _rust_comp.name
         elif _rust_cal is not None:
@@ -1520,6 +1742,7 @@ class Component:
         def _sync() -> None:
             if not self._materialized:
                 self._ensure_materialized()
+            if self._props is not None:
                 seen = 0
                 for idx, (k, v, _p) in enumerate(self._props):
                     if k == key_upper:
@@ -1537,6 +1760,7 @@ class Component:
         def _sync() -> None:
             if not self._materialized:
                 self._ensure_materialized()
+            assert self._props is not None
             seen = 0
             for idx, (k, _v, p) in enumerate(self._props):
                 if k == key_upper:
@@ -1555,6 +1779,7 @@ class Component:
 
     def _get_children(self) -> _TrackedSubcomponents:
         if self._materialized:
+            assert self._subcomponents is not None
             return self._subcomponents
         if self._children_cache is None:
             if self._rust_cal is not None:
@@ -1576,20 +1801,25 @@ class Component:
         children = self._get_children()
         self._materialized = True
         self._children_cache = None
+        props: list[tuple[str, Any, Optional[Parameters]]] = []
+        self._props = props
+        self._subcomponents = children
         if self._rust_cal is not None:
-            for pname, val, raw_params in self._rust_cal.root.raw_properties():
+            for pname, val, raw_params in self._rust_cal.root.raw_properties_compact():
                 up = pname.upper()
-                p_obj = self._make_prop_params(raw_params)
-                if _is_binary_prop(p_obj):
-                    val = vBinary(_decode_binary_val(val), params=p_obj)
-                self._props.append((up, val, p_obj))
-            self._subcomponents = children
+                if raw_params is None:
+                    props.append((up, val, None))
+                else:
+                    p_obj = self._make_prop_params(raw_params)
+                    if _is_binary_prop(p_obj):
+                        val = vBinary(_decode_binary_val(val), params=p_obj)
+                    props.append((up, val, p_obj))
             return
 
         if isinstance(self._rust_comp, _ox.Occurrence):
             comp = self._rust_comp.component
             end_key = "DUE" if self._rust_comp.name == "VTODO" else "DTEND"
-            for pname, val, raw_params in comp.raw_properties():
+            for pname, val, raw_params in comp.raw_properties_compact():
                 up = pname.upper()
                 if up in ("DTSTART", "DTEND", "DUE", "DURATION"):
                     continue
@@ -1600,23 +1830,39 @@ class Component:
                     "RECURRENCE-ID",
                 ):
                     continue
-                p_obj = self._make_prop_params(raw_params)
-                if _is_binary_prop(p_obj):
-                    val = vBinary(_decode_binary_val(val), params=p_obj)
-                self._props.append((up, val, p_obj))
+                if raw_params is None:
+                    props.append((up, val, None))
+                else:
+                    p_obj = self._make_prop_params(raw_params)
+                    if _is_binary_prop(p_obj):
+                        val = vBinary(_decode_binary_val(val), params=p_obj)
+                    props.append((up, val, p_obj))
             dtstart_p = _temporal_params_for_value(self._rust_comp.start, comp.params("DTSTART"))
             end_p = _temporal_params_for_value(self._rust_comp.end, comp.params(end_key))
-            self._props.append(("DTSTART", self._rust_comp.start, self._make_prop_params(dtstart_p)))
-            self._props.append((end_key, self._rust_comp.end, self._make_prop_params(end_p)))
-            self._subcomponents = children
+            props.append(
+                (
+                    "DTSTART",
+                    self._rust_comp.start,
+                    self._make_prop_params(dtstart_p) if dtstart_p else None,
+                )
+            )
+            props.append(
+                (
+                    end_key,
+                    self._rust_comp.end,
+                    self._make_prop_params(end_p) if end_p else None,
+                )
+            )
         elif self._rust_comp is not None:
-            for pname, val, raw_params in self._rust_comp.raw_properties():
+            for pname, val, raw_params in self._rust_comp.raw_properties_compact():
                 up = pname.upper()
-                p_obj = self._make_prop_params(raw_params)
-                if _is_binary_prop(p_obj):
-                    val = vBinary(_decode_binary_val(val), params=p_obj)
-                self._props.append((up, val, p_obj))
-            self._subcomponents = children
+                if raw_params is None:
+                    props.append((up, val, None))
+                else:
+                    p_obj = self._make_prop_params(raw_params)
+                    if _is_binary_prop(p_obj):
+                        val = vBinary(_decode_binary_val(val), params=p_obj)
+                    props.append((up, val, p_obj))
 
     def _wrap_prop(
         self,
@@ -1626,7 +1872,10 @@ class Component:
         *,
         match_idx: int = 0,
     ) -> Any:
-        if isinstance(params, Parameters):
+        if params is None:
+            p_obj = Parameters()
+            p_obj._on_mutate = self._make_param_sync(key_upper, match_idx, p_obj)
+        elif isinstance(params, Parameters):
             p_obj = params
             if p_obj._on_mutate is None:
                 p_obj._on_mutate = (
@@ -1827,12 +2076,13 @@ class Component:
 
     def __setitem__(self, name: str, value: Any) -> None:
         self._mark_dirty()
+        assert self._props is not None
         key_upper = name.upper()
         self._props = [(k, v, p) for k, v, p in self._props if k != key_upper]
         if hasattr(value, "params") and isinstance(value.params, Parameters):
-            params = self._make_prop_params(value.params)
+            params: Optional[Parameters] = self._make_prop_params(value.params)
         else:
-            params = Parameters(_on_mutate=self._mark_dirty)
+            params = None
         self._props.append((key_upper, value, params))
 
     def __delitem__(self, name: str) -> None:
@@ -1929,13 +2179,19 @@ class Component:
 
     def copy(self) -> Component:
         self._ensure_materialized()
+        assert self._props is not None and self._subcomponents is not None
         dup = self.__class__()
         dup.name = self.name
         dup._props = copy.deepcopy(self._props)
+        assert dup._props is not None
         for _k, v, p in dup._props:
-            p._on_mutate = dup._mark_dirty
+            if p is not None:
+                p._on_mutate = dup._mark_dirty
             if hasattr(v, "params") and isinstance(v.params, Parameters):
-                v.params = p
+                if p is not None:
+                    v.params = p
+                else:
+                    v.params._on_mutate = dup._mark_dirty
             if hasattr(v, "_on_mutate"):
                 v._on_mutate = dup._mark_dirty
         dup._subcomponents = _TrackedSubcomponents(dup, [sub.copy() for sub in self._subcomponents])
@@ -1958,14 +2214,15 @@ class Component:
     ) -> None:
         _ = encode
         self._mark_dirty()
+        assert self._props is not None
         if isinstance(parameters, Parameters):
-            params = self._make_prop_params(parameters)
-        elif parameters is not None:
+            params: Optional[Parameters] = self._make_prop_params(parameters)
+        elif parameters:
             params = Parameters(_flatten_params(parameters), _on_mutate=self._mark_dirty)
         elif hasattr(value, "params") and isinstance(value.params, Parameters):
             params = self._make_prop_params(value.params)
         else:
-            params = Parameters(_on_mutate=self._mark_dirty)
+            params = None
         self._props.append((name.upper(), value, params))
 
     def add_component(self, component: Component) -> None:
@@ -2044,8 +2301,32 @@ class Component:
         return _COMPONENT_CLASS_MAP.get(str(name).upper(), Component)
 
     @classmethod
-    def new(cls, **kwargs: Any) -> Component:
+    def new(
+        cls,
+        created: Any = None,
+        comments: Any = None,
+        concepts: Any = None,
+        last_modified: Any = None,
+        links: Any = None,
+        refids: Any = None,
+        related_to: Any = None,
+        stamp: Any = None,
+        subcomponents: Optional[Iterable[Component]] = None,
+        **kwargs: Any,
+    ) -> Component:
         comp = cls()
+        _apply_common_new_kwargs(
+            comp,
+            created=created,
+            comments=comments,
+            concepts=concepts,
+            last_modified=last_modified,
+            links=links,
+            refids=refids,
+            related_to=related_to,
+            stamp=stamp,
+            subcomponents=subcomponents,
+        )
         for k, v in kwargs.items():
             if v is not None:
                 comp.add(k.upper().replace("_", "-"), v)
@@ -2114,6 +2395,46 @@ class Component:
             out.extend(sub.walk(target))
         return out
 
+    def _collect_ical_chunks(
+        self, chunks: list[bytes], lines: list[str], *, sorted: bool = True
+    ) -> None:
+        if not self._materialized:
+            if lines:
+                chunks.append(_ox.fold_ical_lines(lines))
+                lines.clear()
+            chunks.append(self.to_ical(sorted=sorted))
+            return
+
+        lines.append(f"BEGIN:{self.name}")
+        raw_list = self._props or []
+        props = _order_props(raw_list, self.canonical_order) if sorted else raw_list
+        for key, val, raw_params in props:
+            if raw_params is None and isinstance(val, str) and not isinstance(val, (vCalAddress, vUri)):
+                if key in _RAW_STR_KEYS:
+                    lines.append(f"{key}:{val}")
+                elif key == "REQUEST-STATUS":
+                    esc_parts = ";".join(_escape_text(p) for p in val.split(";"))
+                    lines.append(f"{key}:{esc_parts}")
+                else:
+                    lines.append(f"{key}:{_escape_text(val)}")
+                continue
+            params = dict(raw_params) if raw_params is not None else {}
+            val_str = self._serialize_value(key, val, params)
+            if not params:
+                lines.append(f"{key}:{val_str}")
+            else:
+                param_str = ""
+                for pk, pv in params.items():
+                    if isinstance(pv, (list, tuple)):
+                        joined = ",".join(_format_param_val(str(x)) for x in pv)
+                    else:
+                        joined = _format_param_val(str(pv))
+                    param_str += f";{pk.upper()}={joined}"
+                lines.append(f"{key}{param_str}:{val_str}")
+        for sub in self._subcomponents or ():
+            sub._collect_ical_chunks(chunks, lines, sorted=sorted)
+        lines.append(f"END:{self.name}")
+
     def to_ical(self, sorted: bool = True) -> bytes:
         if not self._materialized:
             if self._rust_cal is not None:
@@ -2125,32 +2446,22 @@ class Component:
             if self._rust_comp is not None:
                 return self._rust_comp.to_ical(sorted=sorted)
 
-        buf = bytearray()
-        buf.extend(_fold_line(f"BEGIN:{self.name}"))
-        props = _order_props(self._props, self.canonical_order) if sorted else self._props
-        for key, val, raw_params in props:
-            params = dict(raw_params)
-            val_str = self._serialize_value(key, val, params)
-            param_str = ""
-            for pk, pv in params.items():
-                if isinstance(pv, (list, tuple)):
-                    joined = ",".join(_format_param_val(str(x)) for x in pv)
-                else:
-                    joined = _format_param_val(str(pv))
-                param_str += f";{pk.upper()}={joined}"
-            buf.extend(_fold_line(f"{key}{param_str}:{val_str}"))
-        for sub in self._subcomponents:
-            buf.extend(sub.to_ical(sorted=sorted))
-        buf.extend(_fold_line(f"END:{self.name}"))
-        return bytes(buf)
+        chunks: list[bytes] = []
+        lines: list[str] = []
+        self._collect_ical_chunks(chunks, lines, sorted=sorted)
+        if lines:
+            chunks.append(_ox.fold_ical_lines(lines))
+        if not chunks:
+            return b""
+        return chunks[0] if len(chunks) == 1 else b"".join(chunks)
 
     def to_jcal(self) -> list[Any]:
         """Serialize this component into RFC 7265 jCal nested list structure."""
         self._ensure_materialized()
         jprops: list[list[Any]] = []
-        for key, val, raw_params in self._props:
-            jprops.append(_prop_to_jcal(key, val, raw_params))
-        jsubs = [sub.to_jcal() for sub in self._subcomponents]
+        for key, val, raw_params in self._props or ():
+            jprops.append(_prop_to_jcal(key, val, raw_params if raw_params is not None else {}))
+        jsubs = [sub.to_jcal() for sub in self._subcomponents or ()]
         return [self.name.lower(), jprops, jsubs]
 
     def to_json(self) -> str:
@@ -2418,6 +2729,91 @@ def _parse_iso_time(raw: str, params: dict[str, Any]) -> datetime.time:
     return t
 
 
+def _add_seq_or_single(comp: Component, prop_name: str, value: Any) -> None:
+    if value is None:
+        return
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            comp.add(prop_name, item)
+    else:
+        comp.add(prop_name, value)
+
+
+def _apply_common_new_kwargs(
+    comp: Component,
+    *,
+    attendees: Optional[Sequence[Any]] = None,
+    categories: Sequence[str] = (),
+    classification: Any = None,
+    color: Optional[str] = None,
+    comments: Any = None,
+    concepts: Any = None,
+    conferences: Optional[Sequence[Any]] = None,
+    contacts: Any = None,
+    created: Any = None,
+    description: Any = None,
+    last_modified: Any = None,
+    links: Any = None,
+    location: Optional[str] = None,
+    organizer: Any = None,
+    priority: Optional[int] = None,
+    recurrence_id: Any = None,
+    refids: Any = None,
+    related_to: Any = None,
+    request_status: Any = None,
+    sequence: Optional[int] = None,
+    stamp: Any = None,
+    status: Any = None,
+    subcomponents: Optional[Iterable[Component]] = None,
+    transparency: Any = None,
+    uid: Any = None,
+    url: Optional[str] = None,
+) -> None:
+    if uid is not None:
+        comp.add("UID", str(uid))
+    if created is not None:
+        comp.add("CREATED", created)
+    if last_modified is not None:
+        comp.add("LAST-MODIFIED", last_modified)
+    if stamp is not None:
+        comp.add("DTSTAMP", stamp)
+    _add_seq_or_single(comp, "DESCRIPTION", description)
+    if location is not None:
+        comp.add("LOCATION", location)
+    if status is not None:
+        comp.add("STATUS", str(status))
+    if classification is not None:
+        comp.add("CLASS", str(classification))
+    if transparency is not None:
+        comp.add("TRANSP", str(transparency))
+    if priority is not None:
+        comp.add("PRIORITY", priority)
+    if sequence is not None:
+        comp.add("SEQUENCE", sequence)
+    if recurrence_id is not None:
+        comp.add("RECURRENCE-ID", recurrence_id)
+    if color is not None:
+        comp.add("COLOR", color)
+    if url is not None:
+        comp.add("URL", url)
+    if organizer is not None:
+        comp.add("ORGANIZER", organizer)
+    if categories:
+        comp.add("CATEGORIES", list(categories))
+    _add_seq_or_single(comp, "ATTENDEE", attendees)
+    _add_seq_or_single(comp, "COMMENT", comments)
+    _add_seq_or_single(comp, "CONCEPT", concepts)
+    _add_seq_or_single(comp, "CONFERENCE", conferences)
+    _add_seq_or_single(comp, "CONTACT", contacts)
+    _add_seq_or_single(comp, "LINK", links)
+    _add_seq_or_single(comp, "REFID", refids)
+    _add_seq_or_single(comp, "RELATED-TO", related_to)
+    _add_seq_or_single(comp, "REQUEST-STATUS", request_status)
+    if subcomponents is not None:
+        for sub in subcomponents:
+            comp.add_component(sub)
+
+
 class _SpanMixin(Component):
     """Shared ergonomic properties matching ``icalendar 7.x`` Event/Todo/Journal."""
 
@@ -2445,14 +2841,22 @@ class _SpanMixin(Component):
         if "DTEND" in self:
             return self.decoded("DTEND", None)
         st = self.start
-        dur = self.duration
+        dur = self.decoded("DURATION", None)
         if st is not None and isinstance(dur, datetime.timedelta):
             return st + dur
+        if (
+            st is not None
+            and self.name == "VEVENT"
+            and isinstance(st, datetime.date)
+            and not isinstance(st, datetime.datetime)
+        ):
+            return st + datetime.timedelta(days=1)
         return st
 
     @end.setter
     def end(self, val: Any) -> None:
         key = "DUE" if self.name == "VTODO" else "DTEND"
+        self.pop("DURATION", None)
         self[key] = val
 
     @end.deleter
@@ -2462,8 +2866,9 @@ class _SpanMixin(Component):
 
     def set_end(self, val: Any, parameters: Optional[dict[str, Any]] = None) -> None:
         self._ensure_materialized()
+        assert self._props is not None
         key = "DUE" if self.name == "VTODO" else "DTEND"
-        self._props = [(k, v, p) for k, v, p in self._props if k != key]
+        self._props = [(k, v, p) for k, v, p in self._props if k not in (key, "DURATION")]
         self.add(key, val, parameters=parameters)
 
     @property
@@ -2475,6 +2880,11 @@ class _SpanMixin(Component):
         en = self.decoded(end_key, None)
         if st is not None and en is not None:
             return en - st
+        if st is not None and self.name == "VEVENT":
+            if isinstance(st, datetime.date) and not isinstance(st, datetime.datetime):
+                return datetime.timedelta(days=1)
+            if isinstance(st, datetime.datetime):
+                return datetime.timedelta(0)
         return None
 
     @duration.setter
@@ -2482,6 +2892,8 @@ class _SpanMixin(Component):
         if val is None:
             self.pop("DURATION", None)
         else:
+            end_key = "DUE" if self.name == "VTODO" else "DTEND"
+            self.pop(end_key, None)
             self["DURATION"] = val
 
     @duration.deleter
@@ -2489,6 +2901,8 @@ class _SpanMixin(Component):
         self.pop("DURATION", None)
 
     def set_duration(self, val: datetime.timedelta) -> None:
+        end_key = "DUE" if self.name == "VTODO" else "DTEND"
+        self.pop(end_key, None)
         self["DURATION"] = val
 
     summary = _scalar_prop("SUMMARY")
@@ -2532,17 +2946,67 @@ class Event(_SpanMixin):
     def new(
         cls,
         *,
-        summary: Optional[str] = None,
-        start: Any = None,
+        attendees: Optional[Sequence[Any]] = None,
+        categories: Sequence[str] = (),
+        classification: Any = None,
+        color: Optional[str] = None,
+        comments: Any = None,
+        concepts: Any = None,
+        conferences: Optional[Sequence[Any]] = None,
+        contacts: Any = None,
+        created: Any = None,
+        description: Optional[str] = None,
         end: Any = None,
         duration: Optional[datetime.timedelta] = None,
-        uid: Optional[str] = None,
-        description: Optional[str] = None,
+        last_modified: Any = None,
+        links: Any = None,
         location: Optional[str] = None,
+        organizer: Any = None,
+        priority: Optional[int] = None,
+        recurrence_id: Any = None,
+        refids: Any = None,
+        related_to: Any = None,
+        request_status: Any = None,
+        sequence: Optional[int] = None,
+        stamp: Any = None,
+        start: Any = None,
+        status: Any = None,
+        subcomponents: Optional[Iterable[Component]] = None,
+        transparency: Any = None,
+        summary: Optional[str] = None,
+        uid: Any = None,
+        url: Optional[str] = None,
     ) -> Event:
         ev = cls()
-        if uid is not None:
-            ev.add("UID", uid)
+        _apply_common_new_kwargs(
+            ev,
+            attendees=attendees,
+            categories=categories,
+            classification=classification,
+            color=color,
+            comments=comments,
+            concepts=concepts,
+            conferences=conferences,
+            contacts=contacts,
+            created=created,
+            description=description,
+            last_modified=last_modified,
+            links=links,
+            location=location,
+            organizer=organizer,
+            priority=priority,
+            recurrence_id=recurrence_id,
+            refids=refids,
+            related_to=related_to,
+            request_status=request_status,
+            sequence=sequence,
+            stamp=stamp,
+            status=status,
+            subcomponents=subcomponents,
+            transparency=transparency,
+            uid=uid,
+            url=url,
+        )
         if summary is not None:
             ev.add("SUMMARY", summary)
         if start is not None:
@@ -2551,10 +3015,6 @@ class Event(_SpanMixin):
             ev.add("DTEND", end)
         if duration is not None:
             ev.add("DURATION", duration)
-        if description is not None:
-            ev.add("DESCRIPTION", description)
-        if location is not None:
-            ev.add("LOCATION", location)
         return ev
 
     @classmethod
@@ -2577,23 +3037,76 @@ class Todo(_SpanMixin):
     def new(
         cls,
         *,
-        summary: Optional[str] = None,
-        start: Any = None,
+        attendees: Optional[Sequence[Any]] = None,
+        categories: Sequence[str] = (),
+        classification: Any = None,
+        color: Optional[str] = None,
+        comments: Any = None,
+        concepts: Any = None,
+        contacts: Any = None,
+        conferences: Optional[Sequence[Any]] = None,
+        created: Any = None,
+        description: Optional[str] = None,
         due: Any = None,
-        uid: Optional[str] = None,
-        status: Optional[str] = None,
+        end: Any = None,
+        duration: Optional[datetime.timedelta] = None,
+        last_modified: Any = None,
+        links: Any = None,
+        location: Optional[str] = None,
+        organizer: Any = None,
+        priority: Optional[int] = None,
+        recurrence_id: Any = None,
+        refids: Any = None,
+        related_to: Any = None,
+        request_status: Any = None,
+        sequence: Optional[int] = None,
+        stamp: Any = None,
+        start: Any = None,
+        status: Any = None,
+        subcomponents: Optional[Iterable[Component]] = None,
+        summary: Optional[str] = None,
+        uid: Any = None,
+        url: Optional[str] = None,
     ) -> Todo:
         td = cls()
-        if uid is not None:
-            td.add("UID", uid)
+        _apply_common_new_kwargs(
+            td,
+            attendees=attendees,
+            categories=categories,
+            classification=classification,
+            color=color,
+            comments=comments,
+            concepts=concepts,
+            conferences=conferences,
+            contacts=contacts,
+            created=created,
+            description=description,
+            last_modified=last_modified,
+            links=links,
+            location=location,
+            organizer=organizer,
+            priority=priority,
+            recurrence_id=recurrence_id,
+            refids=refids,
+            related_to=related_to,
+            request_status=request_status,
+            sequence=sequence,
+            stamp=stamp,
+            status=status,
+            subcomponents=subcomponents,
+            uid=uid,
+            url=url,
+        )
         if summary is not None:
             td.add("SUMMARY", summary)
         if start is not None:
             td.add("DTSTART", start)
         if due is not None:
             td.add("DUE", due)
-        if status is not None:
-            td.add("STATUS", status)
+        elif end is not None:
+            td.add("DUE", end)
+        if duration is not None:
+            td.add("DURATION", duration)
         return td
 
     @classmethod
@@ -2617,20 +3130,59 @@ class Journal(_SpanMixin):
     def new(
         cls,
         *,
-        summary: Optional[str] = None,
+        attendees: Optional[Sequence[Any]] = None,
+        categories: Sequence[str] = (),
+        classification: Any = None,
+        color: Optional[str] = None,
+        comments: Any = None,
+        concepts: Any = None,
+        contacts: Any = None,
+        created: Any = None,
+        description: Any = None,
+        last_modified: Any = None,
+        links: Any = None,
+        organizer: Any = None,
+        recurrence_id: Any = None,
+        refids: Any = None,
+        related_to: Any = None,
+        request_status: Any = None,
+        sequence: Optional[int] = None,
+        stamp: Any = None,
         start: Any = None,
-        uid: Optional[str] = None,
-        description: Optional[str] = None,
+        status: Any = None,
+        summary: Optional[str] = None,
+        uid: Any = None,
+        url: Optional[str] = None,
     ) -> Journal:
         jn = cls()
-        if uid is not None:
-            jn.add("UID", uid)
+        _apply_common_new_kwargs(
+            jn,
+            attendees=attendees,
+            categories=categories,
+            classification=classification,
+            color=color,
+            comments=comments,
+            concepts=concepts,
+            contacts=contacts,
+            created=created,
+            description=description,
+            last_modified=last_modified,
+            links=links,
+            organizer=organizer,
+            recurrence_id=recurrence_id,
+            refids=refids,
+            related_to=related_to,
+            request_status=request_status,
+            sequence=sequence,
+            stamp=stamp,
+            status=status,
+            uid=uid,
+            url=url,
+        )
         if summary is not None:
             jn.add("SUMMARY", summary)
         if start is not None:
             jn.add("DTSTART", start)
-        if description is not None:
-            jn.add("DESCRIPTION", description)
         return jn
 
     @classmethod
@@ -2661,13 +3213,27 @@ class Alarm(Component):
         summary: Optional[str] = None,
         repeat: Optional[int] = None,
         duration: Optional[datetime.timedelta] = None,
+        attendees: Optional[Sequence[Any]] = None,
+        concepts: Any = None,
+        links: Any = None,
+        refids: Any = None,
+        related_to: Any = None,
+        uid: Any = None,
     ) -> Alarm:
         al = cls()
         al.add("ACTION", action)
+        _apply_common_new_kwargs(
+            al,
+            attendees=attendees,
+            concepts=concepts,
+            description=description,
+            links=links,
+            refids=refids,
+            related_to=related_to,
+            uid=uid,
+        )
         if trigger is not None:
             al.add("TRIGGER", trigger)
-        if description is not None:
-            al.add("DESCRIPTION", description)
         if summary is not None:
             al.add("SUMMARY", summary)
         if repeat is not None:
@@ -2779,20 +3345,39 @@ class FreeBusy(_SpanMixin):
     def new(
         cls,
         *,
-        start: Any = None,
+        comments: Any = None,
+        concepts: Any = None,
+        contacts: Any = None,
         end: Any = None,
-        uid: Optional[str] = None,
-        organizer: Optional[str] = None,
+        links: Any = None,
+        organizer: Any = None,
+        refids: Any = None,
+        related_to: Any = None,
+        request_status: Any = None,
+        stamp: Any = None,
+        start: Any = None,
+        uid: Any = None,
+        url: Optional[str] = None,
     ) -> FreeBusy:
         fb = cls()
-        if uid is not None:
-            fb.add("UID", uid)
+        _apply_common_new_kwargs(
+            fb,
+            comments=comments,
+            concepts=concepts,
+            contacts=contacts,
+            links=links,
+            organizer=organizer,
+            refids=refids,
+            related_to=related_to,
+            request_status=request_status,
+            stamp=stamp,
+            uid=uid,
+            url=url,
+        )
         if start is not None:
             fb.add("DTSTART", start)
         if end is not None:
             fb.add("DTEND", end)
-        if organizer is not None:
-            fb.add("ORGANIZER", organizer)
         return fb
 
     @classmethod
@@ -2985,15 +3570,54 @@ class Availability(_SpanMixin):
     def new(
         cls,
         *,
-        summary: Optional[str] = None,
-        start: Any = None,
-        end: Any = None,
         busy_type: Optional[str] = None,
-        uid: Optional[str] = None,
+        categories: Sequence[str] = (),
+        classification: Any = None,
+        comments: Any = None,
+        components: Optional[Sequence[Available]] = (),
+        concepts: Any = None,
+        contacts: Any = None,
+        created: Any = None,
+        description: Optional[str] = None,
+        end: Any = None,
+        last_modified: Any = None,
+        links: Any = None,
+        location: Optional[str] = None,
+        organizer: Any = None,
+        priority: Optional[int] = None,
+        refids: Any = None,
+        related_to: Any = None,
+        sequence: Optional[int] = None,
+        stamp: Any = None,
+        start: Any = None,
+        subcomponents: Optional[Iterable[Component]] = None,
+        summary: Optional[str] = None,
+        uid: Any = None,
+        url: Optional[str] = None,
     ) -> Availability:
         av = cls()
-        if uid is not None:
-            av.add("UID", uid)
+        _apply_common_new_kwargs(
+            av,
+            categories=categories,
+            classification=classification,
+            comments=comments,
+            concepts=concepts,
+            contacts=contacts,
+            created=created,
+            description=description,
+            last_modified=last_modified,
+            links=links,
+            location=location,
+            organizer=organizer,
+            priority=priority,
+            refids=refids,
+            related_to=related_to,
+            sequence=sequence,
+            stamp=stamp,
+            subcomponents=subcomponents,
+            uid=uid,
+            url=url,
+        )
         if summary is not None:
             av.add("SUMMARY", summary)
         if start is not None:
@@ -3001,7 +3625,10 @@ class Availability(_SpanMixin):
         if end is not None:
             av.add("DTEND", end)
         if busy_type is not None:
-            av.add("BUSYTYPE", busy_type)
+            av.add("BUSYTYPE", str(busy_type))
+        if components:
+            for item in components:
+                av.add_component(item)
         return av
 
     @classmethod
@@ -3031,15 +3658,45 @@ class Available(_SpanMixin):
     def new(
         cls,
         *,
-        summary: Optional[str] = None,
-        start: Any = None,
-        end: Any = None,
+        categories: Sequence[str] = (),
+        comments: Any = None,
+        concepts: Any = None,
+        contacts: Any = None,
+        created: Any = None,
+        description: Optional[str] = None,
         duration: Optional[datetime.timedelta] = None,
-        uid: Optional[str] = None,
+        end: Any = None,
+        last_modified: Any = None,
+        links: Any = None,
+        location: Optional[str] = None,
+        recurrence_id: Any = None,
+        refids: Any = None,
+        related_to: Any = None,
+        sequence: Optional[int] = None,
+        stamp: Any = None,
+        start: Any = None,
+        summary: Optional[str] = None,
+        uid: Any = None,
     ) -> Available:
         av = cls()
-        if uid is not None:
-            av.add("UID", uid)
+        _apply_common_new_kwargs(
+            av,
+            categories=categories,
+            comments=comments,
+            concepts=concepts,
+            contacts=contacts,
+            created=created,
+            description=description,
+            last_modified=last_modified,
+            links=links,
+            location=location,
+            recurrence_id=recurrence_id,
+            refids=refids,
+            related_to=related_to,
+            sequence=sequence,
+            stamp=stamp,
+            uid=uid,
+        )
         if summary is not None:
             av.add("SUMMARY", summary)
         if start is not None:
@@ -3086,6 +3743,26 @@ def _wrap_rust_component(
 ) -> Component:
     cls = _COMPONENT_CLASS_MAP.get(comp.name, Component)
     return cls(_rust_comp=comp, _keep_recurrence=keep_recurrence, _parent=_parent)
+
+
+def _wrap_rust_occurrence_fast(
+    occ: _ox.Occurrence,
+    keep_recurrence: bool = False,
+) -> Component:
+    cname = occ.name
+    cls = _COMPONENT_CLASS_MAP.get(cname, Component)
+    obj = cls.__new__(cls)
+    obj._rust_comp = occ
+    obj._rust_cal = None
+    obj._keep_recurrence = keep_recurrence
+    obj._parent = None
+    obj._children_cache = None
+    obj._props = None
+    obj._subcomponents = None
+    obj._errors = None
+    obj._materialized = False
+    obj.name = cname
+    return obj
 
 
 def _wrap_rust_component_or_cal(cal: _ox.Calendar) -> Component:
@@ -3145,16 +3822,75 @@ class Calendar(Component):
     def new(
         cls,
         *,
-        prodid: Optional[str] = None,
-        name: Optional[str] = None,
         calscale: Optional[str] = "GREGORIAN",
+        categories: Sequence[str] = (),
+        color: Optional[str] = None,
+        concepts: Any = None,
+        description: Optional[str] = None,
+        language: Optional[str] = None,
+        last_modified: Any = None,
+        links: Any = None,
+        method: Optional[str] = None,
+        name: Optional[str] = None,
+        organization: Optional[str] = None,
+        prodid: Optional[str] = None,
+        refresh_interval: Optional[datetime.timedelta] = None,
+        refids: Any = None,
+        related_to: Any = None,
+        source: Optional[str] = None,
+        subcomponents: Optional[Iterable[Component]] = None,
+        uid: Any = None,
+        url: Optional[str] = None,
         version: str = "2.0",
     ) -> Calendar:
-        cal = cls(_rust_cal=_ox.Calendar.new(prodid=prodid, name=name))
+        effective_prodid = prodid
+        if effective_prodid is None and organization is not None:
+            effective_prodid = f"-//{organization}//{name or 'icaloxide'}//{language or 'EN'}"
+        cal = cls(_rust_cal=_ox.Calendar.new(prodid=effective_prodid, name=name))
         if calscale is not None and calscale != "GREGORIAN":
             cal["CALSCALE"] = calscale
+        elif calscale is None:
+            cal.pop("CALSCALE", None)
         if version != "2.0":
             cal["VERSION"] = version
+        if method is not None:
+            cal["METHOD"] = method
+        if refresh_interval is not None:
+            cal["REFRESH-INTERVAL"] = refresh_interval
+        if source is not None:
+            cal["SOURCE"] = source
+        if language is not None:
+            cal["LANGUAGE"] = language
+        if any(
+            x is not None and x != ()
+            for x in (
+                categories,
+                color,
+                concepts,
+                description,
+                last_modified,
+                links,
+                refids,
+                related_to,
+                subcomponents,
+                uid,
+                url,
+            )
+        ):
+            _apply_common_new_kwargs(
+                cal,
+                categories=categories,
+                color=color,
+                concepts=concepts,
+                description=description,
+                last_modified=last_modified,
+                links=links,
+                refids=refids,
+                related_to=related_to,
+                subcomponents=subcomponents,
+                uid=uid,
+                url=url,
+            )
         return cal
 
     calendar_name = _scalar_prop("NAME", fallback_key="X-WR-CALNAME")
