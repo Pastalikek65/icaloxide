@@ -116,6 +116,7 @@ class Alarms:
     """Compute trigger times and active/acknowledged/snoozed states across alarms."""
 
     def __init__(self, component: Any = None) -> None:
+        self._alarms: list[Any] = []
         self._start_alarms: list[Any] = []
         self._end_alarms: list[Any] = []
         self._absolute_alarms: list[Any] = []
@@ -127,6 +128,15 @@ class Alarms:
         self._local_tzinfo: Optional[datetime.tzinfo] = None
         if component is not None:
             self.add_component(component)
+
+    def __len__(self) -> int:
+        return len(self._alarms)
+
+    def __getitem__(self, index: Any) -> Any:
+        return self._alarms[index]
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self._alarms)
 
     def add_component(self, component: Any) -> None:
         name = getattr(component, "name", "").upper()
@@ -156,6 +166,7 @@ class Alarms:
             self.add_component(sub)
 
     def add_alarm(self, alarm: Any) -> None:
+        self._alarms.append(alarm)
         if "TRIGGER" not in alarm:
             return
         trig = alarm["TRIGGER"]

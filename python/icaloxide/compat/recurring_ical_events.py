@@ -131,6 +131,76 @@ class JournalAdapter(ComponentAdapter):
     name = "VJOURNAL"
 
 
+class AbsoluteAlarmAdapter(ComponentAdapter):
+    """Compatibility adapter for ``VALARM`` components matching ``recurring_ical_events``."""
+
+    name = "VALARM"
+
+    @classmethod
+    def component_bounds(cls, comp: Component) -> tuple[Any, Any]:
+        trig = comp.decoded("TRIGGER")
+        if isinstance(trig, (datetime.date, datetime.datetime)):
+            return trig, trig
+        return None, None
+
+
+class Occurrence:
+    """Compatibility wrapper matching ``recurring_ical_events.Occurrence``."""
+
+    def __init__(
+        self,
+        component: Component,
+        start: Any = None,
+        end: Any = None,
+        recurrence_id: Any = None,
+    ) -> None:
+        self.component = component
+        self.start = start if start is not None else component.decoded("DTSTART")
+        self.end = end if end is not None else (
+            component.decoded("DTEND") or component.decoded("DUE") or self.start
+        )
+        self.recurrence_id = recurrence_id
+
+    def as_component(self, *, keep_recurrence_attributes: bool = False) -> Component:
+        _ = keep_recurrence_attributes
+        return self.component
+
+
+class Series:
+    """Compatibility wrapper representing a recurring component series."""
+
+    def __init__(self, components: Sequence[Component] = ()) -> None:
+        self.components = list(components)
+
+    def between(self, start: DateArgument, stop: Union[DateArgument, datetime.timedelta]) -> list[Component]:
+        temp = CompatCalendar.new()
+        for comp in self.components:
+            temp.add_component(comp)
+        return UnfoldableCalendar(_to_rust_calendar(temp)).between(start, stop)
+
+
+class AlarmOccurrence(Occurrence):
+    """Compatibility occurrence wrapper representing an expanded ``VALARM`` trigger."""
+
+    def __init__(
+        self,
+        alarm: Component,
+        parent: Optional[Component] = None,
+        trigger: Any = None,
+    ) -> None:
+        super().__init__(alarm, start=trigger, end=trigger)
+        self.parent = parent
+        self.trigger = trigger
+
+
+class AlarmSeriesRelativeToStart(Series):
+    """Compatibility series for start-relative ``VALARM`` triggers."""
+
+
+class AlarmSeriesRelativeToEnd(Series):
+    """Compatibility series for end-relative ``VALARM`` triggers."""
+
+
 def _normalize_date_arg(arg: DateArgument) -> tuple[Any, Any]:
     if isinstance(arg, int):
         arg = (arg,)
@@ -636,6 +706,10 @@ def of(
 
 
 __all__ = [
+    "AbsoluteAlarmAdapter",
+    "AlarmOccurrence",
+    "AlarmSeriesRelativeToEnd",
+    "AlarmSeriesRelativeToStart",
     "AllKnownComponents",
     "CalendarQuery",
     "ComponentAdapter",
@@ -646,10 +720,12 @@ __all__ = [
     "DATE_MIN_DT",
     "EventAdapter",
     "JournalAdapter",
+    "Occurrence",
     "OccurrenceID",
     "Page",
     "Pages",
     "SelectComponents",
+    "Series",
     "TodoAdapter",
     "UnfoldableCalendar",
     "of",

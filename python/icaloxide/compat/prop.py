@@ -1,6 +1,7 @@
 """Submodule compatibility shim mimicking ``icalendar.prop``."""
 
 from icaloxide.compat.icalendar import (
+    VPROPERTY,
     AdrFields,
     Conference,
     Image,
@@ -45,6 +46,7 @@ __all__ = [
     "NFields",
     "Parameters",
     "TypesFactory",
+    "VPROPERTY",
     "vAdr",
     "vBinary",
     "vBoolean",

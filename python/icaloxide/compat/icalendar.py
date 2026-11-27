@@ -800,7 +800,26 @@ class vUTCOffset(vDDDTypes):
 class vCategory:
     def __init__(self, cats: Iterable[str], params: Optional[dict[str, Any]] = None) -> None:
         self.cats = [vText(c) for c in cats]
-        self.params = Parameters(params) if params else Parameters()
+        self.params = _ensure_parameters(params)
+
+    def __iter__(self) -> Iterator[vText]:
+        return iter(self.cats)
+
+    def __len__(self) -> int:
+        return len(self.cats)
+
+    def __getitem__(self, idx: Any) -> Any:
+        return self.cats[idx]
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, vCategory):
+            return self.cats == other.cats
+        if isinstance(other, list):
+            return list(self.cats) == other
+        return NotImplemented
+
+    def __repr__(self) -> str:
+        return f"vCategory({[str(c) for c in self.cats]!r})"
 
     def to_ical(self) -> bytes:
         return ",".join(_escape_text(str(c)) for c in self.cats).encode("utf-8")
@@ -924,6 +943,25 @@ class vDDDLists:
         vals = _jcal_values_to_py(pname, jtype, jcal_prop[3:], dict(params))
         items = vals if isinstance(vals, list) else [vals]
         return cls(items, params=params)
+
+    def __iter__(self) -> Iterator[vDDDTypes]:
+        return iter(self.dts)
+
+    def __len__(self) -> int:
+        return len(self.dts)
+
+    def __getitem__(self, idx: Any) -> Any:
+        return self.dts[idx]
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, vDDDLists):
+            return self.dts == other.dts
+        if isinstance(other, list):
+            return self.dts == other
+        return NotImplemented
+
+    def __repr__(self) -> str:
+        return f"vDDDLists({[d.dt for d in self.dts]!r})"
 
 
 class vWeekday(vText):
@@ -1331,6 +1369,14 @@ class Component:
             wrapped_dt = vDDDTypes(val, p_obj)
             wrapped_dt._on_mutate = self._make_value_sync(key_upper, match_idx, wrapped_dt)
             return wrapped_dt
+        if key_upper in ("EXDATE", "RDATE") and isinstance(val, vDDDLists):
+            return val
+        if key_upper in ("EXDATE", "RDATE") and isinstance(val, list):
+            return vDDDLists(val, p_obj)
+        if key_upper in ("CATEGORIES", "RESOURCES") and isinstance(val, vCategory):
+            return val
+        if key_upper in ("CATEGORIES", "RESOURCES") and isinstance(val, list):
+            return vCategory(val, p_obj)
         if key_upper in _TEMPORAL_KEYS and isinstance(val, list):
             return [
                 vDDDTypes(item, p_obj)
@@ -1389,6 +1435,10 @@ class Component:
         raw = matches[0] if len(matches) == 1 else matches
         if isinstance(raw, vDDDTypes):
             return raw.dt
+        if isinstance(raw, vDDDLists):
+            return [d.dt for d in raw.dts]
+        if isinstance(raw, vCategory):
+            return [str(c) for c in raw.cats]
         if isinstance(raw, vBinary):
             return _decode_binary_val(raw)
         if key_upper == "RRULE" and isinstance(raw, str):
@@ -1812,7 +1862,7 @@ class Component:
             out.extend(sub.walk(target))
         return out
 
-    def to_ical(self) -> bytes:
+    def to_ical(self, sorted: bool = True) -> bytes:
         if not self._materialized:
             if self._rust_cal is not None:
                 return self._rust_cal.to_ical()
@@ -1825,7 +1875,8 @@ class Component:
 
         buf = bytearray()
         buf.extend(_fold_line(f"BEGIN:{self.name}"))
-        for key, val, raw_params in self._props:
+        props = _order_props(self._props, self.canonical_order) if sorted else self._props
+        for key, val, raw_params in props:
             params = dict(raw_params)
             val_str = self._serialize_value(key, val, params)
             param_str = ""
@@ -1837,7 +1888,7 @@ class Component:
                 param_str += f";{pk.upper()}={joined}"
             buf.extend(_fold_line(f"{key}{param_str}:{val_str}"))
         for sub in self._subcomponents:
-            buf.extend(sub.to_ical())
+            buf.extend(sub.to_ical(sorted=sorted))
         buf.extend(_fold_line(f"END:{self.name}"))
         return bytes(buf)
 
@@ -1913,6 +1964,10 @@ class Component:
             return "TRUE" if val else "FALSE"
         if isinstance(val, tuple) and key == "GEO" and len(val) == 2:
             return f"{val[0]};{val[1]}"
+        if isinstance(val, (vCategory, vDDDLists)):
+            for pk, pv in val.params.items():
+                params.setdefault(pk, pv)
+            return val.to_ical().decode("utf-8")
         if hasattr(val, "to_ical") and not isinstance(val, str):
             raw = val.to_ical()
             return raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
@@ -1925,6 +1980,14 @@ class Component:
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}({self.name!r})"
+
+
+def _order_props(
+    props: list[tuple[str, Any, Parameters]], canonical_order: tuple[str, ...]
+) -> list[tuple[str, Any, Parameters]]:
+    order_map = {k: idx for idx, k in enumerate(canonical_order)}
+    fallback = len(order_map)
+    return sorted(props, key=lambda item: (order_map.get(item[0], fallback), item[0]))
 
 
 def _normalize_jcal_param(value: Any) -> Any:
@@ -1947,6 +2010,16 @@ def _prop_to_jcal(key: str, val: Any, raw_params: dict[str, Any]) -> list[Any]:
                 params.setdefault(lp, _normalize_jcal_param(pv))
         val = val.dt
 
+    if isinstance(val, vCategory):
+        for pk, pv in val.params.items():
+            params.setdefault(pk.lower(), _normalize_jcal_param(pv))
+        return [pname, params, "text", *[str(c) for c in val.cats]]
+    if isinstance(val, vDDDLists):
+        for pk, pv in val.params.items():
+            lp = pk.lower()
+            if lp != "value":
+                params.setdefault(lp, _normalize_jcal_param(pv))
+        return _prop_to_jcal(key, [d.dt for d in val.dts], params)
     if isinstance(val, vRecur) or (key == "RRULE" and isinstance(val, dict)):
         rec_dict: dict[str, Any] = {}
         for rk, rvs in val.items():
@@ -1996,6 +2069,14 @@ def _prop_to_jcal(key: str, val: Any, raw_params: dict[str, Any]) -> list[Any]:
         if val and isinstance(val[0], datetime.date):
             return [pname, params, "date", *[x.isoformat() for x in val]]
         return [pname, params, "text", *[str(x) for x in val]]
+    if isinstance(val, vCalAddress) or (key in _CAL_ADDRESS_KEYS and isinstance(val, str)):
+        return [pname, params, "cal-address", str(val)]
+    if (
+        (isinstance(val, vUri) or key in _URI_KEYS)
+        and isinstance(val, str)
+        and not _is_binary_prop(raw_params)
+    ):
+        return [pname, params, "uri", str(val)]
     return [pname, params, "text", str(val)]
 
 
@@ -2211,8 +2292,8 @@ class _SpanMixin(Component):
         return list(val) if isinstance(val, list) else [val]
 
     @property
-    def alarms(self) -> list[Alarm]:
-        return [c for c in self.subcomponents if c.name == "VALARM"]  # type: ignore[misc]
+    def alarms(self) -> Alarms:
+        return Alarms(self)
 
     @property
     def classification(self) -> Optional[str]:
@@ -3165,9 +3246,41 @@ from icaloxide.compat.props_extra import (  # noqa: E402
 )
 
 Component.types_factory = TypesFactory()  # type: ignore[attr-defined]
-__version__ = str(getattr(_ox, "__version__", "0.5.0"))
+__version__ = str(getattr(_ox, "__version__", "0.5.1"))
 version = __version__
 version_tuple = tuple(int(p) for p in __version__.split(".")[:3] if p.isdigit())
+__version_tuple__ = version_tuple
+VPROPERTY = Union[
+    vAdr,
+    vBinary,
+    vBoolean,
+    vBroken,
+    vCalAddress,
+    vCategory,
+    vDDDLists,
+    vDDDTypes,
+    vDate,
+    vDatetime,
+    vDuration,
+    vFloat,
+    vFrequency,
+    vGeo,
+    vInt,
+    vMonth,
+    vN,
+    vOrg,
+    vPeriod,
+    vRecur,
+    vSkip,
+    vText,
+    vTime,
+    vUTCOffset,
+    vUid,
+    vUnknown,
+    vUri,
+    vWeekday,
+    vXmlReference,
+]
 
 
 __all__ = [
@@ -3218,7 +3331,9 @@ __all__ = [
     "Todo",
     "TypesFactory",
     "VALUE",
+    "VPROPERTY",
     "__version__",
+    "__version_tuple__",
     "is_utc",
     "q_join",
     "q_split",

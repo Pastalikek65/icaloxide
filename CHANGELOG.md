@@ -5,6 +5,18 @@ All notable changes to `icaloxide` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-11-27
+
+### Fixed & Added
+
+- **100% `icalendar 7.3.2` Top-Level Parity & `compat` Type Fidelity (`icaloxide.compat`)**:
+  - Updated `Component.to_ical(sorted: bool = True)` so `to_ical(sorted=True)` / `to_ical(sorted=False)` match `icalendar.Component.to_ical()` instead of raising `TypeError`.
+  - Updated `Event.alarms` / `Todo.alarms` to return an `Alarms` object (matching `icalendar 7.3.2` `.times`, `.active`, `.acknowledge_until`, `.snooze_until`), while implementing `__len__`/`__getitem__`/`__iter__` on `Alarms` for backwards-compatible sequence indexing (`ev.alarms[0]`).
+  - Wrapped `EXDATE`/`RDATE` lists as `vDDDLists` and `CATEGORIES`/`RESOURCES` lists as `vCategory` (with full `.dts`/`.cats`/`.params`, indexing, list equality, and `decoded()` unwrapping).
+  - Fixed RFC 7265 jCal `_prop_to_jcal` so `ATTENDEE`/`ORGANIZER` emit `"cal-address"` and `URL`/`ATTACH`/`LINK`/`CONFERENCE`/`IMAGE` emit `"uri"`.
+  - Added `VPROPERTY` and `__version_tuple__` (`84/84` `icalendar.__all__` parity) plus `Occurrence`, `Series`, `AlarmOccurrence`, `AbsoluteAlarmAdapter`, `AlarmSeriesRelativeToStart`, and `AlarmSeriesRelativeToEnd` shims in `icaloxide.compat.recurring_ical_events`.
+- **Verification**: Added `tests/test_red_team_v051.py` verifying full jCal property-level equality, `to_ical(sorted=...)`, `ev.alarms`, `vDDDLists`/`vCategory`, `84/84` `__all__` parity, and `recurring_ical_events` inner shims.
+
 ## [0.5.0] - 2026-11-27
 
 ### Fixed & Added

@@ -31,6 +31,7 @@ from icaloxide.compat.errors import (
     PeriodEndBeforeStart,
 )
 from icaloxide.compat.icalendar import (
+    VPROPERTY,
     Alarm,
     Availability,
     Available,
@@ -48,6 +49,7 @@ from icaloxide.compat.icalendar import (
     TimezoneStandard,
     Todo,
     __version__,
+    __version_tuple__,
     is_utc,
     q_join,
     q_split,
@@ -175,7 +177,9 @@ __all__ = [
     "TypesFactory",
     "UnfoldableCalendar",
     "VALUE",
+    "VPROPERTY",
     "__version__",
+    "__version_tuple__",
     "is_utc",
     "of",
     "q_join",
