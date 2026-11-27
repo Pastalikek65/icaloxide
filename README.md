@@ -70,7 +70,16 @@ for ev in events:
 - [x] **Phase 4**: Full modern Python API + `icalendar` / `recurring_ical_events` drop-in `compat` layer
 - [x] **Phase 5**: Differential verification against `icalendar` + `recurring-ical-events` & fuzz/stress tests
 - [x] **Phase 6**: Speed & peak RSS memory benchmarks (`benchmarks/RESULTS.md`)
-- [ ] **Phase 7**: Final release workflow, `CHANGELOG.md`, and GitHub publication
+- [x] **Phase 7**: Final release workflow, `CHANGELOG.md`, and GitHub publication
+
+## Documentation
+
+- [Architecture Deep-Dive](docs/architecture.md)
+- [Migration Guide (`icalendar` & `recurring-ical-events`)](docs/migration-guide.md)
+- [Benchmark Report](benchmarks/RESULTS.md)
+- [Roadmap](docs/ROADMAP.md)
+- [Changelog](CHANGELOG.md)
+- [Contributing](CONTRIBUTING.md)
 
 ## Development
 
