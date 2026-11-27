@@ -319,6 +319,9 @@ fn generate_yearly(
         if !rule.by_month.is_empty() {
             d.retain(|date| rule.by_month.contains(&date.month));
         }
+        if !rule.by_month_day.is_empty() {
+            d.retain(|date| matches_month_days(*date, &rule.by_month_day));
+        }
         if !rule.by_day.is_empty() {
             d.retain(|date| {
                 rule.by_day

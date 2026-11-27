@@ -63,6 +63,12 @@ class AlarmTime:
         return self._alarm
 
     @property
+    def action(self) -> Optional[str]:
+        return getattr(self._alarm, "action", None) or (
+            self._alarm.decoded("ACTION") if hasattr(self._alarm, "decoded") else None
+        )
+
+    @property
     def parent(self) -> Any:
         return self._parent
 

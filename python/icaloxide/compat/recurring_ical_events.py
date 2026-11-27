@@ -12,6 +12,11 @@ from icaloxide.compat.errors import BadRuleStringFormat, PeriodEndBeforeStart
 from icaloxide.compat.icalendar import Calendar as CompatCalendar
 from icaloxide.compat.icalendar import Component, _wrap_rust_component
 
+DATE_MIN = datetime.date(1970, 1, 1)
+DATE_MAX = datetime.date(9999, 12, 31)
+DATE_MIN_DT = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+DATE_MAX_DT = datetime.datetime(9999, 12, 31, 23, 59, 59, tzinfo=datetime.timezone.utc)
+
 DateTuple = Union[
     Tuple[int],
     Tuple[int, int],
@@ -22,7 +27,43 @@ DateTuple = Union[
 ]
 DateArgument = Union[int, str, datetime.date, datetime.datetime, DateTuple]
 
-AllKnownComponents = ("VEVENT", "VTODO", "VJOURNAL", "VFREEBUSY", "VALARM", "VAVAILABILITY", "AVAILABLE")
+AllKnownComponents = (
+    "VEVENT",
+    "VTODO",
+    "VJOURNAL",
+    "VFREEBUSY",
+    "VALARM",
+    "VAVAILABILITY",
+    "AVAILABLE",
+)
+
+
+class OccurrenceID:
+    """Identifier matching ``recurring_ical_events.OccurrenceID``."""
+
+    def __init__(
+        self,
+        name: str,
+        uid: str,
+        recurrence_id: Any,
+        start: Any,
+    ) -> None:
+        self.name = name
+        self.uid = uid
+        self.recurrence_id = recurrence_id
+        self.start = start
+
+    def to_string(self) -> str:
+        s_str = self.start.isoformat() if hasattr(self.start, "isoformat") else str(self.start)
+        r_str = (
+            self.recurrence_id.isoformat()
+            if hasattr(self.recurrence_id, "isoformat")
+            else str(self.recurrence_id or "")
+        )
+        return f"{self.name}|{self.uid}|{r_str}|{s_str}"
+
+    def __repr__(self) -> str:
+        return f"OccurrenceID({self.to_string()!r})"
 
 
 class ComponentsWithName:
@@ -30,6 +71,64 @@ class ComponentsWithName:
 
     def __init__(self, *names: str) -> None:
         self.names = tuple(n.upper() for n in names)
+
+
+class SelectComponents:
+    """Component selection predicate matching ``recurring_ical_events.SelectComponents``."""
+
+    def __init__(self, *names: str) -> None:
+        self.names = tuple(n.upper() for n in names)
+
+    def matches(self, component: Component) -> bool:
+        return component.name.upper() in self.names
+
+
+class ComponentAdapter:
+    """Base adapter for standard or custom (``X-*``) components in ``recurring_ical_events``."""
+
+    name: str = "COMPONENT"
+
+    @classmethod
+    def component_name(cls) -> str:
+        return cls.name.upper()
+
+    @classmethod
+    def collect_components_from(
+        cls,
+        calendar: CompatCalendar,
+        *,
+        keep_recurrence_attributes: bool = False,
+    ) -> list[Component]:
+        _ = keep_recurrence_attributes
+        return calendar.walk(cls.component_name())
+
+    @classmethod
+    def component_bounds(cls, comp: Component) -> tuple[Any, Any]:
+        start = comp.decoded("DTSTART") or comp.decoded("DUE") or comp.decoded("DTSTAMP")
+        if start is None:
+            return None, None
+        end = comp.decoded("DTEND") or comp.decoded("DUE")
+        if end is None:
+            dur = comp.decoded("DURATION")
+            if isinstance(dur, datetime.timedelta):
+                end = start + dur
+            elif isinstance(start, datetime.date) and not isinstance(start, datetime.datetime):
+                end = start + datetime.timedelta(days=1)
+            else:
+                end = start
+        return start, end
+
+
+class EventAdapter(ComponentAdapter):
+    name = "VEVENT"
+
+
+class TodoAdapter(ComponentAdapter):
+    name = "VTODO"
+
+
+class JournalAdapter(ComponentAdapter):
+    name = "VJOURNAL"
 
 
 def _normalize_date_arg(arg: DateArgument) -> tuple[Any, Any]:
@@ -89,6 +188,16 @@ def _to_point(arg: DateArgument) -> Any:
         return arg
     s, _ = _normalize_date_arg(arg)
     return s
+
+
+def _as_cmp_utc(val: Any) -> datetime.datetime:
+    if isinstance(val, datetime.datetime):
+        if val.tzinfo is None:
+            return val.replace(tzinfo=datetime.timezone.utc)
+        return val.astimezone(datetime.timezone.utc)
+    if isinstance(val, datetime.date):
+        return datetime.datetime.combine(val, datetime.time.min, tzinfo=datetime.timezone.utc)
+    raise TypeError(f"cannot compare {type(val).__name__}")
 
 
 def _infer_tz_name(dt: Any) -> Optional[str]:
@@ -244,14 +353,23 @@ class Pages:
         return Page(comps, next_page_id=token)
 
 
-def _normalize_component_names(components: Sequence[Any]) -> list[str]:
+def _split_component_selectors(
+    components: Sequence[Any],
+) -> tuple[list[str], list[type[ComponentAdapter]]]:
     names: list[str] = []
+    custom: list[type[ComponentAdapter]] = []
     for item in components:
-        if isinstance(item, ComponentsWithName):
+        if isinstance(item, ComponentsWithName) or isinstance(item, SelectComponents):
             names.extend(item.names)
+        elif isinstance(item, type) and issubclass(item, ComponentAdapter):
+            cname = item.component_name()
+            if cname in AllKnownComponents:
+                names.append(cname)
+            else:
+                custom.append(item)
         else:
             names.append(str(item))
-    return names
+    return names, custom
 
 
 class UnfoldableCalendar:
@@ -269,7 +387,7 @@ class UnfoldableCalendar:
     ) -> None:
         self._rust_cal = rust_cal
         self._keep_recurrence = keep_recurrence_attributes
-        self._components = _normalize_component_names(components)
+        self._components, self._custom_adapters = _split_component_selectors(components)
         self._skip_bad_series = skip_bad_series
         self._max_iterations = max_iterations
         self._max_periods = max_periods
@@ -296,6 +414,30 @@ class UnfoldableCalendar:
                 )
         return self._query
 
+    def _custom_components_in(self, win_start: Any, win_end: Any) -> list[Component]:
+        if not self._custom_adapters:
+            return []
+        compat_cal = CompatCalendar(_rust_cal=self._rust_cal)
+        ws = _as_cmp_utc(win_start)
+        if isinstance(win_end, datetime.date) and not isinstance(win_end, datetime.datetime):
+            we = datetime.datetime.combine(win_end + datetime.timedelta(days=1), datetime.time.min, tzinfo=datetime.timezone.utc)
+        else:
+            we = _as_cmp_utc(win_end)
+        matched: list[Component] = []
+        for adapter in self._custom_adapters:
+            for comp in adapter.collect_components_from(
+                compat_cal, keep_recurrence_attributes=self._keep_recurrence
+            ):
+                cs, ce = adapter.component_bounds(comp)
+                if cs is None:
+                    continue
+                su = _as_cmp_utc(cs)
+                eu = _as_cmp_utc(ce)
+                overlaps = (su < we and eu > ws) if eu > su else (ws <= su < we)
+                if overlaps:
+                    matched.append(comp)
+        return matched
+
     @property
     def suppressed_errors(self) -> list[str]:
         return self._query.suppressed_errors
@@ -308,18 +450,24 @@ class UnfoldableCalendar:
         s_bound, e_bound = _normalize_date_arg(a_date)
         if s_bound == e_bound and not isinstance(a_date, tuple):
             occs = self._query_for(s_bound).at(s_bound)
+            custom = self._custom_components_in(s_bound, e_bound + datetime.timedelta(seconds=1) if isinstance(e_bound, datetime.datetime) else e_bound)
         elif isinstance(a_date, (int, str, tuple)):
             if isinstance(e_bound, datetime.datetime):
                 occs = self._query_for(s_bound).between(s_bound, e_bound)
+                custom = self._custom_components_in(s_bound, e_bound)
             else:
                 end_q = e_bound - datetime.timedelta(days=1)
                 occs = self._query_for(s_bound).between(s_bound, end_q)
+                custom = self._custom_components_in(s_bound, end_q)
         else:
             occs = self._query_for(s_bound).at(s_bound)
-        return [
+            custom = self._custom_components_in(s_bound, s_bound)
+        res = [
             _wrap_rust_component(o, keep_recurrence=self._keep_recurrence)
             for o in occs
         ]
+        res.extend(custom)
+        return res
 
     def between(
         self,
@@ -337,15 +485,19 @@ class UnfoldableCalendar:
         else:
             e_val = _to_point(stop)
         occs = self._query_for(s_val).between(s_val, e_val)
-        return [
+        res = [
             _wrap_rust_component(o, keep_recurrence=self._keep_recurrence)
             for o in occs
         ]
+        res.extend(self._custom_components_in(s_val, e_val))
+        return res
 
     def after(self, earliest_end: DateArgument) -> Iterator[Component]:
         pt = _to_point(earliest_end)
         for occ in self._query_for(pt).after(pt):
             yield _wrap_rust_component(occ, keep_recurrence=self._keep_recurrence)
+        for comp in self._custom_components_in(pt, DATE_MAX):
+            yield comp
 
     def paginate(
         self,
@@ -385,10 +537,12 @@ class UnfoldableCalendar:
         return _wrap_rust_component(occ, keep_recurrence=self._keep_recurrence)
 
     def all(self) -> list[Component]:
-        return [
+        res = [
             _wrap_rust_component(o, keep_recurrence=self._keep_recurrence)
             for o in self._query.all()
         ]
+        res.extend(self._custom_components_in(DATE_MIN, DATE_MAX))
+        return res
 
     def count(
         self,
@@ -404,8 +558,10 @@ class UnfoldableCalendar:
                     e_val = datetime.datetime.combine(s_val, datetime.time.min) + stop
             else:
                 e_val = _to_point(stop)
-            return self._query_for(s_val).count(s_val, e_val)
-        return self._query.count_all()
+            return self._query_for(s_val).count(s_val, e_val) + len(
+                self._custom_components_in(s_val, e_val)
+            )
+        return self._query.count_all() + len(self._custom_components_in(DATE_MIN, DATE_MAX))
 
     def busy_intervals(
         self,
@@ -482,9 +638,19 @@ def of(
 __all__ = [
     "AllKnownComponents",
     "CalendarQuery",
+    "ComponentAdapter",
     "ComponentsWithName",
+    "DATE_MAX",
+    "DATE_MAX_DT",
+    "DATE_MIN",
+    "DATE_MIN_DT",
+    "EventAdapter",
+    "JournalAdapter",
+    "OccurrenceID",
     "Page",
     "Pages",
+    "SelectComponents",
+    "TodoAdapter",
     "UnfoldableCalendar",
     "of",
 ]

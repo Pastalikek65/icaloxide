@@ -5,6 +5,14 @@ All notable changes to `icaloxide` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-11-27
+
+### Fixed & Added
+
+- **Cross-Year ISO `BYWEEKNO` Parity (`icaloxide-rrule`)**: Fixed `week_days_in_year` so ISO weeks spanning calendar year boundaries (`BYWEEKNO=1` / `BYWEEKNO=-1` / `WKST=SU`) include all 7 week days, plus `BYMONTHDAY` filtering on `BYWEEKNO` rules — verified 100% identical to `recurring-ical-events` / `dateutil.rrule`.
+- **`vUTCOffset`, `vBinary`, and `vPeriod` Fixes (`icaloxide.compat`)**: Fixed `vUTCOffset.to_ical()` emitting RFC 5545 `+0300` (instead of `PT3H`), jCal `"utc-offset"` encoding/decoding (`+03:00`), and `vBinary.to_ical()` Base64 encoding.
+- **Complete `v*`, `Component`, `Parameters`, Exception & Adapter Parity**: Added `from_ical`/`to_jcal`/`from_jcal` across all `v*` classes, `vAdr`/`vN`/`vOrg`/`ComponentFactory`/`TypesFactory`, `ICalParsingError`/`JCalParsingError` exception wrapping, `Component.__eq__` + metadata helpers, `Parameters` helpers, uppercase `DTSTART`/`DTEND`/`ACTION`/`TRIGGER` accessors, `AlarmTime.action`, and extensible `ComponentAdapter`/`EventAdapter`/`TodoAdapter`/`JournalAdapter`/`SelectComponents`/`OccurrenceID`.
+
 ## [0.3.0] - 2026-11-27
 
 ### Added

@@ -60,8 +60,8 @@ pub fn weeks_in_year(year: i16, wkst: Weekday) -> u8 {
     ((w1_next - w1) / 7) as u8
 }
 
-/// Resolve an RFC 5545 `BYWEEKNO` value (`1..=53` or `-53..=-1`) in `year` into dates
-/// falling within `year`.
+/// Resolve an RFC 5545 `BYWEEKNO` value (`1..=53` or `-53..=-1`) in `year` into its 7 dates
+/// (which may spill into late December of `year - 1` or early January of `year + 1`).
 pub fn week_days_in_year(year: i16, week_no: i8, wkst: Weekday) -> SmallVec<[CalDate; 7]> {
     let total_weeks = i16::from(weeks_in_year(year, wkst));
     let target = if week_no > 0 {
@@ -75,10 +75,7 @@ pub fn week_days_in_year(year: i16, week_no: i8, wkst: Weekday) -> SmallVec<[Cal
     }
     let start = week1_start_epoch(year, wkst) + i32::from(target - 1) * 7;
     for d in 0..7 {
-        let date = CalDate::from_days_since_epoch(start + d);
-        if date.year == year {
-            out.push(date);
-        }
+        out.push(CalDate::from_days_since_epoch(start + d));
     }
     out
 }

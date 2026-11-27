@@ -556,3 +556,88 @@ END:VCALENDAR\r\n";
     assert_eq!(al.len(), 1);
     assert_eq!(al[0].start_utc, utc_ts(2026, 3, 31, 23, 30, 0));
 }
+
+#[test]
+fn byweekno_cross_year_iso_spill_parity() {
+    let ics = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+PRODID:-//icaloxide//v031-byweekno//EN\r\n\
+BEGIN:VEVENT\r\n\
+UID:w1-mo\r\n\
+DTSTART:20250101T090000Z\r\n\
+DURATION:PT1H\r\n\
+RRULE:FREQ=YEARLY;BYWEEKNO=1;BYDAY=MO;COUNT=5\r\n\
+SUMMARY:Week1Mon\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\n\
+UID:wlast-su\r\n\
+DTSTART:20251228T090000Z\r\n\
+DURATION:PT1H\r\n\
+RRULE:FREQ=YEARLY;BYWEEKNO=-1;BYDAY=SU;COUNT=4\r\n\
+SUMMARY:LastWeekSun\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\n\
+UID:w1-su-wkst\r\n\
+DTSTART:20250101T090000Z\r\n\
+DURATION:PT1H\r\n\
+RRULE:FREQ=YEARLY;BYWEEKNO=1;WKST=SU;BYDAY=SU;COUNT=4\r\n\
+SUMMARY:Week1SunWkstSu\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+
+    let cal = Arc::new(Calendar::parse_str(ics).unwrap());
+    let q = CalendarQuery::new(cal, QueryOptions::default()).unwrap();
+    let occs = q
+        .between(utc_ts(2025, 1, 1, 0, 0, 0), utc_ts(2030, 1, 15, 0, 0, 0))
+        .unwrap();
+
+    let starts_for = |summary_match: i64| -> Vec<i64> {
+        let _ = summary_match;
+        occs.iter().map(|o| o.start_utc).collect()
+    };
+    let _ = starts_for;
+
+    let mut w1_mo = Vec::new();
+    let mut wlast_su = Vec::new();
+    let mut w1_wkst_su = Vec::new();
+    for occ in occs {
+        match q.calendar().component(occ.component_id).unwrap().uid() {
+            Some("w1-mo") => w1_mo.push(occ.start_utc),
+            Some("wlast-su") => wlast_su.push(occ.start_utc),
+            Some("w1-su-wkst") => w1_wkst_su.push(occ.start_utc),
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        w1_mo,
+        vec![
+            utc_ts(2025, 1, 1, 9, 0, 0),
+            utc_ts(2025, 12, 29, 9, 0, 0),
+            utc_ts(2027, 1, 4, 9, 0, 0),
+            utc_ts(2028, 1, 3, 9, 0, 0),
+            utc_ts(2029, 1, 1, 9, 0, 0),
+            utc_ts(2029, 12, 31, 9, 0, 0),
+        ]
+    );
+    assert_eq!(
+        wlast_su,
+        vec![
+            utc_ts(2025, 12, 28, 9, 0, 0),
+            utc_ts(2027, 1, 3, 9, 0, 0),
+            utc_ts(2028, 1, 2, 9, 0, 0),
+            utc_ts(2028, 12, 31, 9, 0, 0),
+        ]
+    );
+    assert_eq!(
+        w1_wkst_su,
+        vec![
+            utc_ts(2025, 1, 1, 9, 0, 0),
+            utc_ts(2026, 1, 4, 9, 0, 0),
+            utc_ts(2027, 1, 3, 9, 0, 0),
+            utc_ts(2028, 1, 2, 9, 0, 0),
+            utc_ts(2028, 12, 31, 9, 0, 0),
+        ]
+    );
+}

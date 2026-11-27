@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import base64
 import bisect
 import copy
 import datetime
 import json
+import re
 from typing import Any, Iterable, Iterator, Optional, Sequence, Union
 
 import icaloxide as _ox
+from icaloxide.compat.errors import ICalParsingError, JCalParsingError
 from icaloxide.compat.xcal import component_to_xcal, xcal_to_jcal
 
 
@@ -98,14 +101,106 @@ def _format_temporal(val: Any, params: dict[str, Any]) -> str:
     return str(val)
 
 
+def _format_utc_offset(td: datetime.timedelta, colon: bool = False) -> str:
+    total = int(td.total_seconds())
+    sign = "-" if total < 0 else "+"
+    total = abs(total)
+    hours, rem = divmod(total, 3600)
+    mins, secs = divmod(rem, 60)
+    sep = ":" if colon else ""
+    if secs:
+        return f"{sign}{hours:02}{sep}{mins:02}{sep}{secs:02}"
+    return f"{sign}{hours:02}{sep}{mins:02}"
+
+
+def _parse_utc_offset(raw: Union[str, bytes]) -> datetime.timedelta:
+    text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+    s = text.strip().replace(":", "")
+    if len(s) not in (5, 7) or s[0] not in ("+", "-"):
+        raise ValueError(f"invalid UTC offset: {text!r}")
+    sign = -1 if s[0] == "-" else 1
+    h = int(s[1:3])
+    m = int(s[3:5])
+    sec = int(s[5:7]) if len(s) == 7 else 0
+    return datetime.timedelta(seconds=sign * (h * 3600 + m * 60 + sec))
+
+
+_ISO_DUR_RE = re.compile(
+    r"^(?P<sign>[+-])?P(?:(?P<weeks>\d+)W)?(?:(?P<days>\d+)D)?(?:T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?(?:(?P<seconds>\d+)S)?)?$"
+)
+
+
+def _parse_duration_str(raw: Union[str, bytes]) -> datetime.timedelta:
+    text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+    m = _ISO_DUR_RE.match(text.strip())
+    if not m:
+        raise ValueError(f"invalid duration: {text!r}")
+    sign = -1 if m.group("sign") == "-" else 1
+    td = datetime.timedelta(
+        weeks=int(m.group("weeks") or 0),
+        days=int(m.group("days") or 0),
+        hours=int(m.group("hours") or 0),
+        minutes=int(m.group("minutes") or 0),
+        seconds=int(m.group("seconds") or 0),
+    )
+    return -td if sign < 0 else td
+
+
+def _unescape_ical_text(raw: str) -> str:
+    return (
+        raw.replace("\\n", "\n")
+        .replace("\\N", "\n")
+        .replace("\\;", ";")
+        .replace("\\,", ",")
+        .replace("\\\\", "\\")
+    )
+
+
 class Parameters(dict):  # type: ignore[type-arg]
     """Case-insensitive parameter mapping matching ``icalendar.Parameters``."""
 
+    always_quoted = ("ALTREP", "CN", "DIR", "SENT-BY", "MEMBER", "DELEGATED-FROM", "DELEGATED-TO")
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__()
+        self.quote_also: list[str] = []
         data = dict(*args, **kwargs)
         for k, v in data.items():
             self[k] = v
+
+    @property
+    def params(self) -> Parameters:
+        return self
+
+    def move_to_end(self, key: str, last: bool = True) -> None:
+        k_up = str(key).upper()
+        if k_up not in self:
+            raise KeyError(key)
+        val = dict.pop(self, k_up)
+        if last:
+            dict.__setitem__(self, k_up, val)
+        else:
+            items = list(self.items())
+            self.clear()
+            dict.__setitem__(self, k_up, val)
+            for ok, ov in items:
+                dict.__setitem__(self, ok, ov)
+
+    def update_tzid_from(self, dt: Any) -> None:
+        if isinstance(dt, datetime.datetime) and dt.tzinfo is not None:
+            off = dt.utcoffset()
+            if off == datetime.timedelta(0):
+                self.pop("TZID", None)
+                return
+            key = getattr(dt.tzinfo, "key", None) or getattr(dt.tzinfo, "zone", None)
+            if key:
+                self["TZID"] = str(key)
+
+    @classmethod
+    def from_jcal_property(cls, jcal_prop: list[Any]) -> Parameters:
+        if len(jcal_prop) > 1 and isinstance(jcal_prop[1], dict):
+            return cls.from_jcal(jcal_prop[1])
+        return cls()
 
     def __setitem__(self, key: str, value: Any) -> None:
         super().__setitem__(str(key).upper(), value)
@@ -191,11 +286,53 @@ class vDDDTypes:
         params: Optional[dict[str, Any]] = None,
     ) -> None:
         self.dt = dt
-        self.params: Parameters = Parameters(params) if params else Parameters()
+        if isinstance(params, Parameters):
+            self.params = params
+        else:
+            self.params = Parameters(params) if params else Parameters()
 
     def to_ical(self) -> bytes:
         local_params = dict(self.params)
         return _format_temporal(self.dt, local_params).encode("utf-8")
+
+    @classmethod
+    def from_ical(
+        cls,
+        raw: Union[str, bytes],
+        params: Optional[dict[str, Any]] = None,
+        timezone: Any = None,
+    ) -> Any:
+        text = (raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)).strip()
+        if text.startswith(("P", "+P", "-P")):
+            return _parse_duration_str(text)
+        if len(text) == 8 and text.isdigit():
+            return datetime.date(int(text[:4]), int(text[4:6]), int(text[6:8]))
+        if len(text) == 6 and text.isdigit():
+            return datetime.time(int(text[:2]), int(text[2:4]), int(text[4:6]))
+        if len(text) in (15, 16) and text[8] in ("T", "t"):
+            dt = _parse_until_str(text)
+            tz_name = (params or {}).get("TZID") if params else None
+            if isinstance(tz_name, (list, tuple)) and tz_name:
+                tz_name = tz_name[0]
+            if tz_name and dt.tzinfo is None:
+                from zoneinfo import ZoneInfo
+
+                dt = dt.replace(tzinfo=ZoneInfo(str(tz_name)))
+            elif timezone is not None and dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone)
+            return dt
+        raise ValueError(f"invalid temporal value: {text!r}")
+
+    def to_jcal(self, name: str = "dtstart") -> list[Any]:
+        return _prop_to_jcal(name.upper(), self.dt, dict(self.params))
+
+    @classmethod
+    def from_jcal(cls, jcal_prop: list[Any]) -> vDDDTypes:
+        pname = str(jcal_prop[0]).upper()
+        params = Parameters.from_jcal_property(jcal_prop)
+        jtype = str(jcal_prop[2]).lower()
+        val = _jcal_values_to_py(pname, jtype, jcal_prop[3:], dict(params))
+        return cls(val, params=params)
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, vDDDTypes):
@@ -218,6 +355,20 @@ class vText(str):
 
     def to_ical(self) -> bytes:
         return _escape_text(str(self)).encode("utf-8")
+
+    @classmethod
+    def from_ical(cls, raw: Union[str, bytes]) -> str:
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+        return _unescape_ical_text(text)
+
+    def to_jcal(self, name: str = "summary") -> list[Any]:
+        return [name.lower(), self.params.to_jcal(), "text", str(self)]
+
+    @classmethod
+    def from_jcal(cls, jcal_prop: list[Any]) -> vText:
+        params = Parameters.from_jcal_property(jcal_prop)
+        val = str(jcal_prop[3]) if len(jcal_prop) > 3 else ""
+        return cls(val, params=params)
 
 
 class vRecur(dict):  # type: ignore[type-arg]
@@ -290,6 +441,15 @@ class vRecur(dict):  # type: ignore[type-arg]
             parts.append(f"{k}={','.join(rendered)}")
         return ";".join(parts).encode("utf-8")
 
+    def to_jcal(self, name: str = "rrule") -> list[Any]:
+        return _prop_to_jcal(name.upper(), self, dict(self.params))
+
+    @classmethod
+    def from_jcal(cls, jcal_prop: list[Any]) -> vRecur:
+        params = Parameters.from_jcal_property(jcal_prop)
+        rec = dict(jcal_prop[3]) if len(jcal_prop) > 3 and isinstance(jcal_prop[3], dict) else {}
+        return cls(rec, params=params)
+
     def __str__(self) -> str:
         return self.to_ical().decode("utf-8")
 
@@ -320,13 +480,30 @@ class vGeo:
     def to_ical(self) -> bytes:
         return f"{self.latitude};{self.longitude}".encode("utf-8")
 
+    @classmethod
+    def from_ical(cls, raw: Union[str, bytes]) -> tuple[float, float]:
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+        lat_s, lon_s = text.strip().split(";", 1)
+        return (float(lat_s), float(lon_s))
+
+    def to_jcal(self, name: str = "geo") -> list[Any]:
+        return [name.lower(), self.params.to_jcal(), "float", [self.latitude, self.longitude]]
+
+    @classmethod
+    def from_jcal(cls, jcal_prop: list[Any]) -> vGeo:
+        params = Parameters.from_jcal_property(jcal_prop)
+        coords = jcal_prop[3]
+        return cls((float(coords[0]), float(coords[1])), params=params)
+
 
 class vCalAddress(vText):
-    pass
+    def to_jcal(self, name: str = "attendee") -> list[Any]:
+        return [name.lower(), self.params.to_jcal(), "cal-address", str(self)]
 
 
 class vUri(vText):
-    pass
+    def to_jcal(self, name: str = "url") -> list[Any]:
+        return [name.lower(), self.params.to_jcal(), "uri", str(self)]
 
 
 class vBoolean:
@@ -336,6 +513,23 @@ class vBoolean:
 
     def to_ical(self) -> bytes:
         return b"TRUE" if self.val else b"FALSE"
+
+    @classmethod
+    def from_ical(cls, raw: Union[str, bytes]) -> bool:
+        text = (raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)).strip().upper()
+        if text == "TRUE":
+            return True
+        if text == "FALSE":
+            return False
+        raise ValueError(f"invalid boolean value: {text!r}")
+
+    def to_jcal(self, name: str = "rsvp") -> list[Any]:
+        return [name.lower(), self.params.to_jcal(), "boolean", self.val]
+
+    @classmethod
+    def from_jcal(cls, jcal_prop: list[Any]) -> vBoolean:
+        params = Parameters.from_jcal_property(jcal_prop)
+        return cls(bool(jcal_prop[3]), params=params)
 
     def __bool__(self) -> bool:
         return self.val
@@ -352,6 +546,19 @@ class vInt(int):
     def to_ical(self) -> bytes:
         return str(int(self)).encode("utf-8")
 
+    @classmethod
+    def from_ical(cls, raw: Union[str, bytes]) -> int:
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+        return int(text.strip())
+
+    def to_jcal(self, name: str = "sequence") -> list[Any]:
+        return [name.lower(), self.params.to_jcal(), "integer", int(self)]
+
+    @classmethod
+    def from_jcal(cls, jcal_prop: list[Any]) -> vInt:
+        params = Parameters.from_jcal_property(jcal_prop)
+        return cls(int(jcal_prop[3]), params=params)
+
 
 class vFloat(float):
     params: Parameters
@@ -364,9 +571,38 @@ class vFloat(float):
     def to_ical(self) -> bytes:
         return str(float(self)).encode("utf-8")
 
+    @classmethod
+    def from_ical(cls, raw: Union[str, bytes]) -> float:
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+        return float(text.strip())
+
+    def to_jcal(self, name: str = "float") -> list[Any]:
+        return [name.lower(), self.params.to_jcal(), "float", float(self)]
+
+    @classmethod
+    def from_jcal(cls, jcal_prop: list[Any]) -> vFloat:
+        params = Parameters.from_jcal_property(jcal_prop)
+        return cls(float(jcal_prop[3]), params=params)
+
 
 class vDuration(vDDDTypes):
-    pass
+    @classmethod
+    def from_ical(  # type: ignore[override]
+        cls,
+        raw: Union[str, bytes],
+        params: Optional[dict[str, Any]] = None,
+        timezone: Any = None,
+    ) -> datetime.timedelta:
+        _ = params, timezone
+        return _parse_duration_str(raw)
+
+    def to_jcal(self, name: str = "duration") -> list[Any]:
+        return [name.lower(), self.params.to_jcal(), "duration", _format_temporal(self.dt, {})]
+
+    @classmethod
+    def from_jcal(cls, jcal_prop: list[Any]) -> vDuration:  # type: ignore[override]
+        params = Parameters.from_jcal_property(jcal_prop)
+        return cls(_parse_duration_str(str(jcal_prop[3])), params=params)
 
 
 class vPeriod:
@@ -384,9 +620,56 @@ class vPeriod:
         e = _format_temporal(self.end_or_dur, {})
         return f"{s}/{e}".encode("utf-8")
 
+    @classmethod
+    def from_ical(cls, raw: Union[str, bytes]) -> tuple[Any, Any]:
+        text = (raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)).strip()
+        lhs, rhs = text.split("/", 1)
+        start = vDDDTypes.from_ical(lhs)
+        end = _parse_duration_str(rhs) if rhs.startswith(("P", "+P", "-P")) else vDDDTypes.from_ical(rhs)
+        return (start, end)
+
+    def to_jcal(self, name: str = "freebusy") -> list[Any]:
+        iso_s = _iso_temporal(self.start)
+        if isinstance(self.end_or_dur, datetime.timedelta):
+            iso_e = _format_temporal(self.end_or_dur, {})
+        else:
+            iso_e = _iso_temporal(self.end_or_dur)
+        return [name.lower(), self.params.to_jcal(), "period", f"{iso_s}/{iso_e}"]
+
+    @classmethod
+    def from_jcal(cls, jcal_prop: list[Any]) -> vPeriod:
+        params = Parameters.from_jcal_property(jcal_prop)
+        lhs, rhs = str(jcal_prop[3]).split("/", 1)
+        s = _parse_iso_dt(lhs, dict(params))
+        e: Any = (
+            _parse_duration_str(rhs)
+            if rhs.startswith(("P", "+P", "-P"))
+            else _parse_iso_dt(rhs, dict(params))
+        )
+        return cls((s, e), params=params)
+
 
 class vUTCOffset(vDDDTypes):
-    pass
+    def to_ical(self) -> bytes:
+        return _format_utc_offset(self.dt).encode("utf-8")
+
+    @classmethod
+    def from_ical(  # type: ignore[override]
+        cls,
+        raw: Union[str, bytes],
+        params: Optional[dict[str, Any]] = None,
+        timezone: Any = None,
+    ) -> datetime.timedelta:
+        _ = params, timezone
+        return _parse_utc_offset(raw)
+
+    def to_jcal(self, name: str = "tzoffsetto") -> list[Any]:
+        return [name.lower(), self.params.to_jcal(), "utc-offset", _format_utc_offset(self.dt, colon=True)]
+
+    @classmethod
+    def from_jcal(cls, jcal_prop: list[Any]) -> vUTCOffset:  # type: ignore[override]
+        params = Parameters.from_jcal_property(jcal_prop)
+        return cls(_parse_utc_offset(str(jcal_prop[3])), params=params)
 
 
 class vCategory:
@@ -397,6 +680,33 @@ class vCategory:
     def to_ical(self) -> bytes:
         return ",".join(_escape_text(str(c)) for c in self.cats).encode("utf-8")
 
+    @classmethod
+    def from_ical(cls, raw: Union[str, bytes]) -> list[str]:
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+        items: list[str] = []
+        buf: list[str] = []
+        it = iter(text)
+        for ch in it:
+            if ch == ",":
+                items.append(_unescape_ical_text("".join(buf)))
+                buf.clear()
+            elif ch == "\\":
+                nxt = next(it, "")
+                buf.append("\\" + nxt)
+            else:
+                buf.append(ch)
+        if buf or items:
+            items.append(_unescape_ical_text("".join(buf)))
+        return items
+
+    def to_jcal(self, name: str = "categories") -> list[Any]:
+        return [name.lower(), self.params.to_jcal(), "text", *[str(c) for c in self.cats]]
+
+    @classmethod
+    def from_jcal(cls, jcal_prop: list[Any]) -> vCategory:
+        params = Parameters.from_jcal_property(jcal_prop)
+        return cls([str(v) for v in jcal_prop[3:]], params=params)
+
 
 class vBinary:
     def __init__(self, obj: Union[bytes, str], params: Optional[dict[str, Any]] = None) -> None:
@@ -404,19 +714,55 @@ class vBinary:
         self.params = Parameters(params) if params else Parameters()
 
     def to_ical(self) -> bytes:
-        return self.obj if isinstance(self.obj, bytes) else str(self.obj).encode("utf-8")
+        if isinstance(self.obj, bytes):
+            return base64.b64encode(self.obj)
+        return str(self.obj).encode("utf-8")
+
+    @classmethod
+    def from_ical(cls, raw: Union[str, bytes]) -> bytes:
+        data = raw.encode("ascii") if isinstance(raw, str) else raw
+        return base64.b64decode(data.strip())
+
+    def to_jcal(self, name: str = "attach") -> list[Any]:
+        return [name.lower(), self.params.to_jcal(), "binary", self.to_ical().decode("ascii")]
+
+    @classmethod
+    def from_jcal(cls, jcal_prop: list[Any]) -> vBinary:
+        params = Parameters.from_jcal_property(jcal_prop)
+        raw = str(jcal_prop[3]) if len(jcal_prop) > 3 else ""
+        return cls(base64.b64decode(raw), params=params)
 
 
 class vDate(vDDDTypes):
-    pass
+    def to_jcal(self, name: str = "dtstart") -> list[Any]:
+        return [name.lower(), self.params.to_jcal(), "date", self.dt.isoformat()]
 
 
 class vDatetime(vDDDTypes):
-    pass
+    def to_jcal(self, name: str = "dtstart") -> list[Any]:
+        return _prop_to_jcal(name.upper(), self.dt, dict(self.params))
 
 
 class vTime(vDDDTypes):
-    pass
+    @classmethod
+    def from_ical(
+        cls,
+        raw: Union[str, bytes],
+        params: Optional[dict[str, Any]] = None,
+        timezone: Any = None,
+    ) -> datetime.time:
+        text = (raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)).strip()
+        is_utc_flag = text.endswith(("Z", "z"))
+        digits = text[:-1] if is_utc_flag else text
+        t = datetime.time(int(digits[0:2]), int(digits[2:4]), int(digits[4:6]))
+        if is_utc_flag:
+            return t.replace(tzinfo=datetime.timezone.utc)
+        if timezone is not None:
+            return t.replace(tzinfo=timezone)
+        return t
+
+    def to_jcal(self, name: str = "time") -> list[Any]:
+        return [name.lower(), self.params.to_jcal(), "time", self.dt.strftime("%H:%M:%S")]
 
 
 class vDDDLists:
@@ -432,6 +778,27 @@ class vDDDLists:
 
     def to_ical(self) -> bytes:
         return b",".join(d.to_ical() for d in self.dts)
+
+    @classmethod
+    def from_ical(
+        cls,
+        raw: Union[str, bytes],
+        params: Optional[dict[str, Any]] = None,
+    ) -> list[Any]:
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+        return [vDDDTypes.from_ical(item.strip(), params=params) for item in text.split(",") if item.strip()]
+
+    def to_jcal(self, name: str = "rdate") -> list[Any]:
+        return _prop_to_jcal(name.upper(), [d.dt for d in self.dts], dict(self.params))
+
+    @classmethod
+    def from_jcal(cls, jcal_prop: list[Any]) -> vDDDLists:
+        pname = str(jcal_prop[0]).upper()
+        params = Parameters.from_jcal_property(jcal_prop)
+        jtype = str(jcal_prop[2]).lower()
+        vals = _jcal_values_to_py(pname, jtype, jcal_prop[3:], dict(params))
+        items = vals if isinstance(vals, list) else [vals]
+        return cls(items, params=params)
 
 
 class vWeekday(vText):
@@ -506,6 +873,14 @@ class Component:
     """Compatibility wrapper supporting lazy Rust proxies, mutable editing, dict protocol, and jCal."""
 
     name: str = "COMPONENT"
+
+    required: tuple[str, ...] = ()
+    singletons: tuple[str, ...] = ()
+    multiple: tuple[str, ...] = ()
+    exclusive: tuple[tuple[str, ...], ...] = ()
+    inclusive: tuple[tuple[str, ...], ...] = ()
+    canonical_order: tuple[str, ...] = ()
+    ignore_exceptions = False
 
     def __init__(
         self,
@@ -659,7 +1034,8 @@ class Component:
         self._ensure_materialized()
         key_upper = name.upper()
         self._props = [(k, v, p) for k, v, p in self._props if k != key_upper]
-        self._props.append((key_upper, value, {}))
+        params = value.params if hasattr(value, "params") and isinstance(value.params, Parameters) else Parameters()
+        self._props.append((key_upper, value, params))
 
     def __delitem__(self, name: str) -> None:
         self._ensure_materialized()
@@ -766,7 +1142,14 @@ class Component:
     ) -> None:
         _ = encode
         self._ensure_materialized()
-        params = dict(parameters) if parameters else {}
+        if isinstance(parameters, Parameters):
+            params = parameters
+        elif parameters is not None:
+            params = Parameters(parameters)
+        elif hasattr(value, "params") and isinstance(value.params, Parameters):
+            params = value.params
+        else:
+            params = Parameters()
         self._props.append((name.upper(), value, params))
 
     def add_component(self, component: Component) -> None:
@@ -826,9 +1209,27 @@ class Component:
         items = val if isinstance(val, list) else [val]
         return [str(v) for v in items]
 
+    @property
+    def DTSTAMP(self) -> Any:
+        return self.decoded("DTSTAMP")
+
+    @property
+    def CREATED(self) -> Any:
+        return self.decoded("CREATED")
+
+    @property
+    def LAST_MODIFIED(self) -> Any:
+        return self.decoded("LAST-MODIFIED")
+
     def is_empty(self) -> bool:
         self._ensure_materialized()
         return not self._props and not self._subcomponents
+
+    def is_lazy(self) -> bool:
+        return not self._materialized
+
+    def is_thunderbird(self) -> bool:
+        return "X-MOZ-LASTACK" in self or "X-MOZ-SNOOZE-TIME" in self
 
     def with_uid(self, uid: str) -> list[Component]:
         return [c for c in self.walk() if c.decoded("UID") == uid]
@@ -836,6 +1237,64 @@ class Component:
     def stamp(self) -> None:
         now = datetime.datetime.now(datetime.timezone.utc)
         self["DTSTAMP"] = now
+
+    def popitem(self, last: bool = True) -> tuple[str, Any]:
+        ks = self.keys()
+        if not ks:
+            raise KeyError("component is empty")
+        key = ks[-1] if last else ks[0]
+        return key, self.pop(key)
+
+    def move_to_end(self, key: str, last: bool = True) -> None:
+        self._ensure_materialized()
+        k_up = key.upper()
+        matched = [p for p in self._props if p[0] == k_up]
+        if not matched:
+            raise KeyError(key)
+        rest = [p for p in self._props if p[0] != k_up]
+        self._props = (rest + matched) if last else (matched + rest)
+
+    @classmethod
+    def fromkeys(cls, iterable: Iterable[str], value: Any = None) -> Component:
+        comp = cls()
+        for k in iterable:
+            comp.add(k, value)
+        return comp
+
+    def get_inline(self, name: str, default: Any = None) -> Any:
+        return self.decoded(name, default)
+
+    def set_inline(
+        self,
+        name: str,
+        value: Any,
+        parameters: Optional[dict[str, Any]] = None,
+    ) -> None:
+        self._ensure_materialized()
+        k_up = name.upper()
+        self._props = [p for p in self._props if p[0] != k_up]
+        self.add(k_up, value, parameters=parameters)
+
+    @classmethod
+    def get_component_class(cls, name: str) -> type[Component]:
+        return _COMPONENT_CLASS_MAP.get(str(name).upper(), Component)
+
+    @classmethod
+    def new(cls, **kwargs: Any) -> Component:
+        comp = cls()
+        for k, v in kwargs.items():
+            if v is not None:
+                comp.add(k.upper().replace("_", "-"), v)
+        return comp
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Component):
+            return NotImplemented
+        return (
+            self.name == other.name
+            and self.sorted_items() == other.sorted_items()
+            and self.subcomponents == other.subcomponents
+        )
 
     def content_lines(self) -> list[str]:
         return self.to_ical().decode("utf-8").splitlines()
@@ -852,11 +1311,14 @@ class Component:
     def from_ical(
         cls, st: _ox.InputData, multiple: bool = False, *, strict: bool = False
     ) -> Union[Component, list[Component]]:
-        if multiple:
-            cals = _ox.Calendar.from_ical_multiple(st, strict=strict)
-            return [_wrap_rust_component_or_cal(c) for c in cals]
-        comp = _ox.parse_component(st, strict=strict)
-        return _wrap_rust_component(comp)
+        try:
+            if multiple:
+                cals = _ox.Calendar.from_ical_multiple(st, strict=strict)
+                return [_wrap_rust_component_or_cal(c) for c in cals]
+            comp = _ox.parse_component(st, strict=strict)
+            return _wrap_rust_component(comp)
+        except ValueError as exc:
+            raise ICalParsingError(str(exc)) from exc
 
     def to_xcal(self) -> str:
         """Serialize this component into RFC 6321 xCal XML."""
@@ -933,9 +1395,12 @@ class Component:
     @classmethod
     def from_jcal(cls, jcal: Union[str, list[Any]]) -> Component:
         """Parse an RFC 7265 jCal JSON string or nested list into a Component."""
-        data = json.loads(jcal) if isinstance(jcal, str) else jcal
+        try:
+            data = json.loads(jcal) if isinstance(jcal, str) else jcal
+        except json.JSONDecodeError as exc:
+            raise JCalParsingError(str(exc)) from exc
         if not isinstance(data, list) or len(data) < 3:
-            raise ValueError("invalid jCal structure")
+            raise JCalParsingError("invalid jCal structure")
         comp_name = str(data[0]).upper()
         target_cls = _COMPONENT_CLASS_MAP.get(comp_name, cls)
         comp = target_cls()
@@ -958,6 +1423,12 @@ class Component:
         if isinstance(val, vRecur) or (key == "RRULE" and isinstance(val, dict)):
             rec = val if isinstance(val, vRecur) else vRecur(val)
             return rec.to_ical().decode("utf-8")
+        if isinstance(val, vUTCOffset):
+            for pk, pv in val.params.items():
+                params.setdefault(pk, pv)
+            return val.to_ical().decode("utf-8")
+        if isinstance(val, datetime.timedelta) and key in ("TZOFFSETFROM", "TZOFFSETTO"):
+            return _format_utc_offset(val)
         if isinstance(val, vDDDTypes):
             for pk, pv in val.params.items():
                 params.setdefault(pk, pv)
@@ -1026,6 +1497,13 @@ def _prop_to_jcal(key: str, val: Any, raw_params: dict[str, Any]) -> list[Any]:
         return [pname, params, "recur", rec_dict]
     if key == "RRULE" and isinstance(val, str):
         return _prop_to_jcal(key, vRecur.from_ical(val), raw_params)
+    if isinstance(val, vUTCOffset) or (key in ("TZOFFSETFROM", "TZOFFSETTO") and isinstance(val, datetime.timedelta)):
+        td_val = val.dt if isinstance(val, vUTCOffset) else val
+        return [pname, params, "utc-offset", _format_utc_offset(td_val, colon=True)]
+    if isinstance(val, vBinary):
+        return [pname, params, "binary", val.to_ical().decode("ascii")]
+    if isinstance(val, vPeriod):
+        return val.to_jcal(name=pname)
     if isinstance(val, datetime.datetime):
         if (
             val.tzinfo is not None
@@ -1079,6 +1557,23 @@ def _jcal_values_to_py(pname: str, jtype: str, vals: list[Any], params: dict[str
     if jtype == "time":
         parsed_t = [_parse_iso_time(str(v), params) for v in vals]
         return parsed_t[0] if len(parsed_t) == 1 else parsed_t
+    if jtype == "utc-offset":
+        parsed_off = [_parse_utc_offset(str(v)) for v in vals]
+        return parsed_off[0] if len(parsed_off) == 1 else parsed_off
+    if jtype == "duration":
+        parsed_dur = [_parse_duration_str(str(v)) for v in vals]
+        return parsed_dur[0] if len(parsed_dur) == 1 else parsed_dur
+    if jtype == "period":
+        out_p = [
+            (
+                vPeriod.from_jcal([pname, params, "period", v]).start,
+                vPeriod.from_jcal([pname, params, "period", v]).end_or_dur,
+            )
+            for v in vals
+        ]
+        return out_p[0] if len(out_p) == 1 else out_p
+    if jtype == "binary":
+        return vBinary(base64.b64decode(str(vals[0])), params=params)
     if jtype == "integer":
         return int(vals[0])
     if jtype == "float":
@@ -1292,6 +1787,38 @@ class _SpanMixin(Component):
         items = val if isinstance(val, list) else [val]
         return [v if isinstance(v, Image) else Image(v) for v in items]
 
+    @property
+    def DTSTART(self) -> Any:
+        return self.start
+
+    @property
+    def DTEND(self) -> Any:
+        return self.decoded("DTEND")
+
+    @property
+    def DUE(self) -> Any:
+        return self.decoded("DUE")
+
+    @property
+    def DURATION(self) -> Optional[datetime.timedelta]:
+        return self.duration
+
+    @property
+    def RECURRENCE_ID(self) -> Any:
+        return self.decoded("RECURRENCE-ID")
+
+    @property
+    def REQUEST_STATUS(self) -> Any:
+        return self.decoded("REQUEST-STATUS")
+
+    @property
+    def X_MOZ_LASTACK(self) -> Any:
+        return self.decoded("X-MOZ-LASTACK")
+
+    @property
+    def X_MOZ_SNOOZE_TIME(self) -> Any:
+        return self.decoded("X-MOZ-SNOOZE-TIME")
+
 
 class Event(_SpanMixin):
     name = "VEVENT"
@@ -1486,6 +2013,43 @@ class Alarm(Component):
     @property
     def acknowledged(self) -> Any:
         return self.decoded("ACKNOWLEDGED")
+
+    @property
+    def ACTION(self) -> Optional[str]:
+        return self.action
+
+    @property
+    def TRIGGER(self) -> Any:
+        return self.trigger
+
+    @property
+    def TRIGGER_RELATED(self) -> str:
+        if "TRIGGER" not in self:
+            return "START"
+        trig = self["TRIGGER"]
+        params = getattr(trig, "params", {})
+        return str(params.get("RELATED", "START")).strip().upper()
+
+    @property
+    def DURATION(self) -> Optional[datetime.timedelta]:
+        return self.duration
+
+    @property
+    def REPEAT(self) -> int:
+        return self.repeat
+
+    @property
+    def ACKNOWLEDGED(self) -> Any:
+        return self.acknowledged
+
+    Triggers = triggers
+
+    @property
+    def attendees(self) -> list[Any]:
+        val = self.get("ATTENDEE")
+        if val is None:
+            return []
+        return list(val) if isinstance(val, list) else [val]
 
     @property
     def repeat(self) -> int:
@@ -1775,11 +2339,28 @@ class Calendar(Component):
     def from_ical(
         cls, st: _ox.InputData, multiple: bool = False, *, strict: bool = False
     ) -> Union[Calendar, list[Calendar]]:
-        if multiple:
-            cals = _ox.Calendar.from_ical_multiple(st, strict=strict)
-            return [cls(_rust_cal=c) for c in cals]
-        cal = _ox.Calendar.from_ical(st, strict=strict)
-        return cls(_rust_cal=cal)
+        try:
+            if multiple:
+                cals = _ox.Calendar.from_ical_multiple(st, strict=strict)
+                return [cls(_rust_cal=c) for c in cals]
+            cal = _ox.Calendar.from_ical(st, strict=strict)
+            return cls(_rust_cal=cal)
+        except ValueError as exc:
+            raise ICalParsingError(str(exc)) from exc
+
+    @classmethod
+    def example(cls, name: str = "example") -> Calendar:
+        _ = name
+        cal = cls.new(prodid="-//icaloxide//example//EN", name="Example Calendar")
+        ev = Event.new(
+            uid="example-1@icaloxide",
+            summary="Example Event",
+            start=datetime.datetime(2026, 1, 1, 10, 0, tzinfo=datetime.timezone.utc),
+            duration=datetime.timedelta(hours=1),
+        )
+        ev.stamp()
+        cal.add_component(ev)
+        return cal
 
     @classmethod
     def from_jcal(cls, jcal: Union[str, list[Any]]) -> Calendar:
@@ -1862,6 +2443,38 @@ class Calendar(Component):
             return []
         items = val if isinstance(val, list) else [val]
         return [v if isinstance(v, Image) else Image(v) for v in items]
+
+    @property
+    def DTSTART(self) -> Any:
+        return self.start
+
+    @property
+    def DTEND(self) -> Any:
+        return self.decoded("DTEND")
+
+    @property
+    def DUE(self) -> Any:
+        return self.decoded("DUE")
+
+    @property
+    def DURATION(self) -> Optional[datetime.timedelta]:
+        return self.duration
+
+    @property
+    def RECURRENCE_ID(self) -> Any:
+        return self.decoded("RECURRENCE-ID")
+
+    @property
+    def REQUEST_STATUS(self) -> Any:
+        return self.decoded("REQUEST-STATUS")
+
+    @property
+    def X_MOZ_LASTACK(self) -> Any:
+        return self.decoded("X-MOZ-LASTACK")
+
+    @property
+    def X_MOZ_SNOOZE_TIME(self) -> Any:
+        return self.decoded("X-MOZ-SNOOZE-TIME")
 
     def cancel_occurrence(self, uid: str, recurrence_id: Any) -> Calendar:
         """Exclude a specific occurrence of ``uid`` by adding an ``EXDATE`` to its master component."""
