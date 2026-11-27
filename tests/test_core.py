@@ -2,10 +2,8 @@ import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import pytest
-
 import icaloxide
-
+import pytest
 
 SAMPLE_ICS = (
     b"BEGIN:VCALENDAR\r\n"

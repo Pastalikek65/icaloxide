@@ -367,6 +367,7 @@ pub struct AfterIter {
 struct HeapEntry {
     occ: Occurrence,
     source: HeapSource,
+    is_master: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -447,6 +448,7 @@ impl AfterIter {
                 self.heap.push(Reverse(HeapEntry {
                     occ: first,
                     source: HeapSource::Series(s_idx),
+                    is_master: true,
                 }));
             }
             self.series_streams.push(stream);
@@ -467,6 +469,7 @@ impl AfterIter {
                 self.heap.push(Reverse(HeapEntry {
                     occ: occ.clone(),
                     source: HeapSource::Single,
+                    is_master: false,
                 }));
                 break;
             }
@@ -499,6 +502,7 @@ impl AfterIter {
                         parent_id: None,
                     },
                     source: HeapSource::Series(series_idx),
+                    is_master: false,
                 }));
             }
         }
@@ -571,12 +575,16 @@ impl AfterIter {
             let (occ, from_master) = match (best_rule, best_static) {
                 (None, None) => return Ok(None),
                 (Some((i, _, _)), None) => (stream.rule_cursors[i].next_occ.take().unwrap(), true),
-                (None, Some(_)) => (stream.static_items.pop().unwrap().0.occ, false),
+                (None, Some(_)) => {
+                    let item = stream.static_items.pop().unwrap().0;
+                    (item.occ, item.is_master)
+                }
                 (Some((i, rs, re)), Some(st)) => {
                     if (rs, re) < (st.occ.start_utc, st.occ.end_utc) {
                         (stream.rule_cursors[i].next_occ.take().unwrap(), true)
                     } else {
-                        (stream.static_items.pop().unwrap().0.occ, false)
+                        let item = stream.static_items.pop().unwrap().0;
+                        (item.occ, item.is_master)
                     }
                 }
             };
@@ -618,6 +626,7 @@ impl Iterator for AfterIter {
                     Ok(Some(occ)) => self.heap.push(Reverse(HeapEntry {
                         occ,
                         source: HeapSource::Series(s_idx),
+                        is_master: true,
                     })),
                     Ok(None) => {}
                     Err(e) => return Some(Err(e)),
@@ -833,13 +842,12 @@ fn push_master_statics(
                     parent_id: None,
                 },
                 source: HeapSource::Series(series_idx),
+                is_master: true,
             }));
         }
     };
 
-    if master.rrules.is_empty() {
-        try_push(&master.start_local);
-    }
+    try_push(&master.start_local);
     for rdt in &master.rdates {
         try_push(rdt);
     }

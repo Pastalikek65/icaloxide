@@ -165,6 +165,11 @@ impl Calendar {
         parse_calendar_with_options(input, options)
     }
 
+    /// Parse raw iCalendar bytes containing one or more sequential `VCALENDAR` components.
+    pub fn parse_all(input: &[u8], options: &ParseOptions) -> Result<Vec<Self>, ParseError> {
+        crate::parser::parse_all_calendars_with_options(input, options)
+    }
+
     /// Root `VCALENDAR` component ID.
     #[inline]
     pub const fn root_id(&self) -> ComponentId {

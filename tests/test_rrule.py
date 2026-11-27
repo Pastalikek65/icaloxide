@@ -4,7 +4,6 @@ from zoneinfo import ZoneInfo
 
 import icaloxide
 
-
 RRULE_ICS = (
     "BEGIN:VCALENDAR\r\n"
     "VERSION:2.0\r\n"

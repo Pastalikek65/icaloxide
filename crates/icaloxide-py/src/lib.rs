@@ -579,7 +579,9 @@ impl PyOccurrence {
         if pname == PropertyName::DtStart {
             return Ok(self.start(py)?.unbind());
         }
-        if pname == PropertyName::DtEnd {
+        if (self.occ.kind == ComponentKind::VTodo && pname == PropertyName::Due)
+            || (self.occ.kind != ComponentKind::VTodo && pname == PropertyName::DtEnd)
+        {
             return Ok(self.end(py)?.unbind());
         }
         let comp = self.comp()?;
@@ -594,7 +596,9 @@ impl PyOccurrence {
         if pname == PropertyName::DtStart {
             return Ok(self.start(py)?.unbind());
         }
-        if pname == PropertyName::DtEnd {
+        if (self.occ.kind == ComponentKind::VTodo && pname == PropertyName::Due)
+            || (self.occ.kind != ComponentKind::VTodo && pname == PropertyName::DtEnd)
+        {
             return Ok(self.end(py)?.unbind());
         }
         let comp = self.comp()?;
@@ -606,10 +610,66 @@ impl PyOccurrence {
 
     fn __contains__(&self, key: &str) -> PyResult<bool> {
         let pname = PropertyName::parse(key);
-        if matches!(pname, PropertyName::DtStart | PropertyName::DtEnd) {
+        if pname == PropertyName::DtStart
+            || (self.occ.kind == ComponentKind::VTodo && pname == PropertyName::Due)
+            || (self.occ.kind != ComponentKind::VTodo && pname == PropertyName::DtEnd)
+        {
             return Ok(true);
         }
         Ok(self.comp()?.property(&pname).is_some())
+    }
+
+    /// Serialize this occurrence's component with occurrence-adjusted `DTSTART` / `DTEND` (or `DUE`).
+    fn to_ical<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let comp = self.comp()?;
+        let mut temp_cal = CoreCalendar::new();
+        let copy_id = temp_cal.add_component(comp.kind().clone());
+        let end_prop_name = if self.occ.kind == ComponentKind::VTodo {
+            PropertyName::Due
+        } else {
+            PropertyName::DtEnd
+        };
+        if let Some(mut dst) = temp_cal.component_mut(copy_id) {
+            for prop in comp.properties() {
+                if matches!(
+                    prop.name,
+                    PropertyName::DtStart
+                        | PropertyName::DtEnd
+                        | PropertyName::Due
+                        | PropertyName::Duration
+                        | PropertyName::RRule
+                        | PropertyName::RDate
+                        | PropertyName::ExDate
+                        | PropertyName::RecurrenceId
+                ) {
+                    continue;
+                }
+                dst.add_property(prop.clone());
+            }
+            if self.occ.is_all_day {
+                dst.add_property(icaloxide_core::Property::new(
+                    PropertyName::DtStart,
+                    PropertyValue::Date(self.occ.start_local.date),
+                ));
+                dst.add_property(icaloxide_core::Property::new(
+                    end_prop_name,
+                    PropertyValue::Date(self.occ.end_local.date),
+                ));
+            } else {
+                dst.add_property(icaloxide_core::Property::new(
+                    PropertyName::DtStart,
+                    PropertyValue::DateTime(self.occ.start_local.clone()),
+                ));
+                dst.add_property(icaloxide_core::Property::new(
+                    end_prop_name,
+                    PropertyValue::DateTime(self.occ.end_local.clone()),
+                ));
+            }
+        }
+        let serialized = temp_cal
+            .component_to_ical(copy_id)
+            .ok_or_else(|| PyKeyError::new_err("failed to serialize occurrence"))?;
+        Ok(PyBytes::new(py, serialized.as_bytes()))
     }
 
     fn __repr__(&self) -> String {
@@ -787,6 +847,43 @@ impl PyCalendar {
             inner: Arc::new(cal),
             tz_registry: Arc::new(OnceLock::new()),
         })
+    }
+
+    #[classmethod]
+    #[pyo3(signature = (data, *, strict=false))]
+    fn from_ical_multiple(
+        _cls: &Bound<'_, pyo3::types::PyType>,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        strict: bool,
+    ) -> PyResult<Vec<Self>> {
+        let source = extract_input_source(py, data)?;
+        let opts = if strict {
+            ParseOptions::strict()
+        } else {
+            ParseOptions::lenient()
+        };
+
+        let cals = py.allow_threads(|| -> PyResult<Vec<CoreCalendar>> {
+            match source {
+                InputSource::Bytes(bytes) => {
+                    CoreCalendar::parse_all(&bytes, &opts).map_err(|e| parse_err_to_py(&e))
+                }
+                InputSource::Path(path) => {
+                    let bytes = std::fs::read(&path)
+                        .map_err(|e| PyOSError::new_err(format!("{}: {e}", path.display())))?;
+                    CoreCalendar::parse_all(&bytes, &opts).map_err(|e| parse_err_to_py(&e))
+                }
+            }
+        })?;
+
+        Ok(cals
+            .into_iter()
+            .map(|cal| Self {
+                inner: Arc::new(cal),
+                tz_registry: Arc::new(OnceLock::new()),
+            })
+            .collect())
     }
 
     #[classmethod]

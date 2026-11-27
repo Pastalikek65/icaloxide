@@ -11,6 +11,8 @@ use crate::model::{
 
 struct ParserState<'a> {
     options: &'a ParseOptions,
+    allow_multiple: bool,
+    completed: Vec<Calendar>,
     arena: ComponentArena,
     stack: Vec<(ComponentId, ComponentKind)>,
     root: Option<ComponentId>,
@@ -18,9 +20,11 @@ struct ParserState<'a> {
 }
 
 impl<'a> ParserState<'a> {
-    fn new(options: &'a ParseOptions) -> Self {
+    fn new(options: &'a ParseOptions, allow_multiple: bool) -> Self {
         Self {
             options,
+            allow_multiple,
+            completed: Vec::new(),
             arena: ComponentArena::new(),
             stack: Vec::with_capacity(4),
             root: None,
@@ -68,21 +72,32 @@ impl<'a> ParserState<'a> {
 
         let kind = ComponentKind::parse(comp_name);
         if self.stack.is_empty() {
-            if self.root.is_some() {
-                if self.options.mode == ParseMode::Strict {
-                    return Err(ParseError::new(
+            if let Some(prev_root) = self.root.take() {
+                if self.allow_multiple {
+                    let prev_arena = std::mem::take(&mut self.arena);
+                    let prev_warnings = std::mem::take(&mut self.warnings);
+                    self.completed.push(Calendar {
+                        arena: prev_arena,
+                        root: prev_root,
+                        warnings: prev_warnings,
+                    });
+                } else {
+                    self.root = Some(prev_root);
+                    if self.options.mode == ParseMode::Strict {
+                        return Err(ParseError::new(
+                            line_num,
+                            1,
+                            ParseErrorKind::MalformedContentLine(
+                                "multiple root components in single calendar parse",
+                            ),
+                        ));
+                    }
+                    self.warn(
                         line_num,
-                        1,
-                        ParseErrorKind::MalformedContentLine(
-                            "multiple root components in single calendar parse",
-                        ),
-                    ));
+                        CompactString::const_new("ignored trailing root component after VCALENDAR"),
+                    );
+                    return Ok(false);
                 }
-                self.warn(
-                    line_num,
-                    CompactString::const_new("ignored trailing root component after VCALENDAR"),
-                );
-                return Ok(false);
             }
             if kind != ComponentKind::VCalendar {
                 return Err(ParseError::new(
@@ -245,7 +260,7 @@ impl<'a> ParserState<'a> {
         Ok(())
     }
 
-    fn finish(mut self) -> Result<Calendar, ParseError> {
+    fn finish_all(mut self) -> Result<Vec<Calendar>, ParseError> {
         if !self.stack.is_empty() {
             match self.options.mode {
                 ParseMode::Strict => {
@@ -274,25 +289,46 @@ impl<'a> ParserState<'a> {
             }
         }
 
-        let Some(root_id) = self.root else {
-            return Err(ParseError::new(1, 1, ParseErrorKind::EmptyCalendar));
-        };
+        if let Some(root_id) = self.root {
+            self.completed.push(Calendar {
+                arena: self.arena,
+                root: root_id,
+                warnings: self.warnings,
+            });
+        }
 
-        Ok(Calendar {
-            arena: self.arena,
-            root: root_id,
-            warnings: self.warnings,
-        })
+        if self.completed.is_empty() {
+            return Err(ParseError::new(1, 1, ParseErrorKind::EmptyCalendar));
+        }
+
+        Ok(self.completed)
     }
 }
 
-/// Parse a raw iCalendar byte stream into a [`Calendar`] according to [`ParseOptions`].
+/// Parse a raw iCalendar byte stream into a single [`Calendar`] according to [`ParseOptions`].
 pub fn parse_calendar_with_options(
     input: &[u8],
     options: &ParseOptions,
 ) -> Result<Calendar, ParseError> {
+    let mut cals = parse_internal(input, options, false)?;
+    Ok(cals.pop().expect("at least one calendar"))
+}
+
+/// Parse a raw iCalendar byte stream containing one or more sequential `VCALENDAR` blocks.
+pub fn parse_all_calendars_with_options(
+    input: &[u8],
+    options: &ParseOptions,
+) -> Result<Vec<Calendar>, ParseError> {
+    parse_internal(input, options, true)
+}
+
+fn parse_internal(
+    input: &[u8],
+    options: &ParseOptions,
+    allow_multiple: bool,
+) -> Result<Vec<Calendar>, ParseError> {
     let mut unfolder = UnfoldIter::new(input, options.mode, options.max_line_bytes);
-    let mut state = ParserState::new(options);
+    let mut state = ParserState::new(options, allow_multiple);
 
     while let Some(line_res) = unfolder.next_line(&mut state.warnings, options.collect_warnings) {
         let logical_line = line_res?;
@@ -323,5 +359,5 @@ pub fn parse_calendar_with_options(
         }
     }
 
-    state.finish()
+    state.finish_all()
 }

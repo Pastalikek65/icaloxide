@@ -451,9 +451,7 @@ fn expand_master_window(
         }
     };
 
-    if master.rrules.is_empty() {
-        emit_candidate(&master.start_local);
-    }
+    emit_candidate(&master.start_local);
 
     let dtstart_ldt = LocalDateTime::new(master.start_local.date, master.start_local.time);
     for rule in &master.rrules {
