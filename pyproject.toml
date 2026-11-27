@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "icaloxide"
-version = "0.3.1"
+version = "0.4.0"
 description = "Blazing-fast, low-memory iCalendar (RFC 5545/7986/9073/7953) parser, writer, and recurring event engine written in Rust for Python."
 readme = "README.md"
 requires-python = ">=3.9"

@@ -201,6 +201,18 @@ fn utc_offset_to_py(py: Python<'_>, offset: UtcOffset) -> PyResult<Bound<'_, PyA
     types.timedelta_cls.bind(py).call1((days, secs))
 }
 
+fn prop_params_to_py_dict<'py>(
+    py: Python<'py>,
+    params: &[Parameter],
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    for param in params {
+        let vals = PyList::new(py, param.values.iter().map(CompactString::as_str))?;
+        dict.set_item(param.name.as_str(), vals)?;
+    }
+    Ok(dict)
+}
+
 fn property_value_to_py<'py>(
     py: Python<'py>,
     registry: &TzRegistry,
@@ -519,14 +531,43 @@ impl PyComponent {
     fn params<'py>(&self, py: Python<'py>, key: &str) -> PyResult<Bound<'py, PyDict>> {
         let comp = self.node_ref()?;
         let pname = PropertyName::parse(key);
-        let dict = PyDict::new(py);
-        if let Some(prop) = comp.property(&pname) {
-            for param in &prop.params {
-                let vals = PyList::new(py, param.values.iter().map(CompactString::as_str))?;
-                dict.set_item(param.name.as_str(), vals)?;
-            }
+        match comp.property(&pname) {
+            Some(prop) => prop_params_to_py_dict(py, &prop.params),
+            None => Ok(PyDict::new(py)),
         }
-        Ok(dict)
+    }
+
+    fn raw_properties<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Vec<(String, PyObject, Bound<'py, PyDict>)>> {
+        let comp = self.node_ref()?;
+        let reg = self.registry();
+        comp.properties()
+            .iter()
+            .map(|prop| {
+                let val = property_value_to_py(py, reg, &prop.value)?.unbind();
+                let params = prop_params_to_py_dict(py, &prop.params)?;
+                Ok((prop.name.as_str().to_owned(), val, params))
+            })
+            .collect()
+    }
+
+    fn get_all_with_params<'py>(
+        &self,
+        py: Python<'py>,
+        key: &str,
+    ) -> PyResult<Vec<(PyObject, Bound<'py, PyDict>)>> {
+        let comp = self.node_ref()?;
+        let pname = PropertyName::parse(key);
+        let reg = self.registry();
+        comp.properties_named(&pname)
+            .map(|prop| {
+                let val = property_value_to_py(py, reg, &prop.value)?.unbind();
+                let params = prop_params_to_py_dict(py, &prop.params)?;
+                Ok((val, params))
+            })
+            .collect()
     }
 
     fn property_names(&self) -> PyResult<Vec<String>> {
@@ -950,9 +991,17 @@ impl PyCalendarQuery {
             .collect())
     }
 
-    #[pyo3(signature = (dt, *, limit=None))]
-    fn after(&self, dt: &Bound<'_, PyAny>, limit: Option<usize>) -> PyResult<PyOccurrenceIterator> {
-        let earliest_utc = py_time_bound_to_utc(dt, self.query.default_timezone(), false)?;
+    #[pyo3(signature = (dt=None, *, limit=None))]
+    fn after(
+        &self,
+        dt: Option<&Bound<'_, PyAny>>,
+        limit: Option<usize>,
+    ) -> PyResult<PyOccurrenceIterator> {
+        let earliest_utc = if let Some(bound) = dt {
+            py_time_bound_to_utc(bound, self.query.default_timezone(), false)?
+        } else {
+            self.query.min_start_floor()
+        };
         Ok(PyOccurrenceIterator {
             cal: Arc::clone(&self.cal),
             tz_registry: Arc::clone(&self.tz_registry),
@@ -974,7 +1023,7 @@ impl PyCalendarQuery {
         let anchor_utc = if let Some(dt) = earliest_end {
             py_time_bound_to_utc(dt, self.query.default_timezone(), false)?
         } else {
-            i64::from(CalDate::new(1900, 1, 1).unwrap().to_days_since_epoch()) * 86_400
+            self.query.min_start_floor()
         };
         let latest_start_utc = match latest_start {
             Some(dt) => Some(py_time_bound_to_utc(
@@ -1370,6 +1419,15 @@ impl PyCalendar {
     }
 
     #[getter]
+    fn root(&self) -> PyComponent {
+        PyComponent {
+            cal: Arc::clone(&self.inner),
+            tz_registry: Arc::clone(&self.tz_registry),
+            id: self.inner.root_id(),
+        }
+    }
+
+    #[getter]
     fn events(&self) -> Vec<PyComponent> {
         self.collect_kind(ComponentKind::VEvent)
     }
@@ -1447,10 +1505,19 @@ impl PyCalendar {
     }
 }
 
+fn temporal_to_property(name: PropertyName, val: PyInputTemporal) -> Property {
+    match val {
+        PyInputTemporal::Date(d) => Property::new(name, PropertyValue::Date(d))
+            .with_param(Parameter::new(ParamName::Value, "DATE")),
+        PyInputTemporal::DateTime(dt) => Property::new(name, PropertyValue::DateTime(dt)),
+    }
+}
+
 /// Mutable Rust-backed builder for constructing high-performance calendars without Python dict overhead.
 #[pyclass(name = "CalendarBuilder")]
 pub struct PyCalendarBuilder {
     cal: CoreCalendar,
+    last_component: Option<ComponentId>,
 }
 
 #[pymethods]
@@ -1471,7 +1538,17 @@ impl PyCalendarBuilder {
                 PropertyValue::Text(CompactString::from(cal_name)),
             ));
         }
-        Self { cal }
+        Self {
+            cal,
+            last_component: None,
+        }
+    }
+
+    fn set_property(&mut self, name: &str, value: &str) {
+        self.cal.root_mut().set_property(Property::new(
+            PropertyName::parse(name),
+            PropertyValue::Text(CompactString::from(value)),
+        ));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1509,27 +1586,9 @@ impl PyCalendarBuilder {
                 PropertyName::Summary,
                 PropertyValue::Text(CompactString::from(summary)),
             ));
-            match start_val {
-                PyInputTemporal::Date(d) => ev.add_property(
-                    Property::new(PropertyName::DtStart, PropertyValue::Date(d))
-                        .with_param(Parameter::new(ParamName::Value, "DATE")),
-                ),
-                PyInputTemporal::DateTime(dt) => ev.add_property(Property::new(
-                    PropertyName::DtStart,
-                    PropertyValue::DateTime(dt),
-                )),
-            }
+            ev.add_property(temporal_to_property(PropertyName::DtStart, start_val));
             if let Some(ev_end) = end_val {
-                match ev_end {
-                    PyInputTemporal::Date(d) => ev.add_property(
-                        Property::new(PropertyName::DtEnd, PropertyValue::Date(d))
-                            .with_param(Parameter::new(ParamName::Value, "DATE")),
-                    ),
-                    PyInputTemporal::DateTime(dt) => ev.add_property(Property::new(
-                        PropertyName::DtEnd,
-                        PropertyValue::DateTime(dt),
-                    )),
-                }
+                ev.add_property(temporal_to_property(PropertyName::DtEnd, ev_end));
             }
             if let Some(dur) = dur_val {
                 ev.add_property(Property::new(
@@ -1562,6 +1621,7 @@ impl PyCalendarBuilder {
                 ));
             }
         }
+        self.last_component = Some(comp_id);
         Ok(())
     }
 
@@ -1595,33 +1655,134 @@ impl PyCalendarBuilder {
                 PropertyValue::Text(CompactString::from(summary)),
             ));
             if let Some(sv) = start_val {
-                match sv {
-                    PyInputTemporal::Date(d) => td.add_property(
-                        Property::new(PropertyName::DtStart, PropertyValue::Date(d))
-                            .with_param(Parameter::new(ParamName::Value, "DATE")),
-                    ),
-                    PyInputTemporal::DateTime(dt) => td.add_property(Property::new(
-                        PropertyName::DtStart,
-                        PropertyValue::DateTime(dt),
-                    )),
-                }
+                td.add_property(temporal_to_property(PropertyName::DtStart, sv));
             }
             if let Some(dv) = due_val {
-                match dv {
-                    PyInputTemporal::Date(d) => td.add_property(
-                        Property::new(PropertyName::Due, PropertyValue::Date(d))
-                            .with_param(Parameter::new(ParamName::Value, "DATE")),
-                    ),
-                    PyInputTemporal::DateTime(dt) => td.add_property(Property::new(
-                        PropertyName::Due,
-                        PropertyValue::DateTime(dt),
-                    )),
-                }
+                td.add_property(temporal_to_property(PropertyName::Due, dv));
             }
             if let Some(st) = status {
                 td.add_property(Property::new(
                     PropertyName::Status,
                     PropertyValue::Text(CompactString::from(st)),
+                ));
+            }
+        }
+        self.last_component = Some(comp_id);
+        Ok(())
+    }
+
+    #[pyo3(signature = (*, uid, summary, start=None, tzid=None, description=None))]
+    fn add_journal(
+        &mut self,
+        uid: &str,
+        summary: &str,
+        start: Option<&Bound<'_, PyAny>>,
+        tzid: Option<&str>,
+        description: Option<&str>,
+    ) -> PyResult<()> {
+        let comp_id = self.cal.add_component(ComponentKind::VJournal);
+        let start_val = match start {
+            Some(s) => Some(py_to_temporal(s, tzid)?),
+            None => None,
+        };
+        if let Some(mut jn) = self.cal.component_mut(comp_id) {
+            jn.add_property(Property::new(
+                PropertyName::Uid,
+                PropertyValue::Text(CompactString::from(uid)),
+            ));
+            jn.add_property(Property::new(
+                PropertyName::Summary,
+                PropertyValue::Text(CompactString::from(summary)),
+            ));
+            if let Some(sv) = start_val {
+                jn.add_property(temporal_to_property(PropertyName::DtStart, sv));
+            }
+            if let Some(desc) = description {
+                jn.add_property(Property::new(
+                    PropertyName::Description,
+                    PropertyValue::Text(CompactString::from(desc)),
+                ));
+            }
+        }
+        self.last_component = Some(comp_id);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (*, trigger, action="DISPLAY", description=None, summary=None, duration=None, repeat=None, parent_uid=None))]
+    fn add_alarm(
+        &mut self,
+        trigger: &Bound<'_, PyAny>,
+        action: &str,
+        description: Option<&str>,
+        summary: Option<&str>,
+        duration: Option<&Bound<'_, PyAny>>,
+        repeat: Option<i64>,
+        parent_uid: Option<&str>,
+    ) -> PyResult<()> {
+        let target_id = if let Some(uid) = parent_uid {
+            self.cal
+                .components_with_uid(uid)
+                .into_iter()
+                .next()
+                .ok_or_else(|| PyKeyError::new_err(format!("no component with uid {uid:?}")))?
+        } else {
+            self.last_component
+                .ok_or_else(|| PyValueError::new_err("no parent component added yet"))?
+        };
+
+        let trigger_prop = if trigger.hasattr("total_seconds")? {
+            let dur = py_duration_to_cal(trigger)?;
+            Property::new(PropertyName::Trigger, PropertyValue::Duration(dur))
+        } else {
+            match py_to_temporal(trigger, None)? {
+                PyInputTemporal::DateTime(dt) => {
+                    Property::new(PropertyName::Trigger, PropertyValue::DateTime(dt))
+                        .with_param(Parameter::new(ParamName::Value, "DATE-TIME"))
+                }
+                PyInputTemporal::Date(d) => {
+                    Property::new(PropertyName::Trigger, PropertyValue::Date(d))
+                        .with_param(Parameter::new(ParamName::Value, "DATE"))
+                }
+            }
+        };
+        let dur_val = match duration {
+            Some(d) => Some(py_duration_to_cal(d)?),
+            None => None,
+        };
+
+        let alarm_id = self
+            .cal
+            .add_child_component(target_id, ComponentKind::VAlarm)
+            .ok_or_else(|| PyKeyError::new_err("invalid parent component"))?;
+        if let Some(mut al) = self.cal.component_mut(alarm_id) {
+            al.add_property(Property::new(
+                PropertyName::Action,
+                PropertyValue::Text(CompactString::from(action)),
+            ));
+            al.add_property(trigger_prop);
+            if let Some(desc) = description {
+                al.add_property(Property::new(
+                    PropertyName::Description,
+                    PropertyValue::Text(CompactString::from(desc)),
+                ));
+            }
+            if let Some(sum) = summary {
+                al.add_property(Property::new(
+                    PropertyName::Summary,
+                    PropertyValue::Text(CompactString::from(sum)),
+                ));
+            }
+            if let Some(dur) = dur_val {
+                al.add_property(Property::new(
+                    PropertyName::Duration,
+                    PropertyValue::Duration(dur),
+                ));
+            }
+            if let Some(rep) = repeat {
+                al.add_property(Property::new(
+                    PropertyName::Repeat,
+                    PropertyValue::Integer(rep),
                 ));
             }
         }

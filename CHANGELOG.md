@@ -5,6 +5,22 @@ All notable changes to `icaloxide` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-11-27
+
+### Fixed & Added
+
+- **Root-Cause `icaloxide.compat` Materialization & Live Mutations (`icaloxide.compat`)**:
+  - Eliminated $N^2$ duplication and per-instance parameter clobbering on multi-valued properties (`ATTENDEE`, `EXDATE`, `RDATE`, etc.) by adding `Component.raw_properties()` and `Component.get_all_with_params()` in `icaloxide-py`.
+  - Added live `_parent` backlinks, cached `_children_cache`, and `_mark_dirty()` propagation plus `Parameters` mutation callbacks so in-place edits on child components (`cal.events[0]["SUMMARY"] = ...`) and `.params` (`ev["ATTENDEE"].params["CN"] = ...`) persist cleanly through `cal.to_ical()`.
+  - Preserved all root `VCALENDAR` properties (`METHOD`, `CALSCALE`, `COLOR`, `X-*`) during lazy materialization via `Calendar.root`.
+  - Wrapped parsed text/URI/CalAddress properties as `vText`, `vCalAddress`, and `vUri` so `.params` matches `icalendar 7.3.2`.
+- **Cross-Timezone `DTEND`, `UNTIL < DTSTART`, and Unbounded `all()` / `paginate()` (`icaloxide-rrule`, `icaloxide-py`)**:
+  - Preserved distinct `DTEND` `TZID`s (e.g., JFK → IST flights) on `Occurrence.end_local` instead of overwriting with `DTSTART`'s timezone.
+  - Emitted 0 occurrences when `RRULE` `UNTIL < DTSTART` (matching RFC 5545 and `recurring-ical-events`).
+  - Removed the `1900..2100` cap from finite `CalendarQuery.all()`, argless `after()`, and `paginate()` defaults using `min_start_floor()` and `bounded_extents()`.
+- **Extended Rust `CalendarBuilder`**: Added `set_property()`, `add_journal()`, and `add_alarm()`.
+- **Verification**: Added `tests/test_red_team_v04.py` covering all red-team regressions and real-world client payloads (Google Calendar, Outlook/Exchange, Apple Calendar, Mozilla Thunderbird, Lotus Notes).
+
 ## [0.3.1] - 2026-11-27
 
 ### Fixed & Added

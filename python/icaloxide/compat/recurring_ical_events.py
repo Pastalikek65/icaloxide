@@ -508,12 +508,12 @@ class UnfoldableCalendar:
     ) -> Pages:
         if next_page_id:
             cs, _, _, _ = _decode_cursor(next_page_id)
-            anchor = cs
+            anchor: Any = cs
         elif earliest_end is not None:
             anchor = _to_point(earliest_end)
         else:
-            anchor = datetime.date(1900, 1, 1)
-        q = self._query_for(anchor)
+            anchor = None
+        q = self._query_for(anchor) if anchor is not None else self._query
         return Pages(
             q.after(anchor),
             page_size,

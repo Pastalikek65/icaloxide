@@ -156,23 +156,54 @@ def _unescape_ical_text(raw: str) -> str:
     )
 
 
+def _flatten_params(params: Optional[dict[str, Any]]) -> dict[str, Any]:
+    if not params:
+        return {}
+    out: dict[str, Any] = {}
+    for k, v in params.items():
+        k_up = str(k).upper()
+        if isinstance(v, (list, tuple)) and len(v) == 1:
+            out[k_up] = v[0]
+        else:
+            out[k_up] = v
+    return out
+
+
+def _ensure_parameters(params: Optional[dict[str, Any]]) -> Parameters:
+    if isinstance(params, Parameters):
+        return params
+    return Parameters(_flatten_params(params)) if params else Parameters()
+
+
 class Parameters(dict):  # type: ignore[type-arg]
     """Case-insensitive parameter mapping matching ``icalendar.Parameters``."""
 
     always_quoted = ("ALTREP", "CN", "DIR", "SENT-BY", "MEMBER", "DELEGATED-FROM", "DELEGATED-TO")
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, _on_mutate: Any = None, **kwargs: Any) -> None:
         super().__init__()
         self.quote_also: list[str] = []
+        self._on_mutate: Any = None
         data = dict(*args, **kwargs)
         for k, v in data.items():
-            self[k] = v
+            dict.__setitem__(self, str(k).upper(), v)
+        self._on_mutate = _on_mutate
+
+    def _notify_mutate(self) -> None:
+        if self._on_mutate is not None:
+            self._on_mutate()
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> Parameters:
+        cloned = Parameters({k: copy.deepcopy(v, memo) for k, v in self.items()})
+        cloned.quote_also = list(self.quote_also)
+        return cloned
 
     @property
     def params(self) -> Parameters:
         return self
 
     def move_to_end(self, key: str, last: bool = True) -> None:
+        self._notify_mutate()
         k_up = str(key).upper()
         if k_up not in self:
             raise KeyError(key)
@@ -181,7 +212,7 @@ class Parameters(dict):  # type: ignore[type-arg]
             dict.__setitem__(self, k_up, val)
         else:
             items = list(self.items())
-            self.clear()
+            dict.clear(self)
             dict.__setitem__(self, k_up, val)
             for ok, ov in items:
                 dict.__setitem__(self, ok, ov)
@@ -203,7 +234,37 @@ class Parameters(dict):  # type: ignore[type-arg]
         return cls()
 
     def __setitem__(self, key: str, value: Any) -> None:
+        self._notify_mutate()
         super().__setitem__(str(key).upper(), value)
+
+    def __delitem__(self, key: str) -> None:
+        self._notify_mutate()
+        super().__delitem__(str(key).upper())
+
+    def pop(self, key: str, *args: Any) -> Any:
+        self._notify_mutate()
+        return super().pop(str(key).upper(), *args)
+
+    def popitem(self) -> tuple[str, Any]:
+        self._notify_mutate()
+        return super().popitem()
+
+    def clear(self) -> None:
+        self._notify_mutate()
+        super().clear()
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        self._notify_mutate()
+        data = dict(*args, **kwargs)
+        for k, v in data.items():
+            dict.__setitem__(self, str(k).upper(), v)
+
+    def setdefault(self, key: str, default: Any = None) -> Any:
+        k_up = str(key).upper()
+        if k_up in self:
+            return self[k_up]
+        self._notify_mutate()
+        return super().setdefault(k_up, default)
 
     def __getitem__(self, key: str) -> Any:
         return super().__getitem__(str(key).upper())
@@ -286,10 +347,7 @@ class vDDDTypes:
         params: Optional[dict[str, Any]] = None,
     ) -> None:
         self.dt = dt
-        if isinstance(params, Parameters):
-            self.params = params
-        else:
-            self.params = Parameters(params) if params else Parameters()
+        self.params = _ensure_parameters(params)
 
     def to_ical(self) -> bytes:
         local_params = dict(self.params)
@@ -350,7 +408,7 @@ class vText(str):
 
     def __new__(cls, value: Any, params: Optional[dict[str, Any]] = None) -> vText:
         obj = super().__new__(cls, str(value))
-        obj.params = Parameters(params) if params else Parameters()
+        obj.params = _ensure_parameters(params)
         return obj
 
     def to_ical(self) -> bytes:
@@ -383,7 +441,7 @@ class vRecur(dict):  # type: ignore[type-arg]
         **kwargs: Any,
     ) -> None:
         super().__init__()
-        self.params = Parameters(params) if params else Parameters()
+        self.params = _ensure_parameters(params)
         data = dict(*args, **kwargs)
         for k, v in data.items():
             self[k] = v
@@ -406,9 +464,13 @@ class vRecur(dict):  # type: ignore[type-arg]
         super().__setitem__(key_up, normalized)
 
     @classmethod
-    def from_ical(cls, raw: Union[str, bytes]) -> vRecur:
+    def from_ical(
+        cls,
+        raw: Union[str, bytes],
+        params: Optional[dict[str, Any]] = None,
+    ) -> vRecur:
         text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
-        rec = cls()
+        rec = cls(params=params)
         for part in text.strip().split(";"):
             if not part or "=" not in part:
                 continue
@@ -475,7 +537,7 @@ class vGeo:
     def __init__(self, geo: tuple[float, float], params: Optional[dict[str, Any]] = None) -> None:
         self.latitude = float(geo[0])
         self.longitude = float(geo[1])
-        self.params = Parameters(params) if params else Parameters()
+        self.params = _ensure_parameters(params)
 
     def to_ical(self) -> bytes:
         return f"{self.latitude};{self.longitude}".encode("utf-8")
@@ -540,7 +602,7 @@ class vInt(int):
 
     def __new__(cls, val: Any, params: Optional[dict[str, Any]] = None) -> vInt:
         obj = super().__new__(cls, int(val))
-        obj.params = Parameters(params) if params else Parameters()
+        obj.params = _ensure_parameters(params)
         return obj
 
     def to_ical(self) -> bytes:
@@ -565,7 +627,7 @@ class vFloat(float):
 
     def __new__(cls, val: Any, params: Optional[dict[str, Any]] = None) -> vFloat:
         obj = super().__new__(cls, float(val))
-        obj.params = Parameters(params) if params else Parameters()
+        obj.params = _ensure_parameters(params)
         return obj
 
     def to_ical(self) -> bytes:
@@ -613,7 +675,7 @@ class vPeriod:
     ) -> None:
         self.start = per[0]
         self.end_or_dur = per[1]
-        self.params = Parameters(params) if params else Parameters()
+        self.params = _ensure_parameters(params)
 
     def to_ical(self) -> bytes:
         s = _format_temporal(self.start, {})
@@ -773,8 +835,8 @@ class vDDDLists:
         dt_list: Iterable[Any],
         params: Optional[dict[str, Any]] = None,
     ) -> None:
-        self.params = Parameters(params) if params else Parameters()
-        self.dts = [x if isinstance(x, vDDDTypes) else vDDDTypes(x, params) for x in dt_list]
+        self.params = _ensure_parameters(params)
+        self.dts = [x if isinstance(x, vDDDTypes) else vDDDTypes(x, self.params) for x in dt_list]
 
     def to_ical(self) -> bytes:
         return b",".join(d.to_ical() for d in self.dts)
@@ -867,6 +929,8 @@ _TEMPORAL_KEYS = frozenset(
         "EXDATE",
     }
 )
+_CAL_ADDRESS_KEYS = frozenset({"ATTENDEE", "ORGANIZER"})
+_URI_KEYS = frozenset({"URL", "ATTACH", "TZURL", "SOURCE", "IMAGE", "CONFERENCE", "LINK"})
 
 
 class Component:
@@ -888,11 +952,14 @@ class Component:
         _rust_comp: Optional[Union[_ox.Component, _ox.Occurrence]] = None,
         _rust_cal: Optional[_ox.Calendar] = None,
         _keep_recurrence: bool = False,
+        _parent: Optional[Component] = None,
     ) -> None:
         self._rust_comp = _rust_comp
         self._rust_cal = _rust_cal
         self._keep_recurrence = _keep_recurrence
-        self._props: list[tuple[str, Any, dict[str, Any]]] = []
+        self._parent = _parent
+        self._children_cache: Optional[list[Component]] = None
+        self._props: list[tuple[str, Any, Parameters]] = []
         self._subcomponents: list[Component] = []
         self._materialized = _rust_comp is None and _rust_cal is None
         if _rust_comp is not None:
@@ -900,90 +967,175 @@ class Component:
         elif _rust_cal is not None:
             self.name = "VCALENDAR"
 
+    def _mark_dirty(self) -> None:
+        cur: Optional[Component] = self
+        while cur is not None:
+            if not cur._materialized:
+                cur._ensure_materialized()
+            cur = cur._parent
+
+    def _make_prop_params(self, raw_params: Any) -> Parameters:
+        if isinstance(raw_params, Parameters):
+            if raw_params._on_mutate is None:
+                raw_params._on_mutate = self._mark_dirty
+            return raw_params
+        return Parameters(_flatten_params(raw_params), _on_mutate=self._mark_dirty)
+
+    def _make_param_sync(
+        self, key_upper: str, match_idx: int, params_obj: Parameters
+    ) -> Any:
+        def _sync() -> None:
+            if not self._materialized:
+                self._ensure_materialized()
+                seen = 0
+                for idx, (k, v, _p) in enumerate(self._props):
+                    if k == key_upper:
+                        if seen == match_idx:
+                            if hasattr(v, "params") and isinstance(v.params, Parameters):
+                                v.params = params_obj
+                            self._props[idx] = (k, v, params_obj)
+                            break
+                        seen += 1
+            self._mark_dirty()
+
+        return _sync
+
+    def _get_children(self) -> list[Component]:
+        if self._materialized:
+            return self._subcomponents
+        if self._children_cache is None:
+            if self._rust_cal is not None:
+                raw_subs = self._rust_cal.subcomponents
+            elif isinstance(self._rust_comp, _ox.Component):
+                raw_subs = self._rust_comp.subcomponents
+            elif isinstance(self._rust_comp, _ox.Occurrence):
+                raw_subs = self._rust_comp.component.subcomponents
+            else:
+                raw_subs = []
+            self._children_cache = [_wrap_rust_component(c, _parent=self) for c in raw_subs]
+        return self._children_cache
+
     def _ensure_materialized(self) -> None:
         if self._materialized:
             return
+        children = list(self._get_children())
         self._materialized = True
+        self._children_cache = None
         if self._rust_cal is not None:
-            self._props = [("VERSION", "2.0", {})]
-            if self._rust_cal.prodid:
-                self._props.append(("PRODID", self._rust_cal.prodid, {}))
-            if self._rust_cal.name:
-                self._props.append(("NAME", self._rust_cal.name, {}))
-            if self._rust_cal.default_timezone:
-                self._props.append(("X-WR-TIMEZONE", self._rust_cal.default_timezone, {}))
-            self._subcomponents = [
-                _wrap_rust_component(c) for c in self._rust_cal.subcomponents
-            ]
+            for pname, val, raw_params in self._rust_cal.root.raw_properties():
+                self._props.append((pname.upper(), val, self._make_prop_params(raw_params)))
+            self._subcomponents = children
             return
 
         if isinstance(self._rust_comp, _ox.Occurrence):
             comp = self._rust_comp.component
             end_key = "DUE" if self._rust_comp.name == "VTODO" else "DTEND"
-            for pname in comp.property_names():
+            for pname, val, raw_params in comp.raw_properties():
                 up = pname.upper()
                 if up in ("DTSTART", "DTEND", "DUE", "DURATION"):
                     continue
-                if not self._keep_recurrence and up in ("RRULE", "RDATE", "EXDATE", "RECURRENCE-ID"):
+                if not self._keep_recurrence and up in (
+                    "RRULE",
+                    "RDATE",
+                    "EXDATE",
+                    "RECURRENCE-ID",
+                ):
                     continue
-                for val in comp.get_all(pname):
-                    self._props.append((up, val, comp.params(pname)))
-            self._props.append(("DTSTART", self._rust_comp.start, {}))
-            self._props.append((end_key, self._rust_comp.end, {}))
-            self._subcomponents = [_wrap_rust_component(c) for c in comp.subcomponents]
+                self._props.append((up, val, self._make_prop_params(raw_params)))
+            self._props.append(("DTSTART", self._rust_comp.start, Parameters(_on_mutate=self._mark_dirty)))
+            self._props.append((end_key, self._rust_comp.end, Parameters(_on_mutate=self._mark_dirty)))
+            self._subcomponents = children
         elif self._rust_comp is not None:
-            for pname in self._rust_comp.property_names():
-                vals = self._rust_comp.get_all(pname)
-                params = self._rust_comp.params(pname)
-                for val in vals:
-                    self._props.append((pname.upper(), val, dict(params)))
-            self._subcomponents = [
-                _wrap_rust_component(c) for c in self._rust_comp.subcomponents
-            ]
+            for pname, val, raw_params in self._rust_comp.raw_properties():
+                self._props.append((pname.upper(), val, self._make_prop_params(raw_params)))
+            self._subcomponents = children
 
-    def _wrap_prop(self, key_upper: str, val: Any, params: dict[str, Any]) -> Any:
+    def _wrap_prop(
+        self,
+        key_upper: str,
+        val: Any,
+        params: Any,
+        *,
+        match_idx: int = 0,
+    ) -> Any:
+        if isinstance(params, Parameters):
+            p_obj = params
+            if p_obj._on_mutate is None:
+                p_obj._on_mutate = (
+                    self._mark_dirty
+                    if self._materialized
+                    else self._make_param_sync(key_upper, match_idx, p_obj)
+                )
+        else:
+            p_obj = Parameters(_flatten_params(params))
+            p_obj._on_mutate = (
+                self._mark_dirty
+                if self._materialized
+                else self._make_param_sync(key_upper, match_idx, p_obj)
+            )
+
         if key_upper == "RRULE":
             if isinstance(val, vRecur):
                 return val
             if isinstance(val, dict):
-                return vRecur(val, params=params)
-            return vRecur.from_ical(str(val))
+                return vRecur(val, params=p_obj)
+            return vRecur.from_ical(str(val), params=p_obj)
         if key_upper in _TEMPORAL_KEYS and isinstance(
             val, (datetime.date, datetime.datetime, datetime.timedelta, datetime.time)
         ):
-            return vDDDTypes(val, params)
+            return vDDDTypes(val, p_obj)
         if key_upper in _TEMPORAL_KEYS and isinstance(val, list):
             return [
-                vDDDTypes(item, params)
+                vDDDTypes(item, p_obj)
                 if isinstance(
                     item, (datetime.date, datetime.datetime, datetime.timedelta, datetime.time)
                 )
                 else item
                 for item in val
             ]
+        if key_upper in _CAL_ADDRESS_KEYS and isinstance(val, str):
+            return val if isinstance(val, vCalAddress) else vCalAddress(val, params=p_obj)
+        if key_upper in _URI_KEYS and isinstance(val, str) and not isinstance(val, vBinary):
+            return val if isinstance(val, vUri) else vUri(val, params=p_obj)
+        if isinstance(val, str):
+            return val if isinstance(val, vText) else vText(val, params=p_obj)
         return val
 
     def decoded(self, name: str, default: Any = None) -> Any:
         key_upper = name.upper()
         if not self._materialized:
+            if isinstance(self._rust_comp, _ox.Occurrence):
+                if not self._keep_recurrence and key_upper in (
+                    "RRULE",
+                    "RDATE",
+                    "EXDATE",
+                    "RECURRENCE-ID",
+                ):
+                    return default
+                occ_end_key = "DUE" if self._rust_comp.name == "VTODO" else "DTEND"
+                if key_upper == "DTSTART":
+                    return self._rust_comp.start
+                if key_upper == occ_end_key:
+                    return self._rust_comp.end
+                if key_upper == "DURATION":
+                    return default
+                vals = self._rust_comp.component.get_all(key_upper)
+                if not vals:
+                    return default
+                raw = vals[0] if len(vals) == 1 else vals
+                return vRecur.from_ical(raw) if key_upper == "RRULE" and isinstance(raw, str) else raw
             if self._rust_comp is not None:
-                if key_upper in self._rust_comp:
-                    val = self._rust_comp[key_upper]
-                    if key_upper == "RRULE" and isinstance(val, str):
-                        return vRecur.from_ical(val)
-                    return val
-                return default
+                vals = self._rust_comp.get_all(key_upper)
+                if not vals:
+                    return default
+                raw = vals[0] if len(vals) == 1 else vals
+                return vRecur.from_ical(raw) if key_upper == "RRULE" and isinstance(raw, str) else raw
             if self._rust_cal is not None:
-                if key_upper == "NAME":
-                    return self._rust_cal.name if self._rust_cal.name is not None else default
-                if key_upper == "PRODID":
-                    return self._rust_cal.prodid if self._rust_cal.prodid is not None else default
-                if key_upper == "X-WR-TIMEZONE":
-                    return (
-                        self._rust_cal.default_timezone
-                        if self._rust_cal.default_timezone is not None
-                        else default
-                    )
+                vals = self._rust_cal.root.get_all(key_upper)
+                if not vals:
+                    return default
+                raw = vals[0] if len(vals) == 1 else vals
+                return vRecur.from_ical(raw) if key_upper == "RRULE" and isinstance(raw, str) else raw
         self._ensure_materialized()
         matches = [val for k, val, _ in self._props if k == key_upper]
         if not matches:
@@ -997,22 +1149,51 @@ class Component:
 
     def get(self, name: str, default: Any = None) -> Any:
         key_upper = name.upper()
-        if not self._materialized and self._rust_comp is not None:
-            if isinstance(self._rust_comp, _ox.Occurrence) and not self._keep_recurrence and key_upper in ("RRULE", "RDATE", "EXDATE", "RECURRENCE-ID"):
-                return default
-            if key_upper not in self._rust_comp:
-                return default
-            val = self._rust_comp[key_upper]
+        if not self._materialized:
             if isinstance(self._rust_comp, _ox.Occurrence):
+                if not self._keep_recurrence and key_upper in (
+                    "RRULE",
+                    "RDATE",
+                    "EXDATE",
+                    "RECURRENCE-ID",
+                ):
+                    return default
                 occ_end_key = "DUE" if self._rust_comp.name == "VTODO" else "DTEND"
-                params = (
-                    {}
-                    if key_upper in ("DTSTART", occ_end_key)
-                    else self._rust_comp.component.params(key_upper)
-                )
-            else:
-                params = self._rust_comp.params(key_upper)
-            return self._wrap_prop(key_upper, val, params)
+                if key_upper == "DTSTART":
+                    return self._wrap_prop(key_upper, self._rust_comp.start, {}, match_idx=0)
+                if key_upper == occ_end_key:
+                    return self._wrap_prop(key_upper, self._rust_comp.end, {}, match_idx=0)
+                if key_upper == "DURATION":
+                    return default
+                pairs = self._rust_comp.component.get_all_with_params(key_upper)
+                if not pairs:
+                    return default
+                if len(pairs) == 1:
+                    return self._wrap_prop(key_upper, pairs[0][0], pairs[0][1], match_idx=0)
+                return [
+                    self._wrap_prop(key_upper, val, raw_params, match_idx=idx)
+                    for idx, (val, raw_params) in enumerate(pairs)
+                ]
+            if self._rust_comp is not None:
+                pairs = self._rust_comp.get_all_with_params(key_upper)
+                if not pairs:
+                    return default
+                if len(pairs) == 1:
+                    return self._wrap_prop(key_upper, pairs[0][0], pairs[0][1], match_idx=0)
+                return [
+                    self._wrap_prop(key_upper, val, raw_params, match_idx=idx)
+                    for idx, (val, raw_params) in enumerate(pairs)
+                ]
+            if self._rust_cal is not None:
+                pairs = self._rust_cal.root.get_all_with_params(key_upper)
+                if not pairs:
+                    return default
+                if len(pairs) == 1:
+                    return self._wrap_prop(key_upper, pairs[0][0], pairs[0][1], match_idx=0)
+                return [
+                    self._wrap_prop(key_upper, val, raw_params, match_idx=idx)
+                    for idx, (val, raw_params) in enumerate(pairs)
+                ]
 
         self._ensure_materialized()
         matches = [(val, params) for k, val, params in self._props if k == key_upper]
@@ -1020,8 +1201,11 @@ class Component:
             return default
         if len(matches) == 1:
             val, params = matches[0]
-            return self._wrap_prop(key_upper, val, params)
-        return [self._wrap_prop(key_upper, val, params) for val, params in matches]
+            return self._wrap_prop(key_upper, val, params, match_idx=0)
+        return [
+            self._wrap_prop(key_upper, val, params, match_idx=idx)
+            for idx, (val, params) in enumerate(matches)
+        ]
 
     def __getitem__(self, name: str) -> Any:
         sentinel = object()
@@ -1031,14 +1215,17 @@ class Component:
         return res
 
     def __setitem__(self, name: str, value: Any) -> None:
-        self._ensure_materialized()
+        self._mark_dirty()
         key_upper = name.upper()
         self._props = [(k, v, p) for k, v, p in self._props if k != key_upper]
-        params = value.params if hasattr(value, "params") and isinstance(value.params, Parameters) else Parameters()
+        if hasattr(value, "params") and isinstance(value.params, Parameters):
+            params = self._make_prop_params(value.params)
+        else:
+            params = Parameters(_on_mutate=self._mark_dirty)
         self._props.append((key_upper, value, params))
 
     def __delitem__(self, name: str) -> None:
-        self._ensure_materialized()
+        self._mark_dirty()
         key_upper = name.upper()
         before = len(self._props)
         self._props = [(k, v, p) for k, v, p in self._props if k != key_upper]
@@ -1049,10 +1236,20 @@ class Component:
         if not isinstance(name, str):
             return False
         key_upper = name.upper()
-        if not self._materialized and self._rust_comp is not None:
-            if isinstance(self._rust_comp, _ox.Occurrence) and not self._keep_recurrence and key_upper in ("RRULE", "RDATE", "EXDATE", "RECURRENCE-ID"):
-                return False
-            return key_upper in self._rust_comp
+        if not self._materialized:
+            if isinstance(self._rust_comp, _ox.Occurrence):
+                if not self._keep_recurrence and key_upper in (
+                    "RRULE",
+                    "RDATE",
+                    "EXDATE",
+                    "RECURRENCE-ID",
+                ):
+                    return False
+                return key_upper in self._rust_comp
+            if self._rust_comp is not None:
+                return key_upper in self._rust_comp
+            if self._rust_cal is not None:
+                return key_upper in self._rust_cal.root
         self._ensure_materialized()
         return any(k == key_upper for k, _, _ in self._props)
 
@@ -1115,7 +1312,7 @@ class Component:
             self[k] = v
 
     def clear(self) -> None:
-        self._ensure_materialized()
+        self._mark_dirty()
         self._props.clear()
         self._subcomponents.clear()
 
@@ -1124,7 +1321,13 @@ class Component:
         dup = self.__class__()
         dup.name = self.name
         dup._props = copy.deepcopy(self._props)
+        for k, v, p in dup._props:
+            p._on_mutate = dup._mark_dirty
+            if hasattr(v, "params") and isinstance(v.params, Parameters):
+                v.params = p
         dup._subcomponents = [sub.copy() for sub in self._subcomponents]
+        for sub in dup._subcomponents:
+            sub._parent = dup
         return dup
 
     def __len__(self) -> int:
@@ -1141,19 +1344,20 @@ class Component:
         encode: int = 1,
     ) -> None:
         _ = encode
-        self._ensure_materialized()
+        self._mark_dirty()
         if isinstance(parameters, Parameters):
-            params = parameters
+            params = self._make_prop_params(parameters)
         elif parameters is not None:
-            params = Parameters(parameters)
+            params = Parameters(_flatten_params(parameters), _on_mutate=self._mark_dirty)
         elif hasattr(value, "params") and isinstance(value.params, Parameters):
-            params = value.params
+            params = self._make_prop_params(value.params)
         else:
-            params = Parameters()
+            params = Parameters(_on_mutate=self._mark_dirty)
         self._props.append((name.upper(), value, params))
 
     def add_component(self, component: Component) -> None:
-        self._ensure_materialized()
+        self._mark_dirty()
+        component._parent = self
         self._subcomponents.append(component)
 
     @property
@@ -1246,7 +1450,7 @@ class Component:
         return key, self.pop(key)
 
     def move_to_end(self, key: str, last: bool = True) -> None:
-        self._ensure_materialized()
+        self._mark_dirty()
         k_up = key.upper()
         matched = [p for p in self._props if p[0] == k_up]
         if not matched:
@@ -1270,7 +1474,7 @@ class Component:
         value: Any,
         parameters: Optional[dict[str, Any]] = None,
     ) -> None:
-        self._ensure_materialized()
+        self._mark_dirty()
         k_up = name.upper()
         self._props = [p for p in self._props if p[0] != k_up]
         self.add(k_up, value, parameters=parameters)
@@ -1332,13 +1536,7 @@ class Component:
     @property
     def subcomponents(self) -> list[Component]:
         if not self._materialized:
-            if self._rust_cal is not None:
-                return [_wrap_rust_component(c) for c in self._rust_cal.subcomponents]
-            if isinstance(self._rust_comp, _ox.Component):
-                return [_wrap_rust_component(c) for c in self._rust_comp.subcomponents]
-            if isinstance(self._rust_comp, _ox.Occurrence):
-                return [_wrap_rust_component(c) for c in self._rust_comp.component.subcomponents]
-        self._ensure_materialized()
+            return list(self._get_children())
         return list(self._subcomponents)
 
     def walk(self, name: Optional[str] = None) -> list[Component]:
@@ -2321,9 +2519,10 @@ def _wrap_rust_component(
     comp: Union[_ox.Component, _ox.Occurrence],
     *,
     keep_recurrence: bool = False,
+    _parent: Optional[Component] = None,
 ) -> Component:
     cls = _COMPONENT_CLASS_MAP.get(comp.name, Component)
-    return cls(_rust_comp=comp, _keep_recurrence=keep_recurrence)
+    return cls(_rust_comp=comp, _keep_recurrence=keep_recurrence, _parent=_parent)
 
 
 def _wrap_rust_component_or_cal(cal: _ox.Calendar) -> Component:
@@ -2540,43 +2739,29 @@ class Calendar(Component):
 
     @property
     def events(self) -> list[Event]:
-        if not self._materialized and self._rust_cal is not None:
-            return [Event(_rust_comp=e) for e in self._rust_cal.events]
         return [c for c in self.subcomponents if c.name == "VEVENT"]  # type: ignore[misc]
 
     @property
     def todos(self) -> list[Todo]:
-        if not self._materialized and self._rust_cal is not None:
-            return [Todo(_rust_comp=t) for t in self._rust_cal.todos]
         return [c for c in self.subcomponents if c.name == "VTODO"]  # type: ignore[misc]
 
     @property
     def journals(self) -> list[Journal]:
-        if not self._materialized and self._rust_cal is not None:
-            return [Journal(_rust_comp=j) for j in self._rust_cal.journals]
         return [c for c in self.subcomponents if c.name == "VJOURNAL"]  # type: ignore[misc]
 
     @property
     def timezones(self) -> list[Timezone]:
-        if not self._materialized and self._rust_cal is not None:
-            return [Timezone(_rust_comp=tz) for tz in self._rust_cal.timezones]
         return [c for c in self.subcomponents if c.name == "VTIMEZONE"]  # type: ignore[misc]
 
     @property
     def freebusy(self) -> list[FreeBusy]:
-        if not self._materialized and self._rust_cal is not None:
-            return [FreeBusy(_rust_comp=fb) for fb in self._rust_cal.freebusies]
         return [c for c in self.subcomponents if c.name == "VFREEBUSY"]  # type: ignore[misc]
 
     @property
     def availabilities(self) -> list[Availability]:
-        if not self._materialized and self._rust_cal is not None:
-            return [Availability(_rust_comp=av) for av in self._rust_cal.availabilities]
         return [c for c in self.subcomponents if c.name == "VAVAILABILITY"]  # type: ignore[misc]
 
     def with_uid(self, uid: str) -> list[Component]:
-        if not self._materialized and self._rust_cal is not None:
-            return [_wrap_rust_component(c) for c in self._rust_cal.with_uid(uid)]
         return [c for c in self.walk() if c.decoded("UID") == uid]
 
     def get_used_tzids(self) -> list[str]:

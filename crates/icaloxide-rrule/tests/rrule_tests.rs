@@ -641,3 +641,65 @@ END:VCALENDAR\r\n";
         ]
     );
 }
+
+#[test]
+fn cross_timezone_dtend_preserves_end_tz_until_lt_dtstart_and_unbounded_all() {
+    let ics = "BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+PRODID:-//Test//Test//EN\r\n\
+BEGIN:VEVENT\r\n\
+UID:flight-1\r\n\
+DTSTART;TZID=America/New_York:20260701T180000\r\n\
+DTEND;TZID=Europe/Istanbul:20260702T110000\r\n\
+SUMMARY:Flight JFK-IST\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\n\
+UID:until-before\r\n\
+DTSTART:20260510T090000Z\r\n\
+DTEND:20260510T100000Z\r\n\
+RRULE:FREQ=DAILY;UNTIL=20260501T000000Z\r\n\
+SUMMARY:Never\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\n\
+UID:historic-1850\r\n\
+DTSTART:18500315T090000Z\r\n\
+DTEND:18500315T100000Z\r\n\
+SUMMARY:Historic\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\n\
+UID:future-2150\r\n\
+DTSTART:21500315T090000Z\r\n\
+DTEND:21500315T100000Z\r\n\
+SUMMARY:Future\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+
+    let cal = Arc::new(Calendar::parse_str(ics).unwrap());
+    let q = CalendarQuery::new(cal, QueryOptions::default()).unwrap();
+    let occs = q.all().unwrap();
+    assert_eq!(occs.len(), 3, "UNTIL < DTSTART should emit 0 occurrences");
+
+    let flight = occs
+        .iter()
+        .find(|o| q.calendar().component(o.component_id).unwrap().uid() == Some("flight-1"))
+        .unwrap();
+    assert_eq!(
+        flight.start_local.tz,
+        icaloxide_core::datetime::TimeZoneRef::TzId("America/New_York".into())
+    );
+    assert_eq!(
+        flight.end_local.tz,
+        icaloxide_core::datetime::TimeZoneRef::TzId("Europe/Istanbul".into())
+    );
+    assert_eq!(flight.end_local.date.year, 2026);
+    assert_eq!(flight.end_local.date.month, 7);
+    assert_eq!(flight.end_local.date.day, 2);
+    assert_eq!(flight.end_local.time.hour, 11);
+
+    let uids: Vec<_> = occs
+        .iter()
+        .filter_map(|o| q.calendar().component(o.component_id).unwrap().uid())
+        .collect();
+    assert!(uids.contains(&"historic-1850"));
+    assert!(uids.contains(&"future-2150"));
+}

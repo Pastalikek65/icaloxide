@@ -148,7 +148,18 @@ pub fn compute_end_local(
     span: SpanDuration,
     tz: &CalendarTimeZone,
 ) -> (i64, CalDateTime) {
-    match span {
+    compute_end_local_with_tz(start_local, start_utc, span, tz, None)
+}
+
+/// Compute local wall-clock end [`CalDateTime`] preserving an explicit `DTEND` timezone when different from `DTSTART`.
+pub fn compute_end_local_with_tz(
+    start_local: &CalDateTime,
+    start_utc: i64,
+    span: SpanDuration,
+    start_tz: &CalendarTimeZone,
+    end_tz: Option<&(TimeZoneRef, CalendarTimeZone)>,
+) -> (i64, CalDateTime) {
+    let (end_utc, fallback_dt) = match span {
         SpanDuration::Days(days) => {
             let end_date = start_local.date.add_days(days);
             let end_dt = CalDateTime {
@@ -156,29 +167,42 @@ pub fn compute_end_local(
                 time: start_local.time,
                 tz: start_local.tz.clone(),
             };
-            let end_utc =
-                match tz.resolve_local(end_date, start_local.time, DstDisambiguation::Compatible) {
-                    Ok(res) => res.utc_timestamp,
-                    Err(_) => end_dt.to_naive_timestamp(),
-                };
+            let end_utc = match start_tz.resolve_local(
+                end_date,
+                start_local.time,
+                DstDisambiguation::Compatible,
+            ) {
+                Ok(res) => res.utc_timestamp,
+                Err(_) => end_dt.to_naive_timestamp(),
+            };
             (end_utc, end_dt)
         }
-        SpanDuration::Seconds(secs) => utc_instant_to_end(start_utc + secs, &start_local.tz, tz),
+        SpanDuration::Seconds(secs) => {
+            let (e_utc, e_dt) = utc_instant_to_end(start_utc + secs, &start_local.tz, start_tz);
+            (e_utc, e_dt)
+        }
         SpanDuration::DaysAndSeconds { days, secs } => {
             let mid_date = start_local.date.add_days(days);
-            let mid_utc =
-                match tz.resolve_local(mid_date, start_local.time, DstDisambiguation::Compatible) {
-                    Ok(res) => res.utc_timestamp,
-                    Err(_) => CalDateTime {
-                        date: mid_date,
-                        time: start_local.time,
-                        tz: start_local.tz.clone(),
-                    }
-                    .to_naive_timestamp(),
-                };
-            utc_instant_to_end(mid_utc + secs, &start_local.tz, tz)
+            let mid_utc = match start_tz.resolve_local(
+                mid_date,
+                start_local.time,
+                DstDisambiguation::Compatible,
+            ) {
+                Ok(res) => res.utc_timestamp,
+                Err(_) => CalDateTime {
+                    date: mid_date,
+                    time: start_local.time,
+                    tz: start_local.tz.clone(),
+                }
+                .to_naive_timestamp(),
+            };
+            utc_instant_to_end(mid_utc + secs, &start_local.tz, start_tz)
         }
+    };
+    if let Some((end_ref, resolved_end_tz)) = end_tz {
+        return utc_instant_to_end(end_utc, end_ref, resolved_end_tz);
     }
+    (end_utc, fallback_dt)
 }
 
 #[inline]
@@ -208,6 +232,7 @@ pub struct ExtractedTiming {
     pub start_local: CalDateTime,
     pub start_utc: i64,
     pub tz: CalendarTimeZone,
+    pub end_tz: Option<(TimeZoneRef, CalendarTimeZone)>,
     pub span: SpanDuration,
     pub is_all_day: bool,
     pub cancelled: bool,
@@ -250,21 +275,30 @@ pub fn extract_component_timing(
         .property(&PropertyName::DtEnd)
         .or_else(|| comp.property(&PropertyName::Due));
 
-    let span = if let Some(ep) = end_prop {
+    let (span, end_tz) = if let Some(ep) = end_prop {
         match &ep.value {
             PropertyValue::Date(end_d) => {
                 let days =
                     (end_d.to_days_since_epoch() - start_local.date.to_days_since_epoch()).max(0);
-                SpanDuration::Days(if is_all_day && days == 0 { 1 } else { days })
+                (
+                    SpanDuration::Days(if is_all_day && days == 0 { 1 } else { days }),
+                    None,
+                )
             }
             PropertyValue::DateTime(end_dt) => {
-                let (end_utc, _) = resolve_datetime_with_fallback(end_dt, reg, default_tz);
-                SpanDuration::Seconds((end_utc - start_utc).max(0))
+                let (end_utc, resolved_end_tz) =
+                    resolve_datetime_with_fallback(end_dt, reg, default_tz);
+                let e_tz = if end_dt.tz == start_local.tz {
+                    None
+                } else {
+                    Some((end_dt.tz.clone(), resolved_end_tz))
+                };
+                (SpanDuration::Seconds((end_utc - start_utc).max(0)), e_tz)
             }
-            _ => default_span(comp, is_all_day),
+            _ => (default_span(comp, is_all_day), None),
         }
     } else {
-        default_span(comp, is_all_day)
+        (default_span(comp, is_all_day), None)
     };
 
     let cancelled = comp
@@ -275,6 +309,7 @@ pub fn extract_component_timing(
         start_local,
         start_utc,
         tz,
+        end_tz,
         span,
         is_all_day,
         cancelled,
@@ -307,6 +342,7 @@ pub struct OverrideEntry {
     pub end_local: CalDateTime,
     pub span: SpanDuration,
     pub tz: CalendarTimeZone,
+    pub end_tz: Option<(TimeZoneRef, CalendarTimeZone)>,
     pub time_shift_secs: i64,
     pub override_rrules: Vec<RRule>,
     pub is_all_day: bool,
@@ -320,7 +356,9 @@ pub struct MasterSeries {
     pub component_id: ComponentId,
     pub kind: ComponentKind,
     pub start_local: CalDateTime,
+    pub start_utc: i64,
     pub tz: CalendarTimeZone,
+    pub end_tz: Option<(TimeZoneRef, CalendarTimeZone)>,
     pub span: SpanDuration,
     pub is_all_day: bool,
     pub cancelled: bool,
@@ -329,6 +367,18 @@ pub struct MasterSeries {
     pub exdates: ExclusionSet,
     pub min_start_utc: i64,
     pub max_end_utc: Option<i64>,
+}
+
+/// Return whether the master `DTSTART` itself should be emitted when `RRULE`s are present.
+pub fn should_emit_master_dtstart(master: &MasterSeries) -> bool {
+    if master.rrules.is_empty() {
+        return true;
+    }
+    master.rrules.iter().any(|rule| {
+        rule.count != Some(0)
+            && resolve_until_utc(rule, &master.tz)
+                .is_none_or(|until_utc| master.start_utc <= until_utc)
+    })
 }
 
 /// Compiled recurrence series for one `(ComponentKind, UID)` group.
@@ -587,7 +637,9 @@ fn expand_master_window(
         }
     };
 
-    emit_candidate(&master.start_local, None);
+    if should_emit_master_dtstart(master) {
+        emit_candidate(&master.start_local, None);
+    }
 
     let dtstart_ldt = LocalDateTime::new(master.start_local.date, master.start_local.time);
     for rule in &master.rrules {
@@ -668,7 +720,8 @@ fn expand_this_and_future_rrules(
             {
                 continue;
             }
-            let (e_utc, e_local) = compute_end_local(&cand, s_utc, tf.span, &tf.tz);
+            let (e_utc, e_local) =
+                compute_end_local_with_tz(&cand, s_utc, tf.span, &tf.tz, tf.end_tz.as_ref());
             if overlaps_window(s_utc, e_utc, start_utc, end_utc) {
                 out.push(Occurrence {
                     component_id: tf.component_id,
@@ -698,7 +751,13 @@ pub fn apply_this_and_future_shift(
 ) -> Option<Occurrence> {
     let idx = this_and_future.partition_point(|tf| tf.recurrence_id_utc <= s_utc);
     if idx == 0 {
-        let (e_utc, e_local) = compute_end_local(cand_local, s_utc, base_span, &master.tz);
+        let (e_utc, e_local) = compute_end_local_with_tz(
+            cand_local,
+            s_utc,
+            base_span,
+            &master.tz,
+            master.end_tz.as_ref(),
+        );
         return Some(Occurrence {
             component_id: master.component_id,
             kind: master.kind.clone(),
@@ -728,7 +787,13 @@ pub fn apply_this_and_future_shift(
             tz: tf.start_local.tz.clone(),
         }
     };
-    let (e_utc, e_local) = compute_end_local(&shifted_local, shifted_utc, tf.span, &tf.tz);
+    let (e_utc, e_local) = compute_end_local_with_tz(
+        &shifted_local,
+        shifted_utc,
+        tf.span,
+        &tf.tz,
+        tf.end_tz.as_ref(),
+    );
     Some(Occurrence {
         component_id: tf.component_id,
         kind: tf.kind.clone(),
@@ -825,11 +890,12 @@ fn build_override(
     let Some(timing) = extract_component_timing(comp, reg, default_tz) else {
         return Ok(None);
     };
-    let (end_utc, end_local) = compute_end_local(
+    let (end_utc, end_local) = compute_end_local_with_tz(
         &timing.start_local,
         timing.start_utc,
         timing.span,
         &timing.tz,
+        timing.end_tz.as_ref(),
     );
 
     let mut override_rrules = Vec::new();
@@ -856,6 +922,7 @@ fn build_override(
         end_local,
         span: timing.span,
         tz: timing.tz,
+        end_tz: timing.end_tz,
         time_shift_secs: timing.start_utc - recurrence_id_utc,
         override_rrules,
         is_all_day: timing.is_all_day,
@@ -1013,7 +1080,9 @@ fn build_master(
         component_id: comp.id(),
         kind: comp.kind().clone(),
         start_local: timing.start_local,
+        start_utc: timing.start_utc,
         tz: timing.tz,
+        end_tz: timing.end_tz,
         span: timing.span,
         is_all_day: timing.is_all_day,
         cancelled: timing.cancelled,

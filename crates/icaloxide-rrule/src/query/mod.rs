@@ -16,8 +16,9 @@ use smallvec::SmallVec;
 use crate::error::{IterationBudget, RRuleError};
 use crate::query::components::{expand_alarms_for_parent, extract_freebusy_occurrences};
 use crate::recurrence::series::{
-    apply_this_and_future_shift, compute_end_local, extract_component_timing, overlaps_window,
-    resolve_datetime_with_fallback, resolve_local_instant, span_from_duration, utc_to_local_approx,
+    apply_this_and_future_shift, compute_end_local, compute_end_local_with_tz,
+    extract_component_timing, overlaps_window, resolve_datetime_with_fallback,
+    resolve_local_instant, should_emit_master_dtstart, span_from_duration, utc_to_local_approx,
     CompiledSeries, OverrideEntry,
 };
 use crate::recurrence::SpanDuration;
@@ -291,9 +292,13 @@ impl CalendarQuery {
         }
     }
 
-    /// Return all occurrences across `[1900-01-01, 2100-12-31]`.
+    /// Return all occurrences across the calendar's bounded span (or `[min_start, 2100-12-31]` when unbounded).
     pub fn all(&self) -> Result<Vec<Occurrence>, RRuleError> {
-        let start_utc = i64::from(CalDate::new(1900, 1, 1).unwrap().to_days_since_epoch()) * 86_400;
+        if let Some((min_s, max_e)) = self.bounded_extents() {
+            return self.between(min_s.saturating_sub(1), max_e.saturating_add(1));
+        }
+        let y1900_utc = i64::from(CalDate::new(1900, 1, 1).unwrap().to_days_since_epoch()) * 86_400;
+        let start_utc = self.min_start_floor().min(y1900_utc);
         let end_utc = i64::from(CalDate::new(2100, 12, 31).unwrap().to_days_since_epoch()) * 86_400;
         self.between(start_utc, end_utc)
     }
@@ -402,7 +407,7 @@ impl CalendarQuery {
         Ok(free)
     }
 
-    fn min_start_floor(&self) -> i64 {
+    pub fn min_start_floor(&self) -> i64 {
         let mut floor = i64::MAX;
         if let Some(s) = self.singles.first() {
             floor = floor.min(s.start_utc);
@@ -425,7 +430,7 @@ impl CalendarQuery {
         }
     }
 
-    fn bounded_extents(&self) -> Option<(i64, i64)> {
+    pub fn bounded_extents(&self) -> Option<(i64, i64)> {
         let mut min_s = i64::MAX;
         let mut max_e = i64::MIN;
         let mut any = false;
@@ -1209,7 +1214,9 @@ fn push_master_statics(
         }
     };
 
-    try_push(&master.start_local, master.span);
+    if should_emit_master_dtstart(master) {
+        try_push(&master.start_local, master.span);
+    }
     for rdt in &master.rdates {
         try_push(&rdt.start_local, rdt.custom_span.unwrap_or(master.span));
     }
@@ -1372,7 +1379,8 @@ fn advance_split_cursor(
         {
             continue;
         }
-        let (e_utc, e_local) = compute_end_local(&cand_local, s_utc, tf.span, &tf.tz);
+        let (e_utc, e_local) =
+            compute_end_local_with_tz(&cand_local, s_utc, tf.span, &tf.tz, tf.end_tz.as_ref());
         if !keeps_for_after(s_utc, e_utc, earliest_end_utc) {
             continue;
         }
@@ -1446,11 +1454,12 @@ fn classify_component_group(
             if skip_cancelled && timing.cancelled {
                 return Ok(());
             }
-            let (end_utc, end_local) = compute_end_local(
+            let (end_utc, end_local) = compute_end_local_with_tz(
                 &timing.start_local,
                 timing.start_utc,
                 timing.span,
                 &timing.tz,
+                timing.end_tz.as_ref(),
             );
             let occ = Occurrence {
                 component_id: mc.id(),
