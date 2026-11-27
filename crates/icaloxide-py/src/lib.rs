@@ -592,10 +592,11 @@ impl PyComponent {
             .collect())
     }
 
-    fn to_ical<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+    #[pyo3(signature = (sorted=false))]
+    fn to_ical<'py>(&self, py: Python<'py>, sorted: bool) -> PyResult<Bound<'py, PyBytes>> {
         let s = self
             .cal
-            .component_to_ical(self.id)
+            .component_to_ical_ordered(self.id, sorted)
             .ok_or_else(|| PyKeyError::new_err("invalid component id"))?;
         Ok(PyBytes::new(py, s.as_bytes()))
     }
@@ -1384,8 +1385,15 @@ impl PyCalendar {
         Ok(Some(delta))
     }
 
-    fn to_ical<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        let s = py.allow_threads(|| self.inner.to_ical());
+    #[pyo3(signature = (sorted=false))]
+    fn to_ical<'py>(&self, py: Python<'py>, sorted: bool) -> Bound<'py, PyBytes> {
+        let s = py.allow_threads(|| {
+            if sorted {
+                self.inner.to_ical_sorted()
+            } else {
+                self.inner.to_ical()
+            }
+        });
         PyBytes::new(py, s.as_bytes())
     }
 

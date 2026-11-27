@@ -62,6 +62,41 @@ class OccurrenceID:
         )
         return f"{self.name}|{self.uid}|{r_str}|{s_str}"
 
+    @classmethod
+    def _parse_iso(cls, text: str) -> Any:
+        if not text:
+            return None
+        if "T" in text:
+            return datetime.datetime.fromisoformat(text)
+        try:
+            return datetime.date.fromisoformat(text)
+        except ValueError:
+            return text
+
+    @classmethod
+    def from_string(cls, raw: str) -> OccurrenceID:
+        parts = str(raw).split("|", 3)
+        if len(parts) != 4:
+            raise ValueError(f"invalid OccurrenceID string: {raw!r}")
+        name, uid, rid_str, start_str = parts
+        return cls(
+            name=name,
+            uid=uid,
+            recurrence_id=cls._parse_iso(rid_str),
+            start=cls._parse_iso(start_str),
+        )
+
+    @classmethod
+    def from_occurrence(cls, comp: Component) -> OccurrenceID:
+        start = comp.decoded("DTSTART", None)
+        rid = comp.decoded("RECURRENCE-ID", None) or start
+        return cls(
+            name=comp.name,
+            uid=str(comp.decoded("UID", "") or ""),
+            recurrence_id=rid,
+            start=start,
+        )
+
     def __repr__(self) -> str:
         return f"OccurrenceID({self.to_string()!r})"
 
@@ -104,12 +139,16 @@ class ComponentAdapter:
 
     @classmethod
     def component_bounds(cls, comp: Component) -> tuple[Any, Any]:
-        start = comp.decoded("DTSTART") or comp.decoded("DUE") or comp.decoded("DTSTAMP")
+        start = (
+            comp.decoded("DTSTART", None)
+            or comp.decoded("DUE", None)
+            or comp.decoded("DTSTAMP", None)
+        )
         if start is None:
             return None, None
-        end = comp.decoded("DTEND") or comp.decoded("DUE")
+        end = comp.decoded("DTEND", None) or comp.decoded("DUE", None)
         if end is None:
-            dur = comp.decoded("DURATION")
+            dur = comp.decoded("DURATION", None)
             if isinstance(dur, datetime.timedelta):
                 end = start + dur
             elif isinstance(start, datetime.date) and not isinstance(start, datetime.datetime):
@@ -138,7 +177,7 @@ class AbsoluteAlarmAdapter(ComponentAdapter):
 
     @classmethod
     def component_bounds(cls, comp: Component) -> tuple[Any, Any]:
-        trig = comp.decoded("TRIGGER")
+        trig = comp.decoded("TRIGGER", None)
         if isinstance(trig, (datetime.date, datetime.datetime)):
             return trig, trig
         return None, None
@@ -155,9 +194,9 @@ class Occurrence:
         recurrence_id: Any = None,
     ) -> None:
         self.component = component
-        self.start = start if start is not None else component.decoded("DTSTART")
+        self.start = start if start is not None else component.decoded("DTSTART", None)
         self.end = end if end is not None else (
-            component.decoded("DTEND") or component.decoded("DUE") or self.start
+            component.decoded("DTEND", None) or component.decoded("DUE", None) or self.start
         )
         self.recurrence_id = recurrence_id
 
@@ -346,6 +385,37 @@ class Page:
         return iter(self._components)
 
 
+def _resolve_default_zoneinfo(tz_name: Optional[str]) -> Any:
+    if not tz_name:
+        return None
+    if tz_name.upper() in ("UTC", "ETC/UTC", "Z"):
+        return datetime.timezone.utc
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo(tz_name)
+    except Exception:
+        return None
+
+
+def _localize_floating_occ(comp: Component, tz_obj: Any) -> Component:
+    if tz_obj is None or comp._rust_comp is None:
+        return comp
+    rc = comp._rust_comp
+    st = rc.start
+    en = rc.end
+    needs_st = isinstance(st, datetime.datetime) and st.tzinfo is None
+    needs_en = isinstance(en, datetime.datetime) and en.tzinfo is None
+    if needs_st or needs_en:
+        comp._ensure_materialized()
+        if needs_st:
+            comp["DTSTART"] = st.replace(tzinfo=tz_obj)
+        if needs_en:
+            end_key = "DUE" if comp.name == "VTODO" else "DTEND"
+            comp[end_key] = en.replace(tzinfo=tz_obj)
+    return comp
+
+
 class Pages:
     """Lazy paginated iterator yielding :class:`Page` objects with cursor ``next_page_id``."""
 
@@ -357,6 +427,7 @@ class Pages:
         latest_start: Optional[DateArgument] = None,
         keep_recurrence_attributes: bool = False,
         cursor_token: str = "",
+        default_tz_obj: Any = None,
     ) -> None:
         if size <= 0:
             raise ValueError(f"A page must have at least one component, not {size}.")
@@ -364,6 +435,7 @@ class Pages:
         self._size = size
         self._latest_start = _to_point(latest_start) if latest_start is not None else None
         self._keep_recurrence = keep_recurrence_attributes
+        self._default_tz_obj = default_tz_obj
         self._next_occ: Optional[_ox.Occurrence] = None
 
         cursor_key: Optional[tuple[str, str, str, str]] = None
@@ -417,7 +489,10 @@ class Pages:
         self._next_occ = next_peek
         token = _encode_cursor(next_peek) if next_peek is not None else ""
         comps = [
-            _wrap_rust_component(o, keep_recurrence=self._keep_recurrence)
+            _localize_floating_occ(
+                _wrap_rust_component(o, keep_recurrence=self._keep_recurrence),
+                self._default_tz_obj,
+            )
             for o in batch
         ]
         return Page(comps, next_page_id=token)
@@ -457,6 +532,7 @@ class UnfoldableCalendar:
     ) -> None:
         self._rust_cal = rust_cal
         self._keep_recurrence = keep_recurrence_attributes
+        self._default_zi = _resolve_default_zoneinfo(rust_cal.default_timezone)
         self._components, self._custom_adapters = _split_component_selectors(components)
         self._skip_bad_series = skip_bad_series
         self._max_iterations = max_iterations
@@ -470,6 +546,12 @@ class UnfoldableCalendar:
             )
         except ValueError as exc:
             raise BadRuleStringFormat(str(exc)) from exc
+
+    def _wrap_occ(self, occ: _ox.Occurrence) -> Component:
+        comp = _wrap_rust_component(occ, keep_recurrence=self._keep_recurrence)
+        if self._default_zi is not None:
+            return _localize_floating_occ(comp, self._default_zi)
+        return comp
 
     def _query_for(self, bound: Any) -> _ox.CalendarQuery:
         if self._rust_cal.default_timezone is None:
@@ -516,12 +598,12 @@ class UnfoldableCalendar:
     def to_datetime(date: DateArgument) -> Any:
         return _to_point(date)
 
-    def at(self, a_date: DateArgument) -> list[Component]:
-        s_bound, e_bound = _normalize_date_arg(a_date)
-        if s_bound == e_bound and not isinstance(a_date, tuple):
+    def at(self, date: DateArgument) -> list[Component]:
+        s_bound, e_bound = _normalize_date_arg(date)
+        if s_bound == e_bound and not isinstance(date, tuple):
             occs = self._query_for(s_bound).at(s_bound)
             custom = self._custom_components_in(s_bound, e_bound + datetime.timedelta(seconds=1) if isinstance(e_bound, datetime.datetime) else e_bound)
-        elif isinstance(a_date, (int, str, tuple)):
+        elif isinstance(date, (int, str, tuple)):
             if isinstance(e_bound, datetime.datetime):
                 occs = self._query_for(s_bound).between(s_bound, e_bound)
                 custom = self._custom_components_in(s_bound, e_bound)
@@ -532,10 +614,7 @@ class UnfoldableCalendar:
         else:
             occs = self._query_for(s_bound).at(s_bound)
             custom = self._custom_components_in(s_bound, s_bound)
-        res = [
-            _wrap_rust_component(o, keep_recurrence=self._keep_recurrence)
-            for o in occs
-        ]
+        res = [self._wrap_occ(o) for o in occs]
         res.extend(custom)
         return res
 
@@ -555,17 +634,14 @@ class UnfoldableCalendar:
         else:
             e_val = _to_point(stop)
         occs = self._query_for(s_val).between(s_val, e_val)
-        res = [
-            _wrap_rust_component(o, keep_recurrence=self._keep_recurrence)
-            for o in occs
-        ]
+        res = [self._wrap_occ(o) for o in occs]
         res.extend(self._custom_components_in(s_val, e_val))
         return res
 
     def after(self, earliest_end: DateArgument) -> Iterator[Component]:
         pt = _to_point(earliest_end)
         for occ in self._query_for(pt).after(pt):
-            yield _wrap_rust_component(occ, keep_recurrence=self._keep_recurrence)
+            yield self._wrap_occ(occ)
         for comp in self._custom_components_in(pt, DATE_MAX):
             yield comp
 
@@ -590,6 +666,7 @@ class UnfoldableCalendar:
             latest_start=latest_start,
             keep_recurrence_attributes=self._keep_recurrence,
             cursor_token=next_page_id,
+            default_tz_obj=self._default_zi,
         )
 
     @property
@@ -597,20 +674,17 @@ class UnfoldableCalendar:
         occ = self._query.first()
         if occ is None:
             return None
-        return _wrap_rust_component(occ, keep_recurrence=self._keep_recurrence)
+        return self._wrap_occ(occ)
 
     def next_after(self, earliest_end: DateArgument) -> Optional[Component]:
         pt = _to_point(earliest_end)
         occ = self._query_for(pt).next_after(pt)
         if occ is None:
             return None
-        return _wrap_rust_component(occ, keep_recurrence=self._keep_recurrence)
+        return self._wrap_occ(occ)
 
     def all(self) -> list[Component]:
-        res = [
-            _wrap_rust_component(o, keep_recurrence=self._keep_recurrence)
-            for o in self._query.all()
-        ]
+        res = [self._wrap_occ(o) for o in self._query.all()]
         res.extend(self._custom_components_in(DATE_MIN, DATE_MAX))
         return res
 

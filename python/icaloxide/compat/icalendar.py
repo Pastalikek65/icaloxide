@@ -179,6 +179,8 @@ class Parameters(dict):  # type: ignore[type-arg]
     """Case-insensitive parameter mapping matching ``icalendar.Parameters``."""
 
     always_quoted = ("ALTREP", "CN", "DIR", "SENT-BY", "MEMBER", "DELEGATED-FROM", "DELEGATED-TO")
+    canonical_order: tuple[str, ...] = ()
+    quote_also: list[str] = []
 
     def __init__(self, *args: Any, _on_mutate: Any = None, **kwargs: Any) -> None:
         super().__init__()
@@ -363,6 +365,28 @@ class vDDDTypes:
             self._on_mutate()
         self._dt = value
 
+    @property
+    def td(self) -> Optional[datetime.timedelta]:
+        return self._dt if isinstance(self._dt, datetime.timedelta) else None
+
+    @property
+    def TZID(self) -> Optional[str]:
+        return self.params.tzid()
+
+    @property
+    def VALUE(self) -> Optional[str]:
+        return self.params.value()
+
+    @property
+    def RELATED(self) -> Optional[str]:
+        val = self.params.get("RELATED")
+        return str(val) if val is not None else None
+
+    @property
+    def RANGE(self) -> Optional[str]:
+        val = self.params.get("RANGE")
+        return str(val) if val is not None else None
+
     def __deepcopy__(self, memo: dict[int, Any]) -> vDDDTypes:
         return self.__class__(
             copy.deepcopy(self._dt, memo),
@@ -431,6 +455,29 @@ class vText(str):
         obj.params = _ensure_parameters(params)
         return obj
 
+    @property
+    def ical_value(self) -> str:
+        return str(self)
+
+    @property
+    def LANGUAGE(self) -> Optional[str]:
+        v = self.params.get("LANGUAGE")
+        return str(v) if v is not None else None
+
+    @property
+    def ALTREP(self) -> Optional[str]:
+        v = self.params.get("ALTREP")
+        return str(v) if v is not None else None
+
+    @property
+    def RELTYPE(self) -> Optional[str]:
+        v = self.params.get("RELTYPE")
+        return str(v) if v is not None else None
+
+    @property
+    def VALUE(self) -> Optional[str]:
+        return self.params.value()
+
     def to_ical(self) -> bytes:
         return _escape_text(str(self)).encode("utf-8")
 
@@ -453,6 +500,7 @@ class vRecur(dict):  # type: ignore[type-arg]
     """Dictionary representation of RFC 5545 ``RRULE`` matching ``icalendar.vRecur``."""
 
     params: Parameters
+    frequencies = ("YEARLY", "MONTHLY", "WEEKLY", "DAILY", "HOURLY", "MINUTELY", "SECONDLY")
 
     def __init__(
         self,
@@ -577,6 +625,30 @@ class vRecur(dict):  # type: ignore[type-arg]
 
     def __str__(self) -> str:
         return self.to_ical().decode("utf-8")
+
+    def has_key(self, key: str) -> bool:
+        return str(key).upper() in self
+
+    def sorted_keys(self) -> list[str]:
+        return sorted(self.keys())
+
+    def sorted_items(self) -> list[tuple[str, Any]]:
+        return sorted(self.items(), key=lambda kv: kv[0])
+
+    def move_to_end(self, key: str, last: bool = True) -> None:
+        k_up = str(key).upper()
+        if k_up not in self:
+            raise KeyError(key)
+        self._notify_mutate()
+        val = dict.pop(self, k_up)
+        if last:
+            dict.__setitem__(self, k_up, val)
+        else:
+            items = list(self.items())
+            dict.clear(self)
+            dict.__setitem__(self, k_up, val)
+            for ok, ov in items:
+                dict.__setitem__(self, ok, ov)
 
 
 def _parse_until_str(raw: str) -> Any:
@@ -740,6 +812,21 @@ class vPeriod:
         self.end_or_dur = per[1]
         self.params = _ensure_parameters(params)
 
+    @property
+    def dt(self) -> tuple[Any, Any]:
+        return (self.start, self.end_or_dur)
+
+    def overlaps(self, other: vPeriod) -> bool:
+        s1 = self.start
+        e1 = s1 + self.end_or_dur if isinstance(self.end_or_dur, datetime.timedelta) else self.end_or_dur
+        s2 = other.start
+        e2 = (
+            s2 + other.end_or_dur
+            if isinstance(other.end_or_dur, datetime.timedelta)
+            else other.end_or_dur
+        )
+        return s1 < e2 and s2 < e1
+
     def to_ical(self) -> bytes:
         s = _format_temporal(self.start, {})
         e = _format_temporal(self.end_or_dur, {})
@@ -775,6 +862,9 @@ class vPeriod:
 
 
 class vUTCOffset(vDDDTypes):
+    def format(self) -> str:
+        return _format_utc_offset(self.dt)
+
     def to_ical(self) -> bytes:
         return _format_utc_offset(self.dt).encode("utf-8")
 
@@ -856,6 +946,14 @@ class vBinary:
     def __init__(self, obj: Union[bytes, str], params: Optional[dict[str, Any]] = None) -> None:
         self.obj = obj
         self.params = Parameters(params) if params else Parameters()
+
+    @property
+    def base64data(self) -> str:
+        return self.to_ical().decode("ascii")
+
+    @property
+    def ical_value(self) -> Union[bytes, str]:
+        return self.obj
 
     def to_ical(self) -> bytes:
         if isinstance(self.obj, bytes):
@@ -1167,6 +1265,191 @@ _TEMPORAL_KEYS = frozenset(
 )
 _CAL_ADDRESS_KEYS = frozenset({"ATTENDEE", "ORGANIZER"})
 _URI_KEYS = frozenset({"URL", "ATTACH", "TZURL", "SOURCE", "IMAGE", "CONFERENCE", "LINK"})
+_MISSING = object()
+
+
+def _scalar_prop(
+    key: str,
+    *,
+    default: Any = None,
+    cast: Any = None,
+    fallback_key: Optional[str] = None,
+) -> property:
+    def fget(self: Any) -> Any:
+        val = self.decoded(key, None)
+        if val is None:
+            val = self.decoded(fallback_key, default) if fallback_key else default
+        if val is not None and cast is not None:
+            return cast(val)
+        return val
+
+    def fset(self: Any, val: Any) -> None:
+        if val is None:
+            self.pop(key, None)
+        else:
+            self[key] = val
+
+    def fdel(self: Any) -> None:
+        self.pop(key, None)
+
+    return property(fget, fset, fdel)
+
+
+def _multi_prop(
+    key: str,
+    *,
+    use_get: bool = False,
+    wrap: Any = None,
+    unwrap_text: bool = False,
+) -> property:
+    def fget(self: Any) -> list[Any]:
+        val = self.get(key) if use_get else self.decoded(key, None)
+        if val is None:
+            return []
+        items = list(val) if isinstance(val, list) else [val]
+        if wrap is not None:
+            return [x if isinstance(x, wrap) else wrap(x) for x in items]
+        if unwrap_text:
+            return [str(x) for x in items]
+        return items
+
+    def fset(self: Any, items: Any) -> None:
+        self.pop(key, None)
+        if items is None:
+            return
+        seq = items if isinstance(items, (list, tuple)) else [items]
+        for item in seq:
+            self.add(key, item)
+
+    def fdel(self: Any) -> None:
+        self.pop(key, None)
+
+    return property(fget, fset, fdel)
+
+
+def _categories_prop(key: str = "CATEGORIES") -> property:
+    def fget(self: Any) -> list[str]:
+        val = self.decoded(key, None)
+        if val is None:
+            return []
+        return list(val) if isinstance(val, list) else [str(val)]
+
+    def fset(self: Any, val: Any) -> None:
+        self.pop(key, None)
+        if val:
+            self.add(key, list(val) if isinstance(val, (list, tuple)) else [val])
+
+    def fdel(self: Any) -> None:
+        self.pop(key, None)
+
+    return property(fget, fset, fdel)
+
+
+def _flatten_exdate_item(item: Any) -> list[Any]:
+    if isinstance(item, vDDDLists):
+        return [d.dt for d in item.dts]
+    if isinstance(item, vDDDTypes):
+        return [item.dt]
+    if isinstance(item, list):
+        out: list[Any] = []
+        for sub in item:
+            out.extend(_flatten_exdate_item(sub))
+        return out
+    return [item]
+
+
+def _exdates_prop() -> property:
+    def fget(self: Any) -> list[Any]:
+        val = self.get("EXDATE")
+        if val is None:
+            return []
+        raw_items = val if isinstance(val, list) and not isinstance(val, vDDDLists) else [val]
+        out: list[Any] = []
+        for item in raw_items:
+            out.extend(_flatten_exdate_item(item))
+        return out
+
+    def fset(self: Any, val: Any) -> None:
+        self.pop("EXDATE", None)
+        if val:
+            seq = val if isinstance(val, (list, tuple)) else [val]
+            for item in seq:
+                self.add("EXDATE", item)
+
+    def fdel(self: Any) -> None:
+        self.pop("EXDATE", None)
+
+    return property(fget, fset, fdel)
+
+
+def _flatten_rdate_item(item: Any) -> list[tuple[Any, Any]]:
+    if isinstance(item, vDDDLists):
+        out: list[tuple[Any, Any]] = []
+        for d in item.dts:
+            out.extend(_flatten_rdate_item(d.dt))
+        return out
+    if isinstance(item, vDDDTypes):
+        return _flatten_rdate_item(item.dt)
+    if isinstance(item, vPeriod):
+        end_dt = (
+            item.start + item.end_or_dur
+            if isinstance(item.end_or_dur, datetime.timedelta)
+            else item.end_or_dur
+        )
+        return [(item.start, end_dt)]
+    if isinstance(item, tuple) and len(item) == 2:
+        end_dt = (item[0] + item[1]) if isinstance(item[1], datetime.timedelta) else item[1]
+        return [(item[0], end_dt)]
+    if isinstance(item, list):
+        out = []
+        for sub in item:
+            out.extend(_flatten_rdate_item(sub))
+        return out
+    return [(item, None)]
+
+
+def _rdates_prop() -> property:
+    def fget(self: Any) -> list[tuple[Any, Any]]:
+        val = self.get("RDATE")
+        if val is None:
+            return []
+        raw_items = val if isinstance(val, list) and not isinstance(val, vDDDLists) else [val]
+        out: list[tuple[Any, Any]] = []
+        for item in raw_items:
+            out.extend(_flatten_rdate_item(item))
+        return out
+
+    def fset(self: Any, val: Any) -> None:
+        self.pop("RDATE", None)
+        if val:
+            seq = val if isinstance(val, (list, tuple)) else [val]
+            for item in seq:
+                self.add("RDATE", item)
+
+    def fdel(self: Any) -> None:
+        self.pop("RDATE", None)
+
+    return property(fget, fset, fdel)
+
+
+def _rrules_prop() -> property:
+    def fget(self: Any) -> list[vRecur]:
+        val = self.get("RRULE")
+        if val is None:
+            return []
+        return list(val) if isinstance(val, list) else [val]
+
+    def fset(self: Any, val: Any) -> None:
+        self.pop("RRULE", None)
+        if val:
+            seq = val if isinstance(val, (list, tuple)) else [val]
+            for item in seq:
+                self.add("RRULE", item)
+
+    def fdel(self: Any) -> None:
+        self.pop("RRULE", None)
+
+    return property(fget, fset, fdel)
 
 
 class Component:
@@ -1197,11 +1480,25 @@ class Component:
         self._children_cache: Optional[_TrackedSubcomponents] = None
         self._props: list[tuple[str, Any, Parameters]] = []
         self._subcomponents: _TrackedSubcomponents = _TrackedSubcomponents(self)
+        self._errors: Optional[list[Any]] = None
         self._materialized = _rust_comp is None and _rust_cal is None
         if _rust_comp is not None:
             self.name = _rust_comp.name
         elif _rust_cal is not None:
             self.name = "VCALENDAR"
+
+    @property
+    def errors(self) -> list[Any]:
+        if self._errors is None:
+            if self._rust_cal is not None:
+                self._errors = list(self._rust_cal.warnings)
+            else:
+                self._errors = []
+        return self._errors
+
+    @errors.setter
+    def errors(self, value: list[Any]) -> None:
+        self._errors = list(value)
 
     def _mark_dirty(self) -> None:
         cur: Optional[Component] = self
@@ -1394,7 +1691,7 @@ class Component:
             return val if isinstance(val, vText) else vText(val, params=p_obj)
         return val
 
-    def decoded(self, name: str, default: Any = None) -> Any:
+    def decoded(self, name: str, default: Any = _MISSING) -> Any:
         key_upper = name.upper()
         if not self._materialized:
             if isinstance(self._rust_comp, _ox.Occurrence):
@@ -1404,6 +1701,8 @@ class Component:
                     "EXDATE",
                     "RECURRENCE-ID",
                 ):
+                    if default is _MISSING:
+                        raise KeyError(name)
                     return default
                 occ_end_key = "DUE" if self._rust_comp.name == "VTODO" else "DTEND"
                 if key_upper == "DTSTART":
@@ -1411,6 +1710,8 @@ class Component:
                 if key_upper == occ_end_key:
                     return self._rust_comp.end
                 if key_upper == "DURATION":
+                    if default is _MISSING:
+                        raise KeyError(name)
                     return default
                 pairs = self._rust_comp.component.get_all_with_params(key_upper)
             elif self._rust_comp is not None:
@@ -1420,6 +1721,8 @@ class Component:
             else:
                 pairs = []
             if not pairs:
+                if default is _MISSING:
+                    raise KeyError(name)
                 return default
             decoded_vals = [
                 vRecur.from_ical(val)
@@ -1431,6 +1734,8 @@ class Component:
         self._ensure_materialized()
         matches = [val for k, val, _ in self._props if k == key_upper]
         if not matches:
+            if default is _MISSING:
+                raise KeyError(name)
             return default
         raw = matches[0] if len(matches) == 1 else matches
         if isinstance(raw, vDDDTypes):
@@ -1668,70 +1973,17 @@ class Component:
         component._parent = self
         self._subcomponents.append(component)
 
-    @property
-    def uid(self) -> Optional[str]:
-        v = self.decoded("UID")
-        return str(v) if v is not None else None
-
-    @property
-    def created(self) -> Any:
-        return self.decoded("CREATED")
-
-    @property
-    def last_modified(self) -> Any:
-        return self.decoded("LAST-MODIFIED")
-
-    @property
-    def links(self) -> list[vUri]:
-        val = self.get("LINK")
-        if val is None:
-            return []
-        items = val if isinstance(val, list) else [val]
-        return [v if isinstance(v, vUri) else vUri(v) for v in items]
-
-    @property
-    def concepts(self) -> list[vUri]:
-        val = self.get("CONCEPT")
-        if val is None:
-            return []
-        items = val if isinstance(val, list) else [val]
-        return [v if isinstance(v, vUri) else vUri(v) for v in items]
-
-    @property
-    def refids(self) -> list[str]:
-        val = self.decoded("REFID")
-        if val is None:
-            return []
-        items = val if isinstance(val, list) else [val]
-        return [str(v) for v in items]
-
-    @property
-    def related_to(self) -> list[str]:
-        val = self.decoded("RELATED-TO")
-        if val is None:
-            return []
-        items = val if isinstance(val, list) else [val]
-        return [str(v) for v in items]
-
-    @property
-    def comments(self) -> list[str]:
-        val = self.decoded("COMMENT")
-        if val is None:
-            return []
-        items = val if isinstance(val, list) else [val]
-        return [str(v) for v in items]
-
-    @property
-    def DTSTAMP(self) -> Any:
-        return self.decoded("DTSTAMP")
-
-    @property
-    def CREATED(self) -> Any:
-        return self.decoded("CREATED")
-
-    @property
-    def LAST_MODIFIED(self) -> Any:
-        return self.decoded("LAST-MODIFIED")
+    uid = _scalar_prop("UID", cast=str)
+    created = _scalar_prop("CREATED")
+    last_modified = _scalar_prop("LAST-MODIFIED")
+    links = _multi_prop("LINK", use_get=True, wrap=vUri)
+    concepts = _multi_prop("CONCEPT", use_get=True, wrap=vUri)
+    refids = _multi_prop("REFID", unwrap_text=True)
+    related_to = _multi_prop("RELATED-TO", unwrap_text=True)
+    comments = _multi_prop("COMMENT", unwrap_text=True)
+    DTSTAMP = _scalar_prop("DTSTAMP")
+    CREATED = _scalar_prop("CREATED")
+    LAST_MODIFIED = _scalar_prop("LAST-MODIFIED")
 
     def is_empty(self) -> bool:
         self._ensure_materialized()
@@ -1744,7 +1996,7 @@ class Component:
         return "X-MOZ-LASTACK" in self or "X-MOZ-SNOOZE-TIME" in self
 
     def with_uid(self, uid: str) -> list[Component]:
-        return [c for c in self.walk() if c.decoded("UID") == uid]
+        return [c for c in self.walk() if c.decoded("UID", None) == uid]
 
     def stamp(self) -> None:
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -1865,13 +2117,13 @@ class Component:
     def to_ical(self, sorted: bool = True) -> bytes:
         if not self._materialized:
             if self._rust_cal is not None:
-                return self._rust_cal.to_ical()
+                return self._rust_cal.to_ical(sorted=sorted)
             if isinstance(self._rust_comp, _ox.Occurrence):
                 return self._rust_comp.to_ical(
                     keep_recurrence_attributes=self._keep_recurrence
                 )
             if self._rust_comp is not None:
-                return self._rust_comp.to_ical()
+                return self._rust_comp.to_ical(sorted=sorted)
 
         buf = bytearray()
         buf.extend(_fold_line(f"BEGIN:{self.name}"))
@@ -2171,11 +2423,15 @@ class _SpanMixin(Component):
 
     @property
     def start(self) -> Any:
-        return self.decoded("DTSTART")
+        return self.decoded("DTSTART", None)
 
     @start.setter
     def start(self, val: Any) -> None:
         self["DTSTART"] = val
+
+    @start.deleter
+    def start(self) -> None:
+        self.pop("DTSTART", None)
 
     def set_start(self, val: Any, parameters: Optional[dict[str, Any]] = None) -> None:
         self._ensure_materialized()
@@ -2185,9 +2441,9 @@ class _SpanMixin(Component):
     @property
     def end(self) -> Any:
         if self.name == "VTODO" and "DUE" in self:
-            return self.decoded("DUE")
+            return self.decoded("DUE", None)
         if "DTEND" in self:
-            return self.decoded("DTEND")
+            return self.decoded("DTEND", None)
         st = self.start
         dur = self.duration
         if st is not None and isinstance(dur, datetime.timedelta):
@@ -2199,6 +2455,11 @@ class _SpanMixin(Component):
         key = "DUE" if self.name == "VTODO" else "DTEND"
         self[key] = val
 
+    @end.deleter
+    def end(self) -> None:
+        key = "DUE" if self.name == "VTODO" and "DUE" in self else "DTEND"
+        self.pop(key, None)
+
     def set_end(self, val: Any, parameters: Optional[dict[str, Any]] = None) -> None:
         self._ensure_materialized()
         key = "DUE" if self.name == "VTODO" else "DTEND"
@@ -2208,159 +2469,60 @@ class _SpanMixin(Component):
     @property
     def duration(self) -> Optional[datetime.timedelta]:
         if "DURATION" in self:
-            return self.decoded("DURATION")
-        st = self.decoded("DTSTART")
+            return self.decoded("DURATION", None)
+        st = self.decoded("DTSTART", None)
         end_key = "DUE" if self.name == "VTODO" else "DTEND"
-        en = self.decoded(end_key)
+        en = self.decoded(end_key, None)
         if st is not None and en is not None:
             return en - st
         return None
 
+    @duration.setter
+    def duration(self, val: Any) -> None:
+        if val is None:
+            self.pop("DURATION", None)
+        else:
+            self["DURATION"] = val
+
+    @duration.deleter
+    def duration(self) -> None:
+        self.pop("DURATION", None)
+
     def set_duration(self, val: datetime.timedelta) -> None:
         self["DURATION"] = val
 
-    @property
-    def summary(self) -> Optional[str]:
-        return self.decoded("SUMMARY")
-
-    @property
-    def description(self) -> Optional[str]:
-        return self.decoded("DESCRIPTION")
-
-    @property
-    def location(self) -> Optional[str]:
-        return self.decoded("LOCATION")
-
-    @property
-    def uid(self) -> Optional[str]:
-        return self.decoded("UID")
-
-    @property
-    def status(self) -> Optional[str]:
-        return self.decoded("STATUS")
-
-    @property
-    def priority(self) -> Optional[int]:
-        return self.decoded("PRIORITY")
-
-    @property
-    def sequence(self) -> int:
-        val = self.decoded("SEQUENCE", 0)
-        return int(val) if val is not None else 0
-
-    @property
-    def categories(self) -> list[str]:
-        val = self.decoded("CATEGORIES")
-        if val is None:
-            return []
-        return list(val) if isinstance(val, list) else [str(val)]
-
-    @property
-    def color(self) -> Optional[str]:
-        return self.decoded("COLOR")
-
-    @property
-    def organizer(self) -> Optional[str]:
-        return self.decoded("ORGANIZER")
-
-    @property
-    def attendees(self) -> list[str]:
-        val = self.get("ATTENDEE")
-        if val is None:
-            return []
-        return list(val) if isinstance(val, list) else [val]
-
-    @property
-    def rrules(self) -> list[vRecur]:
-        val = self.get("RRULE")
-        if val is None:
-            return []
-        return list(val) if isinstance(val, list) else [val]
-
-    @property
-    def rdates(self) -> list[Any]:
-        val = self.get("RDATE")
-        if val is None:
-            return []
-        return list(val) if isinstance(val, list) else [val]
-
-    @property
-    def exdates(self) -> list[Any]:
-        val = self.get("EXDATE")
-        if val is None:
-            return []
-        return list(val) if isinstance(val, list) else [val]
+    summary = _scalar_prop("SUMMARY")
+    description = _scalar_prop("DESCRIPTION")
+    location = _scalar_prop("LOCATION")
+    status = _scalar_prop("STATUS")
+    priority = _scalar_prop("PRIORITY")
+    sequence = _scalar_prop("SEQUENCE", default=0, cast=int)
+    categories = _categories_prop("CATEGORIES")
+    color = _scalar_prop("COLOR")
+    organizer = _scalar_prop("ORGANIZER")
+    attendees = _multi_prop("ATTENDEE", use_get=True)
+    rrules = _rrules_prop()
+    rdates = _rdates_prop()
+    exdates = _exdates_prop()
 
     @property
     def alarms(self) -> Alarms:
         return Alarms(self)
 
-    @property
-    def classification(self) -> Optional[str]:
-        return self.decoded("CLASS")
-
-    @property
-    def transparency(self) -> Optional[str]:
-        return self.decoded("TRANSP")
-
-    @property
-    def url(self) -> Optional[str]:
-        return self.decoded("URL")
-
-    @property
-    def contacts(self) -> list[str]:
-        val = self.decoded("CONTACT")
-        if val is None:
-            return []
-        return list(val) if isinstance(val, list) else [str(val)]
-
-    @property
-    def conferences(self) -> list[Conference]:
-        val = self.get("CONFERENCE")
-        if val is None:
-            return []
-        items = val if isinstance(val, list) else [val]
-        return [v if isinstance(v, Conference) else Conference(v) for v in items]
-
-    @property
-    def images(self) -> list[Image]:
-        val = self.get("IMAGE")
-        if val is None:
-            return []
-        items = val if isinstance(val, list) else [val]
-        return [v if isinstance(v, Image) else Image(v) for v in items]
-
-    @property
-    def DTSTART(self) -> Any:
-        return self.start
-
-    @property
-    def DTEND(self) -> Any:
-        return self.decoded("DTEND")
-
-    @property
-    def DUE(self) -> Any:
-        return self.decoded("DUE")
-
-    @property
-    def DURATION(self) -> Optional[datetime.timedelta]:
-        return self.duration
-
-    @property
-    def RECURRENCE_ID(self) -> Any:
-        return self.decoded("RECURRENCE-ID")
-
-    @property
-    def REQUEST_STATUS(self) -> Any:
-        return self.decoded("REQUEST-STATUS")
-
-    @property
-    def X_MOZ_LASTACK(self) -> Any:
-        return self.decoded("X-MOZ-LASTACK")
-
-    @property
-    def X_MOZ_SNOOZE_TIME(self) -> Any:
-        return self.decoded("X-MOZ-SNOOZE-TIME")
+    classification = _scalar_prop("CLASS")
+    transparency = _scalar_prop("TRANSP")
+    url = _scalar_prop("URL")
+    contacts = _multi_prop("CONTACT", unwrap_text=True)
+    conferences = _multi_prop("CONFERENCE", use_get=True, wrap=Conference)
+    images = _multi_prop("IMAGE", use_get=True, wrap=Image)
+    DTSTART = _scalar_prop("DTSTART")
+    DTEND = _scalar_prop("DTEND")
+    DUE = _scalar_prop("DUE")
+    DURATION = duration
+    RECURRENCE_ID = _scalar_prop("RECURRENCE-ID")
+    REQUEST_STATUS = _scalar_prop("REQUEST-STATUS")
+    X_MOZ_LASTACK = _scalar_prop("X-MOZ-LASTACK")
+    X_MOZ_SNOOZE_TIME = _scalar_prop("X-MOZ-SNOOZE-TIME")
 
 
 class Event(_SpanMixin):
@@ -2483,12 +2645,7 @@ class Journal(_SpanMixin):
         jn.stamp()
         return jn
 
-    @property
-    def descriptions(self) -> list[str]:
-        val = self.decoded("DESCRIPTION")
-        if val is None:
-            return []
-        return list(val) if isinstance(val, list) else [str(val)]
+    descriptions = _multi_prop("DESCRIPTION", unwrap_text=True)
 
 
 class Alarm(Component):
@@ -2569,38 +2726,19 @@ class Alarm(Component):
             al.add("ATTENDEE", att)
         return al
 
-    @property
-    def action(self) -> Optional[str]:
-        return self.decoded("ACTION")
-
-    @property
-    def trigger(self) -> Any:
-        return self.decoded("TRIGGER")
+    action = _scalar_prop("ACTION")
+    trigger = _scalar_prop("TRIGGER")
 
     @property
     def triggers(self) -> list[Any]:
         t = self.trigger
         return [] if t is None else (list(t) if isinstance(t, list) else [t])
 
-    @property
-    def description(self) -> Optional[str]:
-        return self.decoded("DESCRIPTION")
-
-    @property
-    def summary(self) -> Optional[str]:
-        return self.decoded("SUMMARY")
-
-    @property
-    def acknowledged(self) -> Any:
-        return self.decoded("ACKNOWLEDGED")
-
-    @property
-    def ACTION(self) -> Optional[str]:
-        return self.action
-
-    @property
-    def TRIGGER(self) -> Any:
-        return self.trigger
+    description = _scalar_prop("DESCRIPTION")
+    summary = _scalar_prop("SUMMARY")
+    acknowledged = _scalar_prop("ACKNOWLEDGED")
+    ACTION = _scalar_prop("ACTION")
+    TRIGGER = _scalar_prop("TRIGGER")
 
     @property
     def TRIGGER_RELATED(self) -> str:
@@ -2610,39 +2748,28 @@ class Alarm(Component):
         params = getattr(trig, "params", {})
         return str(params.get("RELATED", "START")).strip().upper()
 
-    @property
-    def DURATION(self) -> Optional[datetime.timedelta]:
-        return self.duration
+    @TRIGGER_RELATED.setter
+    def TRIGGER_RELATED(self, value: str) -> None:
+        if "TRIGGER" in self:
+            trig = self["TRIGGER"]
+            if hasattr(trig, "params"):
+                trig.params["RELATED"] = str(value).upper()
 
-    @property
-    def REPEAT(self) -> int:
-        return self.repeat
-
-    @property
-    def ACKNOWLEDGED(self) -> Any:
-        return self.acknowledged
+    DURATION = _scalar_prop("DURATION")
+    REPEAT = _scalar_prop("REPEAT", default=0, cast=int)
+    ACKNOWLEDGED = _scalar_prop("ACKNOWLEDGED")
 
     Triggers = triggers
 
-    @property
-    def attendees(self) -> list[Any]:
-        val = self.get("ATTENDEE")
-        if val is None:
-            return []
-        return list(val) if isinstance(val, list) else [val]
-
-    @property
-    def repeat(self) -> int:
-        return int(self.decoded("REPEAT", 0) or 0)
+    attendees = _multi_prop("ATTENDEE", use_get=True)
+    repeat = _scalar_prop("REPEAT", default=0, cast=int)
 
     @classmethod
     def example(cls, name: str = "example") -> Alarm:
         _ = name
         return cls.new_display(datetime.timedelta(minutes=-15), "Example Alarm")
 
-    @property
-    def duration(self) -> Optional[datetime.timedelta]:
-        return self.decoded("DURATION")
+    duration = _scalar_prop("DURATION")
 
 
 class FreeBusy(_SpanMixin):
@@ -2743,7 +2870,7 @@ class Timezone(Component):
 
     @property
     def tz_name(self) -> Optional[str]:
-        v = self.decoded("TZID")
+        v = self.decoded("TZID", None)
         return str(v) if v is not None else None
 
     @property
@@ -2832,11 +2959,22 @@ class Timezone(Component):
         return _CompiledVTimezoneTzInfo(self.tz_name or "VTIMEZONE", rows)
 
 
-class TimezoneStandard(Component):
+class _TimezoneSubComponent(Component):
+    """Shared properties for ``STANDARD`` and ``DAYLIGHT`` subcomponents."""
+
+    DTSTART = _scalar_prop("DTSTART")
+    TZOFFSETFROM = _scalar_prop("TZOFFSETFROM")
+    TZOFFSETTO = _scalar_prop("TZOFFSETTO")
+    exdates = _exdates_prop()
+    rdates = _rdates_prop()
+    rrules = _rrules_prop()
+
+
+class TimezoneStandard(_TimezoneSubComponent):
     name = "STANDARD"
 
 
-class TimezoneDaylight(Component):
+class TimezoneDaylight(_TimezoneSubComponent):
     name = "DAYLIGHT"
 
 
@@ -2883,9 +3021,7 @@ class Availability(_SpanMixin):
     def available(self) -> list[Available]:
         return [c for c in self.subcomponents if c.name == "AVAILABLE"]  # type: ignore[misc]
 
-    @property
-    def busy_type(self) -> Optional[str]:
-        return self.decoded("BUSYTYPE")
+    busy_type = _scalar_prop("BUSYTYPE")
 
 
 class Available(_SpanMixin):
@@ -2912,6 +3048,18 @@ class Available(_SpanMixin):
             av.add("DTEND", end)
         if duration is not None:
             av.add("DURATION", duration)
+        return av
+
+    @classmethod
+    def example(cls, name: str = "example") -> Available:
+        _ = name
+        av = cls.new(
+            uid="example-available@icaloxide",
+            summary="Morning Slot",
+            start=datetime.datetime(2026, 1, 1, 9, 0, tzinfo=datetime.timezone.utc),
+            duration=datetime.timedelta(hours=3),
+        )
+        av.stamp()
         return av
 
 
@@ -2952,13 +3100,19 @@ class Calendar(Component):
     @classmethod
     def from_ical(
         cls, st: _ox.InputData, multiple: bool = False, *, strict: bool = False
-    ) -> Union[Calendar, list[Calendar]]:
+    ) -> Union[Component, list[Calendar]]:
         try:
             if multiple:
                 cals = _ox.Calendar.from_ical_multiple(st, strict=strict)
                 return [cls(_rust_cal=c) for c in cals]
-            cal = _ox.Calendar.from_ical(st, strict=strict)
-            return cls(_rust_cal=cal)
+            try:
+                cal = _ox.Calendar.from_ical(st, strict=strict)
+                return cls(_rust_cal=cal)
+            except ValueError as inner_exc:
+                if not strict and "expected VCALENDAR root component" in str(inner_exc):
+                    comp = _ox.parse_component(st, strict=False)
+                    return _wrap_rust_component(comp)
+                raise
         except ValueError as exc:
             raise ICalParsingError(str(exc)) from exc
 
@@ -3003,92 +3157,26 @@ class Calendar(Component):
             cal["VERSION"] = version
         return cal
 
-    @property
-    def calendar_name(self) -> Optional[str]:
-        return self.decoded("NAME") or self.decoded("X-WR-CALNAME")
-
-    @property
-    def prodid(self) -> Optional[str]:
-        return self.decoded("PRODID")
-
-    @property
-    def version(self) -> Optional[str]:
-        return self.decoded("VERSION")
-
-    @property
-    def calscale(self) -> Optional[str]:
-        return self.decoded("CALSCALE")
-
-    @property
-    def method(self) -> Optional[str]:
-        return self.decoded("METHOD")
-
-    @property
-    def color(self) -> Optional[str]:
-        return self.decoded("COLOR")
-
-    @property
-    def description(self) -> Optional[str]:
-        return self.decoded("DESCRIPTION") or self.decoded("X-WR-CALDESC")
-
-    @property
-    def categories(self) -> list[str]:
-        val = self.decoded("CATEGORIES")
-        if val is None:
-            return []
-        return list(val) if isinstance(val, list) else [str(val)]
-
-    @property
-    def source(self) -> Optional[str]:
-        return self.decoded("SOURCE")
-
-    @property
-    def refresh_interval(self) -> Any:
-        return self.decoded("REFRESH-INTERVAL")
-
-    @property
-    def url(self) -> Optional[str]:
-        return self.decoded("URL")
-
-    @property
-    def images(self) -> list[Image]:
-        val = self.get("IMAGE")
-        if val is None:
-            return []
-        items = val if isinstance(val, list) else [val]
-        return [v if isinstance(v, Image) else Image(v) for v in items]
-
-    @property
-    def DTSTART(self) -> Any:
-        return self.start
-
-    @property
-    def DTEND(self) -> Any:
-        return self.decoded("DTEND")
-
-    @property
-    def DUE(self) -> Any:
-        return self.decoded("DUE")
-
-    @property
-    def DURATION(self) -> Optional[datetime.timedelta]:
-        return self.duration
-
-    @property
-    def RECURRENCE_ID(self) -> Any:
-        return self.decoded("RECURRENCE-ID")
-
-    @property
-    def REQUEST_STATUS(self) -> Any:
-        return self.decoded("REQUEST-STATUS")
-
-    @property
-    def X_MOZ_LASTACK(self) -> Any:
-        return self.decoded("X-MOZ-LASTACK")
-
-    @property
-    def X_MOZ_SNOOZE_TIME(self) -> Any:
-        return self.decoded("X-MOZ-SNOOZE-TIME")
+    calendar_name = _scalar_prop("NAME", fallback_key="X-WR-CALNAME")
+    prodid = _scalar_prop("PRODID")
+    version = _scalar_prop("VERSION")
+    calscale = _scalar_prop("CALSCALE")
+    method = _scalar_prop("METHOD")
+    color = _scalar_prop("COLOR")
+    description = _scalar_prop("DESCRIPTION", fallback_key="X-WR-CALDESC")
+    categories = _categories_prop("CATEGORIES")
+    source = _scalar_prop("SOURCE")
+    refresh_interval = _scalar_prop("REFRESH-INTERVAL")
+    url = _scalar_prop("URL")
+    images = _multi_prop("IMAGE", use_get=True, wrap=Image)
+    DTSTART = _scalar_prop("DTSTART")
+    DTEND = _scalar_prop("DTEND")
+    DUE = _scalar_prop("DUE")
+    DURATION = _scalar_prop("DURATION")
+    RECURRENCE_ID = _scalar_prop("RECURRENCE-ID")
+    REQUEST_STATUS = _scalar_prop("REQUEST-STATUS")
+    X_MOZ_LASTACK = _scalar_prop("X-MOZ-LASTACK")
+    X_MOZ_SNOOZE_TIME = _scalar_prop("X-MOZ-SNOOZE-TIME")
 
     def cancel_occurrence(self, uid: str, recurrence_id: Any) -> Calendar:
         """Exclude a specific occurrence of ``uid`` by adding an ``EXDATE`` to its master component."""
@@ -3177,7 +3265,7 @@ class Calendar(Component):
         return [c for c in self.subcomponents if c.name == "VAVAILABILITY"]  # type: ignore[misc]
 
     def with_uid(self, uid: str) -> list[Component]:
-        return [c for c in self.walk() if c.decoded("UID") == uid]
+        return [c for c in self.walk() if c.decoded("UID", None) == uid]
 
     def get_used_tzids(self) -> list[str]:
         return self._as_rust_calendar().used_tzids()

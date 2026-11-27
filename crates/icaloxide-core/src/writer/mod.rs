@@ -9,13 +9,28 @@ const MAX_LINE_OCTETS: usize = 75;
 
 /// Serialize an entire [`Calendar`] into `out` using `\r\n` endings and UTF-8-safe 75-octet folding.
 pub fn write_calendar(cal: &Calendar, out: &mut impl Write) -> fmt::Result {
-    write_component(&cal.arena, cal.root_id(), out)
+    write_component_ordered(&cal.arena, cal.root_id(), false, out)
+}
+
+/// Serialize an entire [`Calendar`] with deterministically sorted properties per component.
+pub fn write_calendar_sorted(cal: &Calendar, out: &mut impl Write) -> fmt::Result {
+    write_component_ordered(&cal.arena, cal.root_id(), true, out)
 }
 
 /// Serialize a single component (and its nested subcomponents) into `out`.
 pub fn write_component(
     arena: &ComponentArena,
     id: ComponentId,
+    out: &mut impl Write,
+) -> fmt::Result {
+    write_component_ordered(arena, id, false, out)
+}
+
+/// Serialize a single component (and nested subcomponents) into `out`, optionally sorting properties by name.
+pub fn write_component_ordered(
+    arena: &ComponentArena,
+    id: ComponentId,
+    sorted: bool,
     out: &mut impl Write,
 ) -> fmt::Result {
     let Some(node) = arena.get(id) else {
@@ -30,15 +45,25 @@ pub fn write_component(
     write_folded_line(&line_buf, out)?;
 
     // Properties
-    for prop in &node.properties {
-        line_buf.clear();
-        format_property(prop, &mut line_buf)?;
-        write_folded_line(&line_buf, out)?;
+    if sorted && node.properties.len() > 1 {
+        let mut refs: Vec<&Property> = node.properties.iter().collect();
+        refs.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+        for prop in refs {
+            line_buf.clear();
+            format_property(prop, &mut line_buf)?;
+            write_folded_line(&line_buf, out)?;
+        }
+    } else {
+        for prop in &node.properties {
+            line_buf.clear();
+            format_property(prop, &mut line_buf)?;
+            write_folded_line(&line_buf, out)?;
+        }
     }
 
     // Nested child components
     for &child_id in &node.children {
-        write_component(arena, child_id, out)?;
+        write_component_ordered(arena, child_id, sorted, out)?;
     }
 
     // END:<COMPONENT>

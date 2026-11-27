@@ -5,7 +5,7 @@ use crate::error::{ParseError, ParseOptions, ParseWarning};
 use crate::model::known::{ComponentKind, ParamName, PropertyName};
 use crate::model::value::PropertyValue;
 use crate::parser::parse_calendar_with_options;
-use crate::writer::write_calendar;
+use crate::writer::{write_calendar, write_calendar_sorted, write_component_ordered};
 
 /// Opaque arena index identifying a component inside [`Calendar`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -452,11 +452,23 @@ impl Calendar {
         out
     }
 
+    /// Serialize this calendar with deterministically sorted properties per component.
+    pub fn to_ical_sorted(&self) -> String {
+        let mut out = String::with_capacity(self.arena.len() * 128);
+        let _ = write_calendar_sorted(self, &mut out);
+        out
+    }
+
     /// Serialize a single component (e.g. a `VEVENT`) to an RFC 5545 string.
     pub fn component_to_ical(&self, id: ComponentId) -> Option<String> {
+        self.component_to_ical_ordered(id, false)
+    }
+
+    /// Serialize a single component (e.g. a `VEVENT`), optionally sorting properties by name.
+    pub fn component_to_ical_ordered(&self, id: ComponentId, sorted: bool) -> Option<String> {
         self.component(id)?;
         let mut out = String::with_capacity(256);
-        let _ = crate::writer::write_component(&self.arena, id, &mut out);
+        let _ = write_component_ordered(&self.arena, id, sorted, &mut out);
         Some(out)
     }
 }

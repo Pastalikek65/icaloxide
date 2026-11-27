@@ -65,7 +65,7 @@ class AlarmTime:
     @property
     def action(self) -> Optional[str]:
         return getattr(self._alarm, "action", None) or (
-            self._alarm.decoded("ACTION") if hasattr(self._alarm, "decoded") else None
+            self._alarm.decoded("ACTION", None) if hasattr(self._alarm, "decoded") else None
         )
 
     @property
@@ -88,7 +88,7 @@ class AlarmTime:
         """Return ``True`` if this alarm has not been acknowledged past its active trigger."""
         ack_prop = None
         if hasattr(self._alarm, "decoded"):
-            ack_prop = self._alarm.decoded("ACKNOWLEDGED")
+            ack_prop = self._alarm.decoded("ACKNOWLEDGED", None)
         trigger_utc = _as_utc(self._trigger, getattr(self._trigger, "tzinfo", None))
 
         ack_candidates: list[datetime.datetime] = []
@@ -145,21 +145,21 @@ class Alarms:
             return
         self.set_parent(component)
         if name in ("VEVENT", "VTODO"):
-            start = component.decoded("DTSTART")
+            start = component.decoded("DTSTART", None)
             if start is not None:
                 self.set_start(start)
             end_key = "DUE" if name == "VTODO" and "DUE" in component else "DTEND"
-            end = component.decoded(end_key)
+            end = component.decoded(end_key, None)
             if end is None and start is not None:
-                dur = component.decoded("DURATION")
+                dur = component.decoded("DURATION", None)
                 if isinstance(dur, datetime.timedelta):
                     end = _add_span(start, dur)
             if end is not None:
                 self.set_end(end)
-            last_ack = component.decoded("X-MOZ-LASTACK")
+            last_ack = component.decoded("X-MOZ-LASTACK", None)
             if isinstance(last_ack, (datetime.date, datetime.datetime)):
                 self.acknowledge_until(last_ack)
-            snooze = component.decoded("X-MOZ-SNOOZE-TIME")
+            snooze = component.decoded("X-MOZ-SNOOZE-TIME", None)
             if isinstance(snooze, (datetime.date, datetime.datetime)):
                 self.snooze_until(snooze)
         for sub in getattr(component, "subcomponents", ()):
@@ -215,7 +215,7 @@ class Alarms:
     def _repeat_triggers(first: Any, alarm: Any) -> Iterator[Any]:
         yield first
         repeat = int(alarm.decoded("REPEAT", 0) or 0)
-        dur = alarm.decoded("DURATION")
+        dur = alarm.decoded("DURATION", None)
         if repeat > 0 and isinstance(dur, datetime.timedelta):
             for idx in range(1, repeat + 1):
                 yield _add_span(first, dur * idx)
@@ -242,7 +242,7 @@ class Alarms:
                     "Use Alarms.set_end because an alarm is relative to the end of a component."
                 )
             for al in self._end_alarms:
-                delta = al.decoded("TRIGGER")
+                delta = al.decoded("TRIGGER", None)
                 for trig in self._repeat_triggers(_add_span(self._end, delta), al):
                     out.append(self._make_alarm_time(al, trig))
         if self._start_alarms:
@@ -251,11 +251,11 @@ class Alarms:
                     "Use Alarms.set_start because an alarm is relative to the start of a component."
                 )
             for al in self._start_alarms:
-                delta = al.decoded("TRIGGER")
+                delta = al.decoded("TRIGGER", None)
                 for trig in self._repeat_triggers(_add_span(self._start, delta), al):
                     out.append(self._make_alarm_time(al, trig))
         for al in self._absolute_alarms:
-            abs_trig = al.decoded("TRIGGER")
+            abs_trig = al.decoded("TRIGGER", None)
             for trig in self._repeat_triggers(abs_trig, al):
                 out.append(self._make_alarm_time(al, trig))
         return out

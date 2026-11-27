@@ -5,6 +5,20 @@ All notable changes to `icaloxide` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-11-27
+
+### Fixed & Added
+
+- **Native Rust Sorted Serialization (`icaloxide-core`, `icaloxide-py`)**:
+  - Added `write_calendar_sorted` / `write_component_ordered` and `to_ical(sorted=True)` on `Calendar` and `Component` so unmaterialized `compat.Calendar.to_ical(sorted=True)` executes directly in Rust without Python materialization.
+- **Full `icalendar 7.x` Property Setters/Deleters & API Parity (`icaloxide.compat`)**:
+  - Added property setters and deleters across `Component`, `Event`, `Todo`, `Journal`, `Alarm`, `TimezoneStandard`, `TimezoneDaylight`, `Availability`, and `Calendar` (`summary`, `description`, `location`, `status`, `priority`, `sequence`, `categories`, `attendees`, `rrules`, `rdates`, `exdates`, `calendar_name`, `method`, `TZOFFSETTO`, etc.).
+  - Flattened `ev.exdates` and `ev.rdates` to match `icalendar 7.3.2` (`list[date | datetime]` and `list[tuple[date | datetime, timedelta | None]]`).
+  - Updated `Component.decoded(name)` without a `default` argument to raise `KeyError` (matching `icalendar 7.3.2`).
+  - Enabled `Calendar.from_ical(vevent)` standalone component parsing in lenient mode (`strict=False`), added `Component.errors`, `Available.example()`, `Parameters.canonical_order`, `vPeriod.overlaps`/`dt`, `vRecur` dict helpers, `vDDDTypes.td`/shortcuts, `vText` shortcuts, `vBinary.base64data`, and `vUTCOffset.format()`.
+  - Updated `compat.recurring_ical_events` with `at(date=...)`, `OccurrenceID.from_string`/`from_occurrence`, and `X-WR-TIMEZONE` localization for floating occurrences.
+- **Verification**: Added `tests/test_red_team_v06.py`.
+
 ## [0.5.1] - 2026-11-27
 
 ### Fixed & Added
