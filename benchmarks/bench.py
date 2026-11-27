@@ -269,6 +269,32 @@ def main() -> None:
         }
     )
 
+    # 7. Parse + Mutate 1,000 events + to_ical (compat vs upstream)
+    def _up_mutate_1k() -> bytes:
+        c = up_ical.Calendar.from_ical(medium_ics)
+        for idx, ev in enumerate(c.events):
+            ev["SUMMARY"] = f"Updated #{idx}"
+        return c.to_ical()
+
+    def _oxc_mutate_1k() -> bytes:
+        c = OxCompatCalendar.from_ical(medium_ics)
+        for idx, ev in enumerate(c.events):
+            ev["SUMMARY"] = f"Updated #{idx}"
+        return c.to_ical()
+
+    t_up, h_up = bench_time_and_pyheap(_up_mutate_1k, repeats=3)
+    t_oxc, h_oxc = bench_time_and_pyheap(_oxc_mutate_1k, repeats=5)
+    results.append(
+        {
+            "workload": "Parse + Mutate 1,000 events + to_ical",
+            "upstream_ms": t_up,
+            "ox_ms": None,
+            "oxc_ms": t_oxc,
+            "up_heap_kb": h_up / 1024,
+            "ox_heap_kb": h_oxc / 1024,
+        }
+    )
+
     summary = {
         "rss_10k_mb": {
             "upstream": round(up_rss_mb, 2),

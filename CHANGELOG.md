@@ -5,6 +5,26 @@ All notable changes to `icaloxide` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-11-27
+
+### Fixed & Added
+
+- **Cross-Timezone `RDATE`, Spring-Forward Hourly DST & Post-2100 `COUNT` `all()` (`icaloxide-rrule`)**:
+  - Added per-entry `CalendarTimeZone` resolution (`RDateEntry.tz`) and `cand_tz` propagation through `apply_this_and_future_shift`, `expand_master_window`, `push_master_statics`, and `build_master`, fixing `RDATE;TZID=...` differing from `DTSTART`'s timezone.
+  - Updated deduplication in `expand_master_window` and `OwnedSeriesStream` to key on `(start_utc, local_date, local_time)`, preventing dropped `FREQ=HOURLY` occurrences across DST spring-forward transitions.
+  - Added `CompiledSeries::is_finite()` and updated `CalendarQuery::all()` so finite `COUNT` `RRULE`s beyond year 2100 return all occurrences cleanly.
+- **Live `subcomponents`, `.dt`, `vRecur` Mutations, Binary `ATTACH` & `Occurrence` `TZID` Params (`icaloxide.compat`)**:
+  - Replaced detached `list` copies in `Component.subcomponents` with `_TrackedSubcomponents` so `.clear()`, `.remove()`, `.append()`, item assignment, etc. mark parent components dirty and persist to `to_ical()`.
+  - Added live `_on_mutate` callbacks to `vDDDTypes.dt` and `vRecur` mutating methods so in-place edits (`ev["DTSTART"].dt = ...`, `ev["RRULE"]["COUNT"] = [9]`) persist directly into serialized output.
+  - Decoded `VALUE=BINARY` / `ENCODING=BASE64` properties (`ATTACH`) as `vBinary` / raw `bytes` (not `vUri` / base64 text).
+  - Preserved `TZID` and `VALUE=DATE` parameters on `Occurrence` `DTSTART` / `DTEND` / `DUE` wrappers.
+- **Full `compat.icalendar` Re-Exports & Submodule Shims (`compat.prop`, `compat.cal`, `compat.param`)**:
+  - Re-exported `Alarms`, `AlarmTime`, `enums`, `errors`, `vAdr`, `vN`, `vOrg`, `ComponentFactory`, `TypesFactory`, `q_join`, `q_split`, `use_pytz`, `__version__`, `version`, and `version_tuple` directly on `icaloxide.compat.icalendar`.
+  - Added `Component.parse`, `Component.types_factory`, and `.example()` factories across `Event`, `Todo`, `Journal`, `Alarm`, `Timezone`, `FreeBusy`, and `Availability`, plus standalone `compat.prop`, `compat.cal`, and `compat.param` modules.
+- **Benchmarks & Verification**:
+  - Added `tests/test_red_team_v05.py` covering all 7 red-team bugs and `compat` API parity.
+  - Added a real-world `Parse + Mutate 1,000 events + to_ical` workload to `benchmarks/bench.py` and updated `benchmarks/RESULTS.md` with fresh `v0.5.0` Native + `compat` measurements.
+
 ## [0.4.0] - 2026-11-27
 
 ### Fixed & Added

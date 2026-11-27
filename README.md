@@ -6,15 +6,16 @@
 
 ## Measured Performance (`--release` vs `icalendar 7.3.2` + `recurring-ical-events 3.8.2`)
 
-| Workload | Upstream Python | `icaloxide` (Native) | Speedup | Python Heap (`upstream` vs `icaloxide`) |
-| --- | ---: | ---: | ---: | ---: |
-| Parse 10,000 events (3.74 MB) | 1,530.38 ms | **16.08 ms** | **95.2x** | 61.1 MB vs **0.16 KB** |
-| Recurring `between()` 1y (200 series, 9,133 occs) | 434.91 ms | **5.68 ms** | **76.6x** | 32.9 MB vs **1.57 MB** |
-| Recurring `count()` 5y (200 series) | 1,536.50 ms | **14.86 ms** | **103.4x** | 132.1 MB vs **0.69 KB** |
-| Streaming `after()` next 20 (200 series) | 266.69 ms | **0.47 ms** | **568.8x** | 8.2 MB vs **4.43 KB** |
-| Serialize 5,000 events (`to_ical`) | 497.03 ms | **5.27 ms** | **94.4x** | 16.5 MB vs **1.94 MB** |
+| Workload | Upstream Python | `icaloxide` (Native) | `icaloxide.compat` | Speedup (Native / Compat) | Python Heap (`upstream` vs `icaloxide`) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Parse 10,000 events (3.74 MB) | 1,924.47 ms | **18.55 ms** | **19.27 ms** | **103.8x / 99.9x** | 61.1 MB vs **0.16 KB** |
+| Recurring `between()` 1y (200 series, 9,133 occs) | 500.45 ms | **7.56 ms** | **16.68 ms** | **66.2x / 30.0x** | 32.9 MB vs **1.57 MB** |
+| Recurring `count()` 5y (200 series) | 1,786.30 ms | **16.00 ms** | **15.88 ms** | **111.6x / 112.5x** | 132.1 MB vs **0.69 KB** |
+| Streaming `after()` next 20 (200 series) | 280.73 ms | **0.46 ms** | **0.46 ms** | **613.9x / 608.8x** | 8.2 MB vs **4.24 KB** |
+| Serialize 5,000 events (`to_ical`) | 482.31 ms | **5.89 ms** | **5.73 ms** | **81.9x / 84.2x** | 16.5 MB vs **1.94 MB** |
+| Parse + Mutate 1,000 events + `to_ical` | 243.42 ms | — | **39.97 ms** | **— / 6.1x** | 7.8 MB vs **5.1 MB** |
 
-Process RSS memory for parsing a 10,000-event calendar drops from **61.07 MB** (`icalendar`) to **21.77 MB** (`icaloxide`, **64.4% reduction**). See [benchmarks/RESULTS.md](benchmarks/RESULTS.md).
+Process RSS memory for parsing a 10,000-event calendar drops from **61.31 MB** (`icalendar`) to **21.73 MB** (`icaloxide` Native, **64.6% reduction**) / **25.50 MB** (`icaloxide.compat`, **58.4% reduction**). See [benchmarks/RESULTS.md](benchmarks/RESULTS.md).
 
 ## Quick Start
 

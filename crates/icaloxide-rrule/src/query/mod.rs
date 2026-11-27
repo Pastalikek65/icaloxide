@@ -292,10 +292,22 @@ impl CalendarQuery {
         }
     }
 
-    /// Return all occurrences across the calendar's bounded span (or `[min_start, 2100-12-31]` when unbounded).
+    /// Return all occurrences across the calendar's bounded/finite span (or `[min_start, 2100-12-31]` when infinite).
     pub fn all(&self) -> Result<Vec<Occurrence>, RRuleError> {
         if let Some((min_s, max_e)) = self.bounded_extents() {
             return self.between(min_s.saturating_sub(1), max_e.saturating_add(1));
+        }
+        let all_finite = self.series.iter().all(CompiledSeries::is_finite)
+            && (!self.want_alarms
+                || self
+                    .alarm_parent_series
+                    .iter()
+                    .all(CompiledSeries::is_finite));
+        if all_finite {
+            let start_utc = self.min_start_floor();
+            let y9999_utc =
+                i64::from(CalDate::new(9999, 12, 31).unwrap().to_days_since_epoch()) * 86_400;
+            return self.between(start_utc, y9999_utc);
         }
         let y1900_utc = i64::from(CalDate::new(1900, 1, 1).unwrap().to_days_since_epoch()) * 86_400;
         let start_utc = self.min_start_floor().min(y1900_utc);
@@ -688,7 +700,7 @@ struct OwnedSeriesStream {
     rule_cursors: Vec<OwnedRuleCursor>,
     split_cursors: Vec<OwnedSplitCursor>,
     static_items: BinaryHeap<Reverse<HeapEntry>>,
-    seen_instants: rustc_hash::FxHashSet<i64>,
+    seen_instants: rustc_hash::FxHashSet<(i64, CalDate, CalTime)>,
 }
 
 struct OwnedRuleCursor {
@@ -936,7 +948,13 @@ impl AfterIter {
             let Some(occ) = occ else {
                 return Ok(None);
             };
-            if from_master && !stream.seen_instants.insert(occ.start_utc) {
+            if from_master
+                && !stream.seen_instants.insert((
+                    occ.start_utc,
+                    occ.start_local.date,
+                    occ.start_local.time,
+                ))
+            {
                 continue;
             }
             return Ok(Some(occ));
@@ -1193,17 +1211,23 @@ fn push_master_statics(
     earliest_end_utc: i64,
     static_items: &mut BinaryHeap<Reverse<HeapEntry>>,
 ) {
-    let mut try_push = |dt: &CalDateTime, span: SpanDuration| {
-        let s_utc = resolve_local_instant(dt, &master.tz);
+    let mut try_push = |dt: &CalDateTime, cand_tz: &CalendarTimeZone, span: SpanDuration| {
+        let s_utc = resolve_local_instant(dt, cand_tz);
         if rrule_split_cutoff.is_some_and(|cut| s_utc >= cut) {
             return;
         }
         if master.exdates.matches(s_utc, dt.date, dt.time) {
             return;
         }
-        if let Some(occ) =
-            apply_this_and_future_shift(master, this_and_future, s_utc, dt, span, skip_cancelled)
-        {
+        if let Some(occ) = apply_this_and_future_shift(
+            master,
+            this_and_future,
+            s_utc,
+            dt,
+            cand_tz,
+            span,
+            skip_cancelled,
+        ) {
             if keeps_for_after(occ.start_utc, occ.end_utc, earliest_end_utc) {
                 static_items.push(Reverse(HeapEntry {
                     occ,
@@ -1215,10 +1239,14 @@ fn push_master_statics(
     };
 
     if should_emit_master_dtstart(master) {
-        try_push(&master.start_local, master.span);
+        try_push(&master.start_local, &master.tz, master.span);
     }
     for rdt in &master.rdates {
-        try_push(&rdt.start_local, rdt.custom_span.unwrap_or(master.span));
+        try_push(
+            &rdt.start_local,
+            &rdt.tz,
+            rdt.custom_span.unwrap_or(master.span),
+        );
     }
 }
 
@@ -1292,6 +1320,7 @@ fn advance_owned_cursor(
             this_and_future,
             s_utc,
             &cand_local,
+            &master.tz,
             master.span,
             skip_cancelled,
         ) else {

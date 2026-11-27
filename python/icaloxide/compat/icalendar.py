@@ -345,9 +345,29 @@ class vDDDTypes:
         self,
         dt: Union[datetime.date, datetime.datetime, datetime.timedelta, datetime.time, Any],
         params: Optional[dict[str, Any]] = None,
+        *,
+        _on_mutate: Any = None,
     ) -> None:
-        self.dt = dt
+        self._on_mutate: Any = None
+        self._dt = dt
         self.params = _ensure_parameters(params)
+        self._on_mutate = _on_mutate
+
+    @property
+    def dt(self) -> Any:
+        return self._dt
+
+    @dt.setter
+    def dt(self, value: Any) -> None:
+        if self._on_mutate is not None:
+            self._on_mutate()
+        self._dt = value
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> vDDDTypes:
+        return self.__class__(
+            copy.deepcopy(self._dt, memo),
+            params=copy.deepcopy(self.params, memo),
+        )
 
     def to_ical(self) -> bytes:
         local_params = dict(self.params)
@@ -438,15 +458,29 @@ class vRecur(dict):  # type: ignore[type-arg]
         self,
         *args: Any,
         params: Optional[dict[str, Any]] = None,
+        _on_mutate: Any = None,
         **kwargs: Any,
     ) -> None:
         super().__init__()
+        self._on_mutate: Any = None
         self.params = _ensure_parameters(params)
         data = dict(*args, **kwargs)
         for k, v in data.items():
             self[k] = v
+        self._on_mutate = _on_mutate
+
+    def _notify_mutate(self) -> None:
+        if self._on_mutate is not None:
+            self._on_mutate()
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> vRecur:
+        return vRecur(
+            {k: copy.deepcopy(v, memo) for k, v in self.items()},
+            params=copy.deepcopy(self.params, memo),
+        )
 
     def __setitem__(self, key: str, value: Any) -> None:
+        self._notify_mutate()
         key_up = str(key).upper()
         if isinstance(value, (list, tuple)):
             items = list(value)
@@ -462,6 +496,35 @@ class vRecur(dict):  # type: ignore[type-arg]
                     pass
             normalized.append(item)
         super().__setitem__(key_up, normalized)
+
+    def __delitem__(self, key: str) -> None:
+        self._notify_mutate()
+        super().__delitem__(str(key).upper())
+
+    def pop(self, key: str, *args: Any) -> Any:
+        self._notify_mutate()
+        return super().pop(str(key).upper(), *args)
+
+    def popitem(self) -> tuple[str, Any]:
+        self._notify_mutate()
+        return super().popitem()
+
+    def clear(self) -> None:
+        self._notify_mutate()
+        super().clear()
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        self._notify_mutate()
+        data = dict(*args, **kwargs)
+        for k, v in data.items():
+            self[k] = v
+
+    def setdefault(self, key: str, default: Any = None) -> Any:
+        key_up = str(key).upper()
+        if key_up in self:
+            return self[key_up]
+        self[key_up] = default
+        return self[key_up]
 
     @classmethod
     def from_ical(
@@ -913,6 +976,141 @@ def use_zoneinfo() -> None:
     """Compatibility no-op: ``icaloxide`` always uses stdlib ``zoneinfo`` + embedded TZDB."""
 
 
+def use_pytz() -> None:
+    """Compatibility no-op kept for drop-in ``icalendar`` imports."""
+
+
+def q_join(items: Iterable[Any], sep: str = ",") -> str:
+    """Join parameter values, quoting any element containing delimiters."""
+    return sep.join(_format_param_val(str(x)) for x in items)
+
+
+def q_split(text: str, sep: str = ",", maxsplit: int = -1) -> list[str]:
+    """Split ``text`` by ``sep`` outside double quotes."""
+    parts: list[str] = []
+    buf: list[str] = []
+    in_quotes = False
+    for ch in text:
+        if ch == '"':
+            in_quotes = not in_quotes
+            buf.append(ch)
+        elif ch == sep and not in_quotes and (maxsplit < 0 or len(parts) < maxsplit):
+            parts.append("".join(buf))
+            buf.clear()
+        else:
+            buf.append(ch)
+    parts.append("".join(buf))
+    return parts
+
+
+def _is_binary_prop(params: Any) -> bool:
+    if not params:
+        return False
+    val = params.get("VALUE")
+    enc = params.get("ENCODING")
+    v_str = str(val[0] if isinstance(val, (list, tuple)) and val else val or "").upper()
+    e_str = str(enc[0] if isinstance(enc, (list, tuple)) and enc else enc or "").upper()
+    return v_str == "BINARY" or e_str == "BASE64"
+
+
+def _decode_binary_val(val: Any) -> bytes:
+    if isinstance(val, vBinary):
+        return val.obj if isinstance(val.obj, bytes) else str(val.obj).encode("utf-8")
+    if isinstance(val, bytes):
+        return val
+    text = str(val).strip()
+    try:
+        return base64.b64decode(text)
+    except Exception:
+        return text.encode("utf-8")
+
+
+def _temporal_params_for_value(
+    val: Any, orig_params: Optional[dict[str, Any]] = None
+) -> dict[str, Any]:
+    out = {
+        k: v
+        for k, v in _flatten_params(orig_params).items()
+        if k not in ("TZID", "VALUE")
+    }
+    if isinstance(val, datetime.datetime):
+        if val.tzinfo is not None:
+            key = getattr(val.tzinfo, "key", None) or getattr(val.tzinfo, "zone", None)
+            if key and str(key).upper() not in ("UTC", "ETC/UTC", "Z"):
+                out["TZID"] = str(key)
+            elif val.utcoffset() != datetime.timedelta(0) and orig_params:
+                tz_orig = _flatten_params(orig_params).get("TZID")
+                if tz_orig and str(tz_orig).upper() not in ("UTC", "ETC/UTC", "Z"):
+                    out["TZID"] = str(tz_orig)
+    elif isinstance(val, datetime.date):
+        out["VALUE"] = "DATE"
+    return out
+
+
+class _TrackedSubcomponents(list):  # type: ignore[type-arg]
+    """Live ``subcomponents`` list that marks its owning ``Component`` dirty on mutation."""
+
+    def __init__(self, owner: Component, items: Iterable[Component] = ()) -> None:
+        super().__init__(items)
+        self._owner = owner
+
+    def _bind(self, child: Any) -> Any:
+        if isinstance(child, Component):
+            child._parent = self._owner
+        return child
+
+    def _sync_owner(self) -> None:
+        self._owner._mark_dirty()
+
+    def append(self, item: Any) -> None:
+        self._sync_owner()
+        super().append(self._bind(item))
+
+    def extend(self, items: Iterable[Any]) -> None:
+        bound = [self._bind(x) for x in items]
+        self._sync_owner()
+        super().extend(bound)
+
+    def insert(self, index: Any, item: Any) -> None:
+        self._sync_owner()
+        super().insert(index, self._bind(item))
+
+    def pop(self, index: Any = -1) -> Any:
+        self._sync_owner()
+        return super().pop(index)
+
+    def remove(self, item: Any) -> None:
+        self._sync_owner()
+        super().remove(item)
+
+    def clear(self) -> None:
+        self._sync_owner()
+        super().clear()
+
+    def __setitem__(self, index: Any, value: Any) -> None:
+        self._sync_owner()
+        if isinstance(index, slice):
+            super().__setitem__(index, [self._bind(x) for x in value])
+        else:
+            super().__setitem__(index, self._bind(value))
+
+    def __delitem__(self, index: Any) -> None:
+        self._sync_owner()
+        super().__delitem__(index)
+
+    def __iadd__(self, items: Iterable[Any]) -> _TrackedSubcomponents:
+        self.extend(items)
+        return self
+
+    def reverse(self) -> None:
+        self._sync_owner()
+        super().reverse()
+
+    def sort(self, *, key: Any = None, reverse: bool = False) -> None:
+        self._sync_owner()
+        super().sort(key=key, reverse=reverse)
+
+
 _TEMPORAL_KEYS = frozenset(
     {
         "DTSTART",
@@ -958,9 +1156,9 @@ class Component:
         self._rust_cal = _rust_cal
         self._keep_recurrence = _keep_recurrence
         self._parent = _parent
-        self._children_cache: Optional[list[Component]] = None
+        self._children_cache: Optional[_TrackedSubcomponents] = None
         self._props: list[tuple[str, Any, Parameters]] = []
-        self._subcomponents: list[Component] = []
+        self._subcomponents: _TrackedSubcomponents = _TrackedSubcomponents(self)
         self._materialized = _rust_comp is None and _rust_cal is None
         if _rust_comp is not None:
             self.name = _rust_comp.name
@@ -1000,7 +1198,27 @@ class Component:
 
         return _sync
 
-    def _get_children(self) -> list[Component]:
+    def _make_value_sync(self, key_upper: str, match_idx: int, wrapped: Any) -> Any:
+        def _sync() -> None:
+            if not self._materialized:
+                self._ensure_materialized()
+            seen = 0
+            for idx, (k, _v, p) in enumerate(self._props):
+                if k == key_upper:
+                    if seen == match_idx:
+                        if hasattr(wrapped, "params") and isinstance(wrapped.params, Parameters):
+                            wrapped.params._on_mutate = self._mark_dirty
+                            p = wrapped.params
+                        self._props[idx] = (k, wrapped, p)
+                        break
+                    seen += 1
+            if hasattr(wrapped, "_on_mutate"):
+                wrapped._on_mutate = self._mark_dirty
+            self._mark_dirty()
+
+        return _sync
+
+    def _get_children(self) -> _TrackedSubcomponents:
         if self._materialized:
             return self._subcomponents
         if self._children_cache is None:
@@ -1012,18 +1230,24 @@ class Component:
                 raw_subs = self._rust_comp.component.subcomponents
             else:
                 raw_subs = []
-            self._children_cache = [_wrap_rust_component(c, _parent=self) for c in raw_subs]
+            self._children_cache = _TrackedSubcomponents(
+                self, [_wrap_rust_component(c, _parent=self) for c in raw_subs]
+            )
         return self._children_cache
 
     def _ensure_materialized(self) -> None:
         if self._materialized:
             return
-        children = list(self._get_children())
+        children = self._get_children()
         self._materialized = True
         self._children_cache = None
         if self._rust_cal is not None:
             for pname, val, raw_params in self._rust_cal.root.raw_properties():
-                self._props.append((pname.upper(), val, self._make_prop_params(raw_params)))
+                up = pname.upper()
+                p_obj = self._make_prop_params(raw_params)
+                if _is_binary_prop(p_obj):
+                    val = vBinary(_decode_binary_val(val), params=p_obj)
+                self._props.append((up, val, p_obj))
             self._subcomponents = children
             return
 
@@ -1041,13 +1265,22 @@ class Component:
                     "RECURRENCE-ID",
                 ):
                     continue
-                self._props.append((up, val, self._make_prop_params(raw_params)))
-            self._props.append(("DTSTART", self._rust_comp.start, Parameters(_on_mutate=self._mark_dirty)))
-            self._props.append((end_key, self._rust_comp.end, Parameters(_on_mutate=self._mark_dirty)))
+                p_obj = self._make_prop_params(raw_params)
+                if _is_binary_prop(p_obj):
+                    val = vBinary(_decode_binary_val(val), params=p_obj)
+                self._props.append((up, val, p_obj))
+            dtstart_p = _temporal_params_for_value(self._rust_comp.start, comp.params("DTSTART"))
+            end_p = _temporal_params_for_value(self._rust_comp.end, comp.params(end_key))
+            self._props.append(("DTSTART", self._rust_comp.start, self._make_prop_params(dtstart_p)))
+            self._props.append((end_key, self._rust_comp.end, self._make_prop_params(end_p)))
             self._subcomponents = children
         elif self._rust_comp is not None:
             for pname, val, raw_params in self._rust_comp.raw_properties():
-                self._props.append((pname.upper(), val, self._make_prop_params(raw_params)))
+                up = pname.upper()
+                p_obj = self._make_prop_params(raw_params)
+                if _is_binary_prop(p_obj):
+                    val = vBinary(_decode_binary_val(val), params=p_obj)
+                self._props.append((up, val, p_obj))
             self._subcomponents = children
 
     def _wrap_prop(
@@ -1076,14 +1309,28 @@ class Component:
 
         if key_upper == "RRULE":
             if isinstance(val, vRecur):
+                val._on_mutate = self._make_value_sync(key_upper, match_idx, val)
                 return val
-            if isinstance(val, dict):
-                return vRecur(val, params=p_obj)
-            return vRecur.from_ical(str(val), params=p_obj)
+            rec = (
+                vRecur(val, params=p_obj)
+                if isinstance(val, dict)
+                else vRecur.from_ical(str(val), params=p_obj)
+            )
+            rec._on_mutate = self._make_value_sync(key_upper, match_idx, rec)
+            return rec
+        if _is_binary_prop(p_obj):
+            if isinstance(val, vBinary):
+                return val
+            return vBinary(_decode_binary_val(val), params=p_obj)
+        if key_upper in _TEMPORAL_KEYS and isinstance(val, vDDDTypes):
+            val._on_mutate = self._make_value_sync(key_upper, match_idx, val)
+            return val
         if key_upper in _TEMPORAL_KEYS and isinstance(
             val, (datetime.date, datetime.datetime, datetime.timedelta, datetime.time)
         ):
-            return vDDDTypes(val, p_obj)
+            wrapped_dt = vDDDTypes(val, p_obj)
+            wrapped_dt._on_mutate = self._make_value_sync(key_upper, match_idx, wrapped_dt)
+            return wrapped_dt
         if key_upper in _TEMPORAL_KEYS and isinstance(val, list):
             return [
                 vDDDTypes(item, p_obj)
@@ -1119,23 +1366,22 @@ class Component:
                     return self._rust_comp.end
                 if key_upper == "DURATION":
                     return default
-                vals = self._rust_comp.component.get_all(key_upper)
-                if not vals:
-                    return default
-                raw = vals[0] if len(vals) == 1 else vals
-                return vRecur.from_ical(raw) if key_upper == "RRULE" and isinstance(raw, str) else raw
-            if self._rust_comp is not None:
-                vals = self._rust_comp.get_all(key_upper)
-                if not vals:
-                    return default
-                raw = vals[0] if len(vals) == 1 else vals
-                return vRecur.from_ical(raw) if key_upper == "RRULE" and isinstance(raw, str) else raw
-            if self._rust_cal is not None:
-                vals = self._rust_cal.root.get_all(key_upper)
-                if not vals:
-                    return default
-                raw = vals[0] if len(vals) == 1 else vals
-                return vRecur.from_ical(raw) if key_upper == "RRULE" and isinstance(raw, str) else raw
+                pairs = self._rust_comp.component.get_all_with_params(key_upper)
+            elif self._rust_comp is not None:
+                pairs = self._rust_comp.get_all_with_params(key_upper)
+            elif self._rust_cal is not None:
+                pairs = self._rust_cal.root.get_all_with_params(key_upper)
+            else:
+                pairs = []
+            if not pairs:
+                return default
+            decoded_vals = [
+                vRecur.from_ical(val)
+                if key_upper == "RRULE" and isinstance(val, str)
+                else (_decode_binary_val(val) if _is_binary_prop(params) else val)
+                for val, params in pairs
+            ]
+            return decoded_vals[0] if len(decoded_vals) == 1 else decoded_vals
         self._ensure_materialized()
         matches = [val for k, val, _ in self._props if k == key_upper]
         if not matches:
@@ -1143,6 +1389,8 @@ class Component:
         raw = matches[0] if len(matches) == 1 else matches
         if isinstance(raw, vDDDTypes):
             return raw.dt
+        if isinstance(raw, vBinary):
+            return _decode_binary_val(raw)
         if key_upper == "RRULE" and isinstance(raw, str):
             return vRecur.from_ical(raw)
         return raw
@@ -1160,9 +1408,17 @@ class Component:
                     return default
                 occ_end_key = "DUE" if self._rust_comp.name == "VTODO" else "DTEND"
                 if key_upper == "DTSTART":
-                    return self._wrap_prop(key_upper, self._rust_comp.start, {}, match_idx=0)
+                    dt_p = _temporal_params_for_value(
+                        self._rust_comp.start,
+                        self._rust_comp.component.params("DTSTART"),
+                    )
+                    return self._wrap_prop(key_upper, self._rust_comp.start, dt_p, match_idx=0)
                 if key_upper == occ_end_key:
-                    return self._wrap_prop(key_upper, self._rust_comp.end, {}, match_idx=0)
+                    end_p = _temporal_params_for_value(
+                        self._rust_comp.end,
+                        self._rust_comp.component.params(occ_end_key),
+                    )
+                    return self._wrap_prop(key_upper, self._rust_comp.end, end_p, match_idx=0)
                 if key_upper == "DURATION":
                     return default
                 pairs = self._rust_comp.component.get_all_with_params(key_upper)
@@ -1314,18 +1570,20 @@ class Component:
     def clear(self) -> None:
         self._mark_dirty()
         self._props.clear()
-        self._subcomponents.clear()
+        list.clear(self._subcomponents)
 
     def copy(self) -> Component:
         self._ensure_materialized()
         dup = self.__class__()
         dup.name = self.name
         dup._props = copy.deepcopy(self._props)
-        for k, v, p in dup._props:
+        for _k, v, p in dup._props:
             p._on_mutate = dup._mark_dirty
             if hasattr(v, "params") and isinstance(v.params, Parameters):
                 v.params = p
-        dup._subcomponents = [sub.copy() for sub in self._subcomponents]
+            if hasattr(v, "_on_mutate"):
+                v._on_mutate = dup._mark_dirty
+        dup._subcomponents = _TrackedSubcomponents(dup, [sub.copy() for sub in self._subcomponents])
         for sub in dup._subcomponents:
             sub._parent = dup
         return dup
@@ -1512,6 +1770,12 @@ class Component:
         return comp_cls
 
     @classmethod
+    def parse(
+        cls, st: _ox.InputData, multiple: bool = False, *, strict: bool = False
+    ) -> Union[Component, list[Component]]:
+        return cls.from_ical(st, multiple=multiple, strict=strict)
+
+    @classmethod
     def from_ical(
         cls, st: _ox.InputData, multiple: bool = False, *, strict: bool = False
     ) -> Union[Component, list[Component]]:
@@ -1536,8 +1800,8 @@ class Component:
     @property
     def subcomponents(self) -> list[Component]:
         if not self._materialized:
-            return list(self._get_children())
-        return list(self._subcomponents)
+            return self._get_children()
+        return self._subcomponents
 
     def walk(self, name: Optional[str] = None) -> list[Component]:
         target = name.upper() if name else None
@@ -2050,6 +2314,18 @@ class Event(_SpanMixin):
             ev.add("LOCATION", location)
         return ev
 
+    @classmethod
+    def example(cls, name: str = "example") -> Event:
+        _ = name
+        ev = cls.new(
+            uid="example-event@icaloxide",
+            summary="Example Event",
+            start=datetime.datetime(2026, 1, 1, 10, 0, tzinfo=datetime.timezone.utc),
+            duration=datetime.timedelta(hours=1),
+        )
+        ev.stamp()
+        return ev
+
 
 class Todo(_SpanMixin):
     name = "VTODO"
@@ -2077,6 +2353,19 @@ class Todo(_SpanMixin):
             td.add("STATUS", status)
         return td
 
+    @classmethod
+    def example(cls, name: str = "example") -> Todo:
+        _ = name
+        td = cls.new(
+            uid="example-todo@icaloxide",
+            summary="Example Todo",
+            start=datetime.datetime(2026, 1, 1, 10, 0, tzinfo=datetime.timezone.utc),
+            due=datetime.datetime(2026, 1, 2, 10, 0, tzinfo=datetime.timezone.utc),
+            status="NEEDS-ACTION",
+        )
+        td.stamp()
+        return td
+
 
 class Journal(_SpanMixin):
     name = "VJOURNAL"
@@ -2099,6 +2388,18 @@ class Journal(_SpanMixin):
             jn.add("DTSTART", start)
         if description is not None:
             jn.add("DESCRIPTION", description)
+        return jn
+
+    @classmethod
+    def example(cls, name: str = "example") -> Journal:
+        _ = name
+        jn = cls.new(
+            uid="example-journal@icaloxide",
+            summary="Example Journal",
+            start=datetime.date(2026, 1, 1),
+            description="Sample journal entry",
+        )
+        jn.stamp()
         return jn
 
     @property
@@ -2253,6 +2554,11 @@ class Alarm(Component):
     def repeat(self) -> int:
         return int(self.decoded("REPEAT", 0) or 0)
 
+    @classmethod
+    def example(cls, name: str = "example") -> Alarm:
+        _ = name
+        return cls.new_display(datetime.timedelta(minutes=-15), "Example Alarm")
+
     @property
     def duration(self) -> Optional[datetime.timedelta]:
         return self.decoded("DURATION")
@@ -2279,6 +2585,17 @@ class FreeBusy(_SpanMixin):
             fb.add("DTEND", end)
         if organizer is not None:
             fb.add("ORGANIZER", organizer)
+        return fb
+
+    @classmethod
+    def example(cls, name: str = "example") -> FreeBusy:
+        _ = name
+        fb = cls.new(
+            uid="example-fb@icaloxide",
+            start=datetime.datetime(2026, 1, 1, 10, 0, tzinfo=datetime.timezone.utc),
+            end=datetime.datetime(2026, 1, 1, 11, 0, tzinfo=datetime.timezone.utc),
+        )
+        fb.stamp()
         return fb
 
 
@@ -2338,6 +2655,10 @@ class Timezone(Component):
     name = "VTIMEZONE"
     DEFAULT_FIRST_DATE = datetime.date(1970, 1, 1)
     DEFAULT_LAST_DATE = datetime.date(2038, 1, 1)
+
+    @classmethod
+    def example(cls, name: str = "UTC") -> Timezone:
+        return cls.from_tzid(name)
 
     @property
     def tz_name(self) -> Optional[str]:
@@ -2462,6 +2783,19 @@ class Availability(_SpanMixin):
             av.add("DTEND", end)
         if busy_type is not None:
             av.add("BUSYTYPE", busy_type)
+        return av
+
+    @classmethod
+    def example(cls, name: str = "example") -> Availability:
+        _ = name
+        av = cls.new(
+            uid="example-avail@icaloxide",
+            summary="Office Hours",
+            start=datetime.datetime(2026, 1, 1, 9, 0, tzinfo=datetime.timezone.utc),
+            end=datetime.datetime(2026, 1, 1, 17, 0, tzinfo=datetime.timezone.utc),
+            busy_type="BUSY-UNAVAILABLE",
+        )
+        av.stamp()
         return av
 
     @property
@@ -2792,26 +3126,105 @@ class Calendar(Component):
 _COMPONENT_CLASS_MAP["VCALENDAR"] = Calendar
 LazyCalendar = Calendar
 
+from icaloxide.compat.alarms import Alarms, AlarmTime  # noqa: E402
+from icaloxide.compat.enums import (  # noqa: E402
+    BUSYTYPE,
+    CLASS,
+    CUTYPE,
+    FBTYPE,
+    PARTSTAT,
+    RANGE,
+    RELATED,
+    RELTYPE,
+    ROLE,
+    STATUS,
+    TRANSP,
+    VALUE,
+)
+from icaloxide.compat.errors import (  # noqa: E402
+    BadRuleStringFormat,
+    BrokenCalendarProperty,
+    ComponentEndMissing,
+    ComponentStartMissing,
+    FeatureWillBeRemovedInFutureVersion,
+    GloballyUniqueTZIDGuessed,
+    IncompleteAlarmInformation,
+    IncompleteComponent,
+    InvalidCalendar,
+    LocalTimezoneMissing,
+    PeriodEndBeforeStart,
+)
+from icaloxide.compat.props_extra import (  # noqa: E402
+    AdrFields,
+    ComponentFactory,
+    NFields,
+    TypesFactory,
+    vAdr,
+    vN,
+    vOrg,
+)
+
+Component.types_factory = TypesFactory()  # type: ignore[attr-defined]
+__version__ = str(getattr(_ox, "__version__", "0.5.0"))
+version = __version__
+version_tuple = tuple(int(p) for p in __version__.split(".")[:3] if p.isdigit())
+
 
 __all__ = [
+    "AdrFields",
     "Alarm",
+    "AlarmTime",
+    "Alarms",
     "Availability",
     "Available",
+    "BUSYTYPE",
+    "BadRuleStringFormat",
+    "BrokenCalendarProperty",
+    "CLASS",
+    "CUTYPE",
     "Calendar",
     "Component",
+    "ComponentEndMissing",
+    "ComponentFactory",
+    "ComponentStartMissing",
     "Conference",
     "Event",
+    "FBTYPE",
+    "FeatureWillBeRemovedInFutureVersion",
     "FreeBusy",
+    "GloballyUniqueTZIDGuessed",
+    "ICalParsingError",
     "Image",
+    "IncompleteAlarmInformation",
+    "IncompleteComponent",
+    "InvalidCalendar",
+    "JCalParsingError",
     "Journal",
     "LazyCalendar",
+    "LocalTimezoneMissing",
+    "NFields",
+    "PARTSTAT",
     "Parameters",
+    "PeriodEndBeforeStart",
+    "RANGE",
+    "RELATED",
+    "RELTYPE",
+    "ROLE",
+    "STATUS",
+    "TRANSP",
     "Timezone",
     "TimezoneDaylight",
     "TimezoneStandard",
     "Todo",
+    "TypesFactory",
+    "VALUE",
+    "__version__",
     "is_utc",
+    "q_join",
+    "q_split",
+    "use_pytz",
     "use_zoneinfo",
+    "vAdr",
     "vBinary",
     "vBoolean",
     "vBroken",
@@ -2827,6 +3240,8 @@ __all__ = [
     "vGeo",
     "vInt",
     "vMonth",
+    "vN",
+    "vOrg",
     "vPeriod",
     "vRecur",
     "vSkip",
@@ -2838,4 +3253,6 @@ __all__ = [
     "vUri",
     "vWeekday",
     "vXmlReference",
+    "version",
+    "version_tuple",
 ]

@@ -703,3 +703,56 @@ END:VCALENDAR\r\n";
     assert!(uids.contains(&"historic-1850"));
     assert!(uids.contains(&"future-2150"));
 }
+
+#[test]
+fn cross_tz_rdate_spring_dst_hourly_and_2150_count_all() {
+    let ics = "BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+PRODID:-//Test//Test//EN\r\n\
+BEGIN:VEVENT\r\n\
+UID:rd-tokyo\r\n\
+DTSTART;TZID=America/New_York:20260701T090000\r\n\
+DTEND;TZID=America/New_York:20260701T100000\r\n\
+RDATE;TZID=Asia/Tokyo:20260705T150000\r\n\
+SUMMARY:TokyoRDate\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\n\
+UID:spring-hr\r\n\
+DTSTART;TZID=Europe/Berlin:20260329T003000\r\n\
+DURATION:PT30M\r\n\
+RRULE:FREQ=HOURLY;COUNT=5\r\n\
+SUMMARY:SpringHourly\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\n\
+UID:cnt-2150\r\n\
+DTSTART:21500101T090000Z\r\n\
+DTEND:21500101T100000Z\r\n\
+RRULE:FREQ=DAILY;COUNT=3\r\n\
+SUMMARY:FutureCount\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+
+    let cal = Arc::new(Calendar::parse_str(ics).unwrap());
+    let q = CalendarQuery::new(cal, QueryOptions::default()).unwrap();
+
+    // Tokyo 15:00+09:00 == 06:00Z
+    let tokyo_win = q
+        .between(utc_ts(2026, 7, 5, 5, 0, 0), utc_ts(2026, 7, 5, 7, 0, 0))
+        .unwrap();
+    assert_eq!(tokyo_win.len(), 1);
+    assert_eq!(tokyo_win[0].start_utc, utc_ts(2026, 7, 5, 6, 0, 0));
+
+    // Berlin spring-forward hourly COUNT=5 must emit all 5 occurrences
+    let spring_win = q
+        .between(utc_ts(2026, 3, 28, 0, 0, 0), utc_ts(2026, 3, 30, 0, 0, 0))
+        .unwrap();
+    assert_eq!(spring_win.len(), 5);
+
+    // Year-2150 finite COUNT=3 must appear in all() (2 + 5 + 3 = 10 total)
+    let all_occs = q.all().unwrap();
+    let future_cnt = all_occs
+        .iter()
+        .filter(|o| q.calendar().component(o.component_id).unwrap().uid() == Some("cnt-2150"))
+        .count();
+    assert_eq!(future_cnt, 3);
+}

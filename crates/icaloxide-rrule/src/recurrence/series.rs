@@ -58,10 +58,11 @@ pub fn span_from_duration(
     }
 }
 
-/// An `RDATE` entry with optional custom duration (`RDATE;VALUE=PERIOD`).
+/// An `RDATE` entry with its resolved timezone and optional custom duration (`RDATE;VALUE=PERIOD`).
 #[derive(Debug, Clone)]
 pub struct RDateEntry {
     pub start_local: CalDateTime,
+    pub tz: CalendarTimeZone,
     pub custom_span: Option<SpanDuration>,
 }
 
@@ -492,6 +493,21 @@ impl CompiledSeries {
         }))
     }
 
+    /// Return `true` when every `RRULE` on master or `THISANDFUTURE` overrides has `UNTIL` or `COUNT`.
+    pub fn is_finite(&self) -> bool {
+        let master_ok = self.master.as_ref().is_none_or(|m| {
+            m.rrules
+                .iter()
+                .all(|r| r.until.is_some() || r.count.is_some())
+        });
+        let splits_ok = self.this_and_future.iter().all(|tf| {
+            tf.override_rrules
+                .iter()
+                .all(|r| r.until.is_some() || r.count.is_some())
+        });
+        master_ok && splits_ok
+    }
+
     /// Expand all occurrences intersecting `[start_utc, end_utc)`.
     pub fn expand_window(
         &self,
@@ -610,35 +626,37 @@ fn expand_master_window(
     let ff_local = utc_to_local_approx(ff_utc, &master.tz);
     let win_end_local = utc_to_local_approx(end_utc + max_back_shift + 86_400, &master.tz);
 
-    let mut seen_instants: FxHashSet<i64> = FxHashSet::default();
+    let mut seen_instants: FxHashSet<(i64, CalDate, CalTime)> = FxHashSet::default();
 
-    let mut emit_candidate = |cand: &CalDateTime, custom_span: Option<SpanDuration>| {
-        let s_utc = resolve_local_instant(cand, &master.tz);
-        if rrule_split_cutoff.is_some_and(|cut| s_utc >= cut) {
-            return;
-        }
-        if master.exdates.matches(s_utc, cand.date, cand.time) {
-            return;
-        }
-        if !seen_instants.insert(s_utc) {
-            return;
-        }
-        if let Some(occ) = apply_this_and_future_shift(
-            master,
-            this_and_future,
-            s_utc,
-            cand,
-            custom_span.unwrap_or(master.span),
-            skip_cancelled,
-        ) {
-            if overlaps_window(occ.start_utc, occ.end_utc, start_utc, end_utc) {
-                out.push(occ);
+    let mut emit_candidate =
+        |cand: &CalDateTime, cand_tz: &CalendarTimeZone, custom_span: Option<SpanDuration>| {
+            let s_utc = resolve_local_instant(cand, cand_tz);
+            if rrule_split_cutoff.is_some_and(|cut| s_utc >= cut) {
+                return;
             }
-        }
-    };
+            if master.exdates.matches(s_utc, cand.date, cand.time) {
+                return;
+            }
+            if !seen_instants.insert((s_utc, cand.date, cand.time)) {
+                return;
+            }
+            if let Some(occ) = apply_this_and_future_shift(
+                master,
+                this_and_future,
+                s_utc,
+                cand,
+                cand_tz,
+                custom_span.unwrap_or(master.span),
+                skip_cancelled,
+            ) {
+                if overlaps_window(occ.start_utc, occ.end_utc, start_utc, end_utc) {
+                    out.push(occ);
+                }
+            }
+        };
 
     if should_emit_master_dtstart(master) {
-        emit_candidate(&master.start_local, None);
+        emit_candidate(&master.start_local, &master.tz, None);
     }
 
     let dtstart_ldt = LocalDateTime::new(master.start_local.date, master.start_local.time);
@@ -663,12 +681,12 @@ fn expand_master_window(
             {
                 break;
             }
-            emit_candidate(&cand, None);
+            emit_candidate(&cand, &master.tz, None);
         }
     }
 
     for rdt in &master.rdates {
-        emit_candidate(&rdt.start_local, rdt.custom_span);
+        emit_candidate(&rdt.start_local, &rdt.tz, rdt.custom_span);
     }
 
     Ok(())
@@ -746,6 +764,7 @@ pub fn apply_this_and_future_shift(
     this_and_future: &[OverrideEntry],
     s_utc: i64,
     cand_local: &CalDateTime,
+    cand_tz: &CalendarTimeZone,
     base_span: SpanDuration,
     skip_cancelled: bool,
 ) -> Option<Occurrence> {
@@ -755,7 +774,7 @@ pub fn apply_this_and_future_shift(
             cand_local,
             s_utc,
             base_span,
-            &master.tz,
+            cand_tz,
             master.end_tz.as_ref(),
         );
         return Some(Occurrence {
@@ -939,16 +958,19 @@ fn push_period_rdate(
 ) {
     match period {
         CalPeriod::Explicit { start, end } => {
-            let (s_utc, _) = resolve_datetime_with_fallback(start, reg, default_tz);
+            let (s_utc, s_tz) = resolve_datetime_with_fallback(start, reg, default_tz);
             let (e_utc, _) = resolve_datetime_with_fallback(end, reg, default_tz);
             out.push(RDateEntry {
                 start_local: start.clone(),
+                tz: s_tz,
                 custom_span: Some(SpanDuration::Seconds((e_utc - s_utc).max(0))),
             });
         }
         CalPeriod::Duration { start, duration } => {
+            let (_, s_tz) = resolve_datetime_with_fallback(start, reg, default_tz);
             out.push(RDateEntry {
                 start_local: start.clone(),
+                tz: s_tz,
                 custom_span: Some(span_from_duration(*duration, false)),
             });
         }
@@ -961,13 +983,16 @@ fn extract_rdates(
     reg: &TzRegistry,
     default_tz: &CalendarTimeZone,
 ) -> Vec<RDateEntry> {
+    let (_, default_start_tz) = resolve_datetime_with_fallback(default_start, reg, default_tz);
     let mut rdates = Vec::new();
     for prop in comp.properties_named(&PropertyName::RDate) {
         match &prop.value {
             PropertyValue::DateTimeList(list) => {
                 for dt in list {
+                    let (_, tz) = resolve_datetime_with_fallback(dt, reg, default_tz);
                     rdates.push(RDateEntry {
                         start_local: dt.clone(),
+                        tz,
                         custom_span: None,
                     });
                 }
@@ -980,20 +1005,26 @@ fn extract_rdates(
                             time: default_start.time,
                             tz: default_start.tz.clone(),
                         },
+                        tz: default_start_tz.clone(),
                         custom_span: None,
                     });
                 }
             }
-            PropertyValue::DateTime(dt) => rdates.push(RDateEntry {
-                start_local: dt.clone(),
-                custom_span: None,
-            }),
+            PropertyValue::DateTime(dt) => {
+                let (_, tz) = resolve_datetime_with_fallback(dt, reg, default_tz);
+                rdates.push(RDateEntry {
+                    start_local: dt.clone(),
+                    tz,
+                    custom_span: None,
+                });
+            }
             PropertyValue::Date(d) => rdates.push(RDateEntry {
                 start_local: CalDateTime {
                     date: *d,
                     time: default_start.time,
                     tz: default_start.tz.clone(),
                 },
+                tz: default_start_tz.clone(),
                 custom_span: None,
             }),
             PropertyValue::Period(p) => push_period_rdate(p, reg, default_tz, &mut rdates),
@@ -1033,31 +1064,40 @@ fn build_master(
 
     let mut min_start_utc = timing.start_utc;
     for rdt in &rdates {
-        let (u, _) = resolve_datetime_with_fallback(&rdt.start_local, reg, default_tz);
+        let u = resolve_local_instant(&rdt.start_local, &rdt.tz);
         min_start_utc = min_start_utc.min(u);
     }
 
     let max_end_utc = if rrules.is_empty() {
-        let mut max_e = compute_end_local(
+        let mut max_e = compute_end_local_with_tz(
             &timing.start_local,
             timing.start_utc,
             timing.span,
             &timing.tz,
+            timing.end_tz.as_ref(),
         )
         .0;
         for rdt in &rdates {
-            let s = resolve_local_instant(&rdt.start_local, &timing.tz);
+            let s = resolve_local_instant(&rdt.start_local, &rdt.tz);
             let span = rdt.custom_span.unwrap_or(timing.span);
-            let e = compute_end_local(&rdt.start_local, s, span, &timing.tz).0;
+            let e = compute_end_local_with_tz(
+                &rdt.start_local,
+                s,
+                span,
+                &rdt.tz,
+                timing.end_tz.as_ref(),
+            )
+            .0;
             max_e = max_e.max(e);
         }
         Some(max_e)
     } else if rrules.iter().all(|r| r.until.is_some()) {
-        let mut max_e = compute_end_local(
+        let mut max_e = compute_end_local_with_tz(
             &timing.start_local,
             timing.start_utc,
             timing.span,
             &timing.tz,
+            timing.end_tz.as_ref(),
         )
         .0;
         for r in &rrules {
@@ -1066,9 +1106,16 @@ fn build_master(
             }
         }
         for rdt in &rdates {
-            let s = resolve_local_instant(&rdt.start_local, &timing.tz);
+            let s = resolve_local_instant(&rdt.start_local, &rdt.tz);
             let span = rdt.custom_span.unwrap_or(timing.span);
-            let e = compute_end_local(&rdt.start_local, s, span, &timing.tz).0;
+            let e = compute_end_local_with_tz(
+                &rdt.start_local,
+                s,
+                span,
+                &rdt.tz,
+                timing.end_tz.as_ref(),
+            )
+            .0;
             max_e = max_e.max(e);
         }
         Some(max_e)
