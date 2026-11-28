@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use compact_str::CompactString;
-use icaloxide_core::tz::build_vtimezone_for_tzid;
+use icaloxide_core::tz::{build_vtimezone_for_tzid, resolve_iana_alias, strip_vendor_prefix};
 use icaloxide_core::writer::write_folded_line;
 use icaloxide_core::{
     CalDate, CalDateTime, CalDuration, CalPeriod, CalTime, Calendar as CoreCalendar,
@@ -184,6 +184,80 @@ fn cal_datetime_to_py<'py>(
         0_u8,
         tzinfo,
     ))
+}
+
+fn cal_datetime_to_py_with_utc<'py>(
+    py: Python<'py>,
+    registry: &TzRegistry,
+    dt: &CalDateTime,
+    exact_utc: i64,
+) -> PyResult<Bound<'py, PyAny>> {
+    let TimeZoneRef::TzId(id) = &dt.tz else {
+        return cal_datetime_to_py(py, registry, dt);
+    };
+    let canonical = registry.resolve_canonical_iana(id.as_str());
+    if canonical.as_deref() == Some("UTC") {
+        return cal_datetime_to_py(py, registry, dt);
+    }
+
+    let types = dt_types(py)?;
+    let cal_tz = registry.resolve(id.as_str());
+    let mut out_date = dt.date;
+    let mut out_time = dt.time;
+    let mut fold = 0_u8;
+
+    let tzinfo = if registry.has_custom_vtimezone(id.as_str()) && canonical.is_none() {
+        if let Some(tz) = &cal_tz {
+            if let Ok(off) = tz.offset_at_utc(exact_utc) {
+                let local_naive = exact_utc + i64::from(off);
+                out_date = CalDate::from_days_since_epoch(local_naive.div_euclid(86_400) as i32);
+                let rem = local_naive.rem_euclid(86_400) as u32;
+                out_time = CalTime {
+                    hour: (rem / 3600) as u8,
+                    minute: ((rem % 3600) / 60) as u8,
+                    second: (rem % 60) as u8,
+                };
+                Some(fixed_tz_to_py(py, off, id.as_str())?)
+            } else {
+                tzref_to_py(py, registry, dt.date, dt.time, &dt.tz)?
+            }
+        } else {
+            tzref_to_py(py, registry, dt.date, dt.time, &dt.tz)?
+        }
+    } else {
+        if let Some(tz) = &cal_tz {
+            if let Ok(earlier) = tz.resolve_local(dt.date, dt.time, DstDisambiguation::Earlier) {
+                if earlier.was_fold {
+                    if let Ok(later) = tz.resolve_local(dt.date, dt.time, DstDisambiguation::Later)
+                    {
+                        if later.utc_timestamp == exact_utc && earlier.utc_timestamp != exact_utc {
+                            fold = 1;
+                        }
+                    }
+                }
+            }
+        }
+        tzref_to_py(py, registry, out_date, out_time, &dt.tz)?
+    };
+
+    let sec = out_time.second.min(59);
+    let args = (
+        i32::from(out_date.year),
+        out_date.month,
+        out_date.day,
+        out_time.hour,
+        out_time.minute,
+        sec,
+        0_u8,
+        tzinfo,
+    );
+    if fold == 0 {
+        types.datetime_cls.bind(py).call1(args)
+    } else {
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("fold", 1_u8)?;
+        types.datetime_cls.bind(py).call(args, Some(&kwargs))
+    }
 }
 
 fn cal_duration_to_py(py: Python<'_>, dur: CalDuration) -> PyResult<Bound<'_, PyAny>> {
@@ -475,7 +549,7 @@ fn extract_input_source(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Inp
     ))
 }
 
-#[pyclass(name = "Component", frozen)]
+#[pyclass(name = "Component", module = "icaloxide._icaloxide", frozen)]
 #[derive(Clone)]
 pub struct PyComponent {
     cal: Arc<CoreCalendar>,
@@ -642,6 +716,15 @@ impl PyComponent {
         Ok(PyBytes::new(py, s.as_bytes()))
     }
 
+    fn __reduce__<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyAny>, (Bound<'py, PyBytes>,))> {
+        let parse_fn = py.import("icaloxide")?.getattr("parse_component")?;
+        let raw = self.to_ical(py, false)?;
+        Ok((parse_fn, (raw,)))
+    }
+
     fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<PyObject> {
         let comp = self.node_ref()?;
         let pname = PropertyName::parse(key);
@@ -667,7 +750,7 @@ impl PyComponent {
     }
 }
 
-#[pyclass(name = "Occurrence", frozen)]
+#[pyclass(name = "Occurrence", module = "icaloxide._icaloxide", frozen)]
 #[derive(Clone)]
 pub struct PyOccurrence {
     cal: Arc<CoreCalendar>,
@@ -691,19 +774,28 @@ impl PyOccurrence {
 impl PyOccurrence {
     #[getter]
     fn start<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        if self.occ.is_all_day {
+        if self.occ.is_undated {
+            Ok(py.None().into_bound(py))
+        } else if self.occ.is_all_day {
             cal_date_to_py(py, self.occ.start_local.date)
         } else {
-            cal_datetime_to_py(py, self.registry(), &self.occ.start_local)
+            cal_datetime_to_py_with_utc(
+                py,
+                self.registry(),
+                &self.occ.start_local,
+                self.occ.start_utc,
+            )
         }
     }
 
     #[getter]
     fn end<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        if self.occ.is_all_day {
+        if self.occ.is_undated {
+            Ok(py.None().into_bound(py))
+        } else if self.occ.is_all_day {
             cal_date_to_py(py, self.occ.end_local.date)
         } else {
-            cal_datetime_to_py(py, self.registry(), &self.occ.end_local)
+            cal_datetime_to_py_with_utc(py, self.registry(), &self.occ.end_local, self.occ.end_utc)
         }
     }
 
@@ -784,13 +876,15 @@ impl PyOccurrence {
 
     fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<PyObject> {
         let pname = PropertyName::parse(key);
-        if pname == PropertyName::DtStart {
-            return Ok(self.start(py)?.unbind());
-        }
-        if (self.occ.kind == ComponentKind::VTodo && pname == PropertyName::Due)
-            || (self.occ.kind != ComponentKind::VTodo && pname == PropertyName::DtEnd)
-        {
-            return Ok(self.end(py)?.unbind());
+        if !self.occ.is_undated {
+            if pname == PropertyName::DtStart {
+                return Ok(self.start(py)?.unbind());
+            }
+            if (self.occ.kind == ComponentKind::VTodo && pname == PropertyName::Due)
+                || (self.occ.kind != ComponentKind::VTodo && pname == PropertyName::DtEnd)
+            {
+                return Ok(self.end(py)?.unbind());
+            }
         }
         let comp = self.comp()?;
         match comp.property(&pname) {
@@ -801,9 +895,10 @@ impl PyOccurrence {
 
     fn __contains__(&self, key: &str) -> PyResult<bool> {
         let pname = PropertyName::parse(key);
-        if pname == PropertyName::DtStart
-            || (self.occ.kind == ComponentKind::VTodo && pname == PropertyName::Due)
-            || (self.occ.kind != ComponentKind::VTodo && pname == PropertyName::DtEnd)
+        if !self.occ.is_undated
+            && (pname == PropertyName::DtStart
+                || (self.occ.kind == ComponentKind::VTodo && pname == PropertyName::Due)
+                || (self.occ.kind != ComponentKind::VTodo && pname == PropertyName::DtEnd))
         {
             return Ok(true);
         }
@@ -887,7 +982,7 @@ impl PyOccurrence {
     }
 }
 
-#[pyclass(name = "OccurrenceIterator")]
+#[pyclass(name = "OccurrenceIterator", module = "icaloxide._icaloxide")]
 pub struct PyOccurrenceIterator {
     cal: Arc<CoreCalendar>,
     tz_registry: Arc<OnceLock<TzRegistry>>,
@@ -920,7 +1015,7 @@ impl PyOccurrenceIterator {
     }
 }
 
-#[pyclass(name = "OccurrencePageIterator")]
+#[pyclass(name = "OccurrencePageIterator", module = "icaloxide._icaloxide")]
 pub struct PyOccurrencePageIterator {
     cal: Arc<CoreCalendar>,
     tz_registry: Arc<OnceLock<TzRegistry>>,
@@ -969,7 +1064,7 @@ impl PyOccurrencePageIterator {
     }
 }
 
-#[pyclass(name = "CalendarQuery", frozen)]
+#[pyclass(name = "CalendarQuery", module = "icaloxide._icaloxide", frozen)]
 pub struct PyCalendarQuery {
     cal: Arc<CoreCalendar>,
     tz_registry: Arc<OnceLock<TzRegistry>>,
@@ -1182,7 +1277,7 @@ impl PyCalendarQuery {
     }
 }
 
-#[pyclass(name = "Calendar", frozen)]
+#[pyclass(name = "Calendar", module = "icaloxide._icaloxide", frozen)]
 pub struct PyCalendar {
     inner: Arc<CoreCalendar>,
     tz_registry: Arc<OnceLock<TzRegistry>>,
@@ -1298,7 +1393,7 @@ impl PyCalendar {
         }
     }
 
-    #[pyo3(signature = (*, components=None, skip_cancelled=false, skip_bad_series=false, default_tz=None, max_iterations=None, max_periods=None))]
+    #[pyo3(signature = (*, components=None, skip_cancelled=false, skip_bad_series=false, include_undated=false, default_tz=None, max_iterations=None, max_periods=None))]
     #[allow(clippy::too_many_arguments)]
     fn query(
         &self,
@@ -1306,6 +1401,7 @@ impl PyCalendar {
         components: Option<Vec<String>>,
         skip_cancelled: bool,
         skip_bad_series: bool,
+        include_undated: bool,
         default_tz: Option<&str>,
         max_iterations: Option<usize>,
         max_periods: Option<usize>,
@@ -1317,6 +1413,7 @@ impl PyCalendar {
         let mut opts = QueryOptions {
             skip_cancelled,
             skip_bad_series,
+            include_undated,
             budget,
             ..QueryOptions::default()
         };
@@ -1436,6 +1533,17 @@ impl PyCalendar {
             }
         });
         PyBytes::new(py, s.as_bytes())
+    }
+
+    fn __reduce__<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyAny>, (Bound<'py, PyBytes>,))> {
+        let unpickle_fn = py
+            .import("icaloxide._icaloxide")?
+            .getattr("_unpickle_calendar")?;
+        let raw = self.to_ical(py, false);
+        Ok((unpickle_fn, (raw,)))
     }
 
     #[getter]
@@ -1563,7 +1671,7 @@ fn temporal_to_property(name: PropertyName, val: PyInputTemporal) -> Property {
 }
 
 /// Mutable Rust-backed builder for constructing high-performance calendars without Python dict overhead.
-#[pyclass(name = "CalendarBuilder")]
+#[pyclass(name = "CalendarBuilder", module = "icaloxide._icaloxide")]
 pub struct PyCalendarBuilder {
     cal: CoreCalendar,
     last_component: Option<ComponentId>,
@@ -1950,6 +2058,31 @@ fn fold_ical_lines<'py>(
     Ok(PyBytes::new(py, out.as_bytes()))
 }
 
+#[pyfunction]
+fn resolve_tzid(tzid: &str) -> Option<String> {
+    let stripped = strip_vendor_prefix(tzid).unwrap_or(tzid);
+    if let Some(canon) = resolve_iana_alias(stripped) {
+        return Some(canon.to_owned());
+    }
+    let reg = TzRegistry::default();
+    if reg.resolve(stripped).is_some() {
+        return Some(stripped.to_owned());
+    }
+    None
+}
+
+#[pyfunction]
+fn _unpickle_calendar(py: Python<'_>, data: &Bound<'_, PyBytes>) -> PyResult<PyCalendar> {
+    let bytes = data.as_bytes().to_vec();
+    let cal = py
+        .allow_threads(|| CoreCalendar::parse_with_options(&bytes, &ParseOptions::lenient()))
+        .map_err(|e| parse_err_to_py(&e))?;
+    Ok(PyCalendar {
+        inner: Arc::new(cal),
+        tz_registry: Arc::new(OnceLock::new()),
+    })
+}
+
 #[pymodule]
 fn _icaloxide(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
@@ -1960,9 +2093,11 @@ fn _icaloxide(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyOccurrence>()?;
     m.add_class::<PyOccurrenceIterator>()?;
     m.add_class::<PyOccurrencePageIterator>()?;
+    m.add_function(wrap_pyfunction!(_unpickle_calendar, m)?)?;
     m.add_function(wrap_pyfunction!(parse_component, m)?)?;
     m.add_function(wrap_pyfunction!(vtimezone_for_tzid, m)?)?;
     m.add_function(wrap_pyfunction!(compile_vtimezone_transitions, m)?)?;
     m.add_function(wrap_pyfunction!(fold_ical_lines, m)?)?;
+    m.add_function(wrap_pyfunction!(resolve_tzid, m)?)?;
     Ok(())
 }

@@ -253,7 +253,7 @@ pub fn extract_component_timing(
         }
     })?;
 
-    let (start_local, is_all_day) = match &start_prop.value {
+    let (mut start_local, is_all_day) = match &start_prop.value {
         PropertyValue::Date(d) => (
             CalDateTime {
                 date: *d,
@@ -270,7 +270,7 @@ pub fn extract_component_timing(
         _ => return None,
     };
 
-    let (start_utc, tz) = resolve_datetime_with_fallback(&start_local, reg, default_tz);
+    let (mut start_utc, mut tz) = resolve_datetime_with_fallback(&start_local, reg, default_tz);
 
     let end_prop = comp
         .property(&PropertyName::DtEnd)
@@ -279,22 +279,54 @@ pub fn extract_component_timing(
     let (span, end_tz) = if let Some(ep) = end_prop {
         match &ep.value {
             PropertyValue::Date(end_d) => {
-                let days =
-                    (end_d.to_days_since_epoch() - start_local.date.to_days_since_epoch()).max(0);
-                (
-                    SpanDuration::Days(if is_all_day && days == 0 { 1 } else { days }),
-                    None,
-                )
+                let start_epoch = start_local.date.to_days_since_epoch();
+                let end_epoch = end_d.to_days_since_epoch();
+                if end_epoch < start_epoch {
+                    let days = start_epoch - end_epoch;
+                    start_local = CalDateTime {
+                        date: *end_d,
+                        time: CalTime {
+                            hour: 0,
+                            minute: 0,
+                            second: 0,
+                        },
+                        tz: TimeZoneRef::Floating,
+                    };
+                    let (sw_utc, sw_tz) =
+                        resolve_datetime_with_fallback(&start_local, reg, default_tz);
+                    start_utc = sw_utc;
+                    tz = sw_tz;
+                    (SpanDuration::Days(days), None)
+                } else {
+                    let days = end_epoch - start_epoch;
+                    (
+                        SpanDuration::Days(if is_all_day && days == 0 { 1 } else { days }),
+                        None,
+                    )
+                }
             }
             PropertyValue::DateTime(end_dt) => {
                 let (end_utc, resolved_end_tz) =
                     resolve_datetime_with_fallback(end_dt, reg, default_tz);
-                let e_tz = if end_dt.tz == start_local.tz {
-                    None
+                if end_utc < start_utc {
+                    let e_tz = if start_local.tz == end_dt.tz {
+                        None
+                    } else {
+                        Some((start_local.tz.clone(), tz))
+                    };
+                    let span_secs = start_utc - end_utc;
+                    start_local = end_dt.clone();
+                    start_utc = end_utc;
+                    tz = resolved_end_tz;
+                    (SpanDuration::Seconds(span_secs), e_tz)
                 } else {
-                    Some((end_dt.tz.clone(), resolved_end_tz))
-                };
-                (SpanDuration::Seconds((end_utc - start_utc).max(0)), e_tz)
+                    let e_tz = if end_dt.tz == start_local.tz {
+                        None
+                    } else {
+                        Some((end_dt.tz.clone(), resolved_end_tz))
+                    };
+                    (SpanDuration::Seconds(end_utc - start_utc), e_tz)
+                }
             }
             _ => (default_span(comp, is_all_day), None),
         }
@@ -376,9 +408,7 @@ pub fn should_emit_master_dtstart(master: &MasterSeries) -> bool {
         return true;
     }
     master.rrules.iter().any(|rule| {
-        rule.count != Some(0)
-            && resolve_until_utc(rule, &master.tz)
-                .is_none_or(|until_utc| master.start_utc <= until_utc)
+        resolve_until_utc(rule, &master.tz).is_none_or(|until_utc| master.start_utc <= until_utc)
     })
 }
 
@@ -517,7 +547,7 @@ impl CompiledSeries {
         budget: IterationBudget,
         out: &mut Vec<Occurrence>,
     ) -> Result<(), RRuleError> {
-        if end_utc <= self.min_start_utc {
+        if end_utc < start_utc || end_utc < self.min_start_utc {
             return Ok(());
         }
         if let Some(max_end) = self.max_end_utc {
@@ -539,6 +569,7 @@ impl CompiledSeries {
                     start_local: ov.start_local.clone(),
                     end_local: ov.end_local.clone(),
                     is_all_day: ov.is_all_day,
+                    is_undated: false,
                     recurrence_id_utc: Some(ov.recurrence_id_utc),
                     parent_id: None,
                 });
@@ -577,6 +608,7 @@ impl CompiledSeries {
                         start_local: tf.start_local.clone(),
                         end_local: tf.end_local.clone(),
                         is_all_day: tf.is_all_day,
+                        is_undated: false,
                         recurrence_id_utc: Some(tf.recurrence_id_utc),
                         parent_id: None,
                     });
@@ -675,9 +707,14 @@ fn expand_master_window(
                 tz: master.start_local.tz.clone(),
             };
             let s_utc = resolve_local_instant(&cand, &master.tz);
+            let past_end = if start_utc == end_utc {
+                s_utc > end_utc + max_back_shift
+            } else {
+                s_utc >= end_utc + max_back_shift
+            };
             if until_utc.is_some_and(|u| s_utc > u)
                 || rrule_split_cutoff.is_some_and(|cut| s_utc >= cut)
-                || s_utc >= end_utc + max_back_shift
+                || past_end
             {
                 break;
             }
@@ -724,9 +761,14 @@ fn expand_this_and_future_rrules(
                 tz: tf.start_local.tz.clone(),
             };
             let s_utc = resolve_local_instant(&cand, &tf.tz);
+            let past_end = if start_utc == end_utc {
+                s_utc > end_utc
+            } else {
+                s_utc >= end_utc
+            };
             if until_utc.is_some_and(|u| s_utc > u)
                 || next_split_utc.is_some_and(|n| s_utc >= n)
-                || s_utc >= end_utc
+                || past_end
             {
                 break;
             }
@@ -749,6 +791,7 @@ fn expand_this_and_future_rrules(
                     start_local: cand,
                     end_local: e_local,
                     is_all_day: tf.is_all_day,
+                    is_undated: false,
                     recurrence_id_utc: Some(s_utc),
                     parent_id: None,
                 });
@@ -785,6 +828,7 @@ pub fn apply_this_and_future_shift(
             start_local: cand_local.clone(),
             end_local: e_local,
             is_all_day: master.is_all_day,
+            is_undated: false,
             recurrence_id_utc: Some(s_utc),
             parent_id: None,
         });
@@ -821,6 +865,7 @@ pub fn apply_this_and_future_shift(
         start_local: shifted_local,
         end_local: e_local,
         is_all_day: tf.is_all_day,
+        is_undated: false,
         recurrence_id_utc: Some(s_utc),
         parent_id: None,
     })
@@ -828,6 +873,15 @@ pub fn apply_this_and_future_shift(
 
 #[inline]
 pub const fn overlaps_window(occ_start: i64, occ_end: i64, win_start: i64, win_end: i64) -> bool {
+    if win_end < win_start {
+        return false;
+    }
+    if win_end == win_start {
+        if occ_end > occ_start {
+            return occ_start <= win_start && occ_end > win_start;
+        }
+        return occ_start == win_start;
+    }
     if occ_end > occ_start {
         occ_start < win_end && occ_end > win_start
     } else {

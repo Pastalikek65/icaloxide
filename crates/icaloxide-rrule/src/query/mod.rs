@@ -41,6 +41,7 @@ pub struct Occurrence {
     pub start_local: CalDateTime,
     pub end_local: CalDateTime,
     pub is_all_day: bool,
+    pub is_undated: bool,
     pub recurrence_id_utc: Option<i64>,
     pub parent_id: Option<ComponentId>,
 }
@@ -51,6 +52,7 @@ pub struct QueryOptions {
     pub components: SmallVec<[ComponentKind; 4]>,
     pub skip_cancelled: bool,
     pub skip_bad_series: bool,
+    pub include_undated: bool,
     pub default_tz: Option<CalendarTimeZone>,
     pub budget: IterationBudget,
 }
@@ -63,6 +65,7 @@ impl Default for QueryOptions {
             components,
             skip_cancelled: false,
             skip_bad_series: false,
+            include_undated: false,
             default_tz: None,
             budget: IterationBudget::default(),
         }
@@ -75,8 +78,10 @@ pub struct CalendarQuery {
     cal: Arc<Calendar>,
     reg: TzRegistry,
     default_tz: CalendarTimeZone,
+    has_explicit_default_tz: bool,
     options: QueryOptions,
     singles: Vec<Occurrence>,
+    undated: Vec<Occurrence>,
     singles_prefix_max_end: Vec<i64>,
     series: Vec<CompiledSeries>,
     alarm_parent_singles: Vec<Occurrence>,
@@ -90,10 +95,12 @@ impl CalendarQuery {
     /// Build an indexed [`CalendarQuery`] over `cal` using `options`.
     pub fn new(cal: Arc<Calendar>, options: QueryOptions) -> Result<Self, RRuleError> {
         let reg = cal.tz_registry();
+        let reg_default_tz = reg.default_timezone();
+        let has_explicit_default_tz = options.default_tz.is_some() || reg_default_tz.is_some();
         let default_tz = options
             .default_tz
             .clone()
-            .or_else(|| reg.default_timezone())
+            .or(reg_default_tz)
             .unwrap_or(CalendarTimeZone::Utc);
 
         let want_alarms = options.components.contains(&ComponentKind::VAlarm);
@@ -107,6 +114,7 @@ impl CalendarQuery {
             .collect();
 
         let mut singles = Vec::new();
+        let mut undated = Vec::new();
         let mut series = Vec::new();
         let mut alarm_parent_singles = Vec::new();
         let mut alarm_parent_series = Vec::new();
@@ -132,10 +140,11 @@ impl CalendarQuery {
                 comps,
                 &reg,
                 &default_tz,
-                options.skip_cancelled,
+                &options,
                 is_direct,
                 has_alarm,
                 &mut singles,
+                &mut undated,
                 &mut series,
                 &mut alarm_parent_singles,
                 &mut alarm_parent_series,
@@ -178,8 +187,10 @@ impl CalendarQuery {
             cal,
             reg,
             default_tz,
+            has_explicit_default_tz,
             options,
             singles,
+            undated,
             singles_prefix_max_end: prefix_max,
             series,
             alarm_parent_singles,
@@ -212,11 +223,12 @@ impl CalendarQuery {
 
     /// Return all occurrences intersecting `[start_utc, end_utc)`.
     pub fn between(&self, start_utc: i64, end_utc: i64) -> Result<Vec<Occurrence>, RRuleError> {
-        if end_utc <= start_utc {
+        if end_utc < start_utc {
             return Ok(Vec::new());
         }
         let mut out = Vec::new();
         self.collect_singles_in_window(start_utc, end_utc, &mut out);
+        out.extend(self.undated.iter().cloned());
 
         for s in &self.series {
             let mut buf = Vec::new();
@@ -245,6 +257,31 @@ impl CalendarQuery {
 
     /// Return all occurrences falling on calendar date `date` (`[00:00, next day 00:00)` in `default_tz`).
     pub fn at_date(&self, date: CalDate) -> Result<Vec<Occurrence>, RRuleError> {
+        if !self.has_explicit_default_tz {
+            let base_utc = i64::from(date.to_days_since_epoch()) * 86_400;
+            let next_date = date.add_days(1);
+            let next_utc = i64::from(next_date.to_days_since_epoch()) * 86_400;
+            let mut occs = self.between(base_utc - 54_000, next_utc + 54_000)?;
+            occs.retain(|occ| {
+                if occ.is_undated {
+                    return true;
+                }
+                if occ.is_all_day {
+                    return occ.start_local.date < next_date
+                        && (occ.end_local.date > date
+                            || (occ.end_local.date == occ.start_local.date
+                                && occ.start_local.date == date));
+                }
+                let s_local = occ.start_local.to_naive_timestamp();
+                let e_local = if occ.start_local.tz == occ.end_local.tz {
+                    occ.end_local.to_naive_timestamp()
+                } else {
+                    s_local + (occ.end_utc - occ.start_utc).max(0)
+                };
+                overlaps_window(s_local, e_local, base_utc, next_utc)
+            });
+            return Ok(occs);
+        }
         let midnight = CalTime {
             hour: 0,
             minute: 0,
@@ -331,7 +368,7 @@ impl CalendarQuery {
         }
 
         let floor_utc = self.min_start_floor();
-        let mut count = 0_usize;
+        let mut count = self.undated.len();
         let max_budget = self.options.budget.max_periods;
         for item in self.after(floor_utc) {
             item?;
@@ -355,7 +392,7 @@ impl CalendarQuery {
         let occs = self.between(start_utc, end_utc)?;
         let mut spans: Vec<BusyInterval> = Vec::with_capacity(occs.len());
         for occ in occs {
-            if occ.kind == ComponentKind::VFreeBusy {
+            if occ.is_undated || occ.kind == ComponentKind::VFreeBusy {
                 continue;
             }
             if let Some(comp) = self.cal.component(occ.component_id) {
@@ -533,11 +570,15 @@ impl CalendarQuery {
 
     /// Count occurrences intersecting `[start_utc, end_utc)`.
     pub fn count_between(&self, start_utc: i64, end_utc: i64) -> Result<usize, RRuleError> {
-        if end_utc <= start_utc {
+        if end_utc < start_utc {
             return Ok(0);
         }
-        let mut count = 0_usize;
-        let upper = self.singles.partition_point(|s| s.start_utc < end_utc);
+        let mut count = self.undated.len();
+        let upper = if end_utc == start_utc {
+            self.singles.partition_point(|s| s.start_utc <= end_utc)
+        } else {
+            self.singles.partition_point(|s| s.start_utc < end_utc)
+        };
         for idx in (0..upper).rev() {
             if self.singles_prefix_max_end[idx] < start_utc {
                 break;
@@ -580,7 +621,11 @@ impl CalendarQuery {
     }
 
     fn collect_singles_in_window(&self, start_utc: i64, end_utc: i64, out: &mut Vec<Occurrence>) {
-        let upper = self.singles.partition_point(|s| s.start_utc < end_utc);
+        let upper = if end_utc == start_utc {
+            self.singles.partition_point(|s| s.start_utc <= end_utc)
+        } else {
+            self.singles.partition_point(|s| s.start_utc < end_utc)
+        };
         for idx in (0..upper).rev() {
             if self.singles_prefix_max_end[idx] < start_utc {
                 break;
@@ -710,6 +755,7 @@ struct OwnedRuleCursor {
     consecutive_empty: usize,
     emitted: u32,
     pending: std::collections::VecDeque<LocalDateTime>,
+    iter_finished: bool,
     finished: bool,
     until_utc: Option<i64>,
     next_occ: Option<Occurrence>,
@@ -723,6 +769,7 @@ struct OwnedSplitCursor {
     consecutive_empty: usize,
     emitted: u32,
     pending: std::collections::VecDeque<LocalDateTime>,
+    iter_finished: bool,
     finished: bool,
     until_utc: Option<i64>,
     next_split_utc: Option<i64>,
@@ -1090,6 +1137,7 @@ fn build_owned_stream(
                     start_local: ov.start_local.clone(),
                     end_local: ov.end_local.clone(),
                     is_all_day: ov.is_all_day,
+                    is_undated: false,
                     recurrence_id_utc: Some(ov.recurrence_id_utc),
                     parent_id: None,
                 },
@@ -1120,6 +1168,7 @@ fn build_owned_stream(
                     consecutive_empty: 0,
                     emitted: 0,
                     pending: std::collections::VecDeque::new(),
+                    iter_finished: false,
                     finished: false,
                     until_utc,
                     next_occ: None,
@@ -1171,6 +1220,7 @@ fn push_split_cursors(
                         start_local: tf.start_local.clone(),
                         end_local: tf.end_local.clone(),
                         is_all_day: tf.is_all_day,
+                        is_undated: false,
                         recurrence_id_utc: Some(tf.recurrence_id_utc),
                         parent_id: None,
                     },
@@ -1193,6 +1243,7 @@ fn push_split_cursors(
                 consecutive_empty: 0,
                 emitted: 0,
                 pending: std::collections::VecDeque::new(),
+                iter_finished: false,
                 finished: false,
                 until_utc: resolve_until_with_tz(rule, &tf.tz),
                 next_split_utc,
@@ -1279,7 +1330,11 @@ fn advance_owned_cursor(
             let off = master.tz.offset_at_utc(u).unwrap_or(0);
             LocalDateTime::from_naive_timestamp(u + 86_400 + i64::from(off))
         }),
-        if cursor.periods_checked == 0 && cursor.emitted == 0 && cursor.pending.is_empty() {
+        if cursor.periods_checked == 0
+            && cursor.emitted == 0
+            && cursor.pending.is_empty()
+            && !cursor.iter_finished
+        {
             Some(ff_local)
         } else {
             None
@@ -1287,13 +1342,18 @@ fn advance_owned_cursor(
         budget,
     );
 
-    if cursor.periods_checked > 0 || cursor.emitted > 0 || !cursor.pending.is_empty() {
+    if cursor.periods_checked > 0
+        || cursor.emitted > 0
+        || !cursor.pending.is_empty()
+        || cursor.iter_finished
+    {
         iter.restore_state(
             cursor.next_period_idx,
             cursor.periods_checked,
             cursor.consecutive_empty,
             cursor.emitted,
             std::mem::take(&mut cursor.pending),
+            cursor.iter_finished,
         );
     }
 
@@ -1339,7 +1399,8 @@ fn advance_owned_cursor(
     cursor.consecutive_empty = c_empty;
     cursor.emitted = emitted;
     cursor.pending = pending;
-    if fin || found.is_none() {
+    cursor.iter_finished = fin;
+    if (fin && cursor.pending.is_empty()) || found.is_none() {
         cursor.finished = true;
     }
     Ok(found)
@@ -1368,7 +1429,11 @@ fn advance_split_cursor(
             let off = tf.tz.offset_at_utc(u).unwrap_or(0);
             LocalDateTime::from_naive_timestamp(u + 86_400 + i64::from(off))
         }),
-        if cursor.periods_checked == 0 && cursor.emitted == 0 && cursor.pending.is_empty() {
+        if cursor.periods_checked == 0
+            && cursor.emitted == 0
+            && cursor.pending.is_empty()
+            && !cursor.iter_finished
+        {
             Some(ff_local)
         } else {
             None
@@ -1376,13 +1441,18 @@ fn advance_split_cursor(
         budget,
     );
 
-    if cursor.periods_checked > 0 || cursor.emitted > 0 || !cursor.pending.is_empty() {
+    if cursor.periods_checked > 0
+        || cursor.emitted > 0
+        || !cursor.pending.is_empty()
+        || cursor.iter_finished
+    {
         iter.restore_state(
             cursor.next_period_idx,
             cursor.periods_checked,
             cursor.consecutive_empty,
             cursor.emitted,
             std::mem::take(&mut cursor.pending),
+            cursor.iter_finished,
         );
     }
 
@@ -1421,6 +1491,7 @@ fn advance_split_cursor(
             start_local: cand_local,
             end_local: e_local,
             is_all_day: tf.is_all_day,
+            is_undated: false,
             recurrence_id_utc: Some(s_utc),
             parent_id: None,
         });
@@ -1433,7 +1504,8 @@ fn advance_split_cursor(
     cursor.consecutive_empty = c_empty;
     cursor.emitted = emitted;
     cursor.pending = pending;
-    if fin || found.is_none() {
+    cursor.iter_finished = fin;
+    if (fin && cursor.pending.is_empty()) || found.is_none() {
         cursor.finished = true;
     }
     Ok(found)
@@ -1453,10 +1525,11 @@ fn classify_component_group(
     comps: &[ComponentRef<'_>],
     reg: &TzRegistry,
     default_tz: &CalendarTimeZone,
-    skip_cancelled: bool,
+    options: &QueryOptions,
     is_direct: bool,
     has_alarm: bool,
     singles: &mut Vec<Occurrence>,
+    undated: &mut Vec<Occurrence>,
     series: &mut Vec<CompiledSeries>,
     alarm_parent_singles: &mut Vec<Occurrence>,
     alarm_parent_series: &mut Vec<CompiledSeries>,
@@ -1480,7 +1553,7 @@ fn classify_component_group(
     if is_simple_single {
         let mc = master.unwrap();
         if let Some(timing) = extract_component_timing(mc, reg, default_tz) {
-            if skip_cancelled && timing.cancelled {
+            if options.skip_cancelled && timing.cancelled {
                 return Ok(());
             }
             let (end_utc, end_local) = compute_end_local_with_tz(
@@ -1498,6 +1571,7 @@ fn classify_component_group(
                 start_local: timing.start_local,
                 end_local,
                 is_all_day: timing.is_all_day,
+                is_undated: false,
                 recurrence_id_utc: None,
                 parent_id: None,
             };
@@ -1506,6 +1580,37 @@ fn classify_component_group(
             }
             if has_alarm {
                 alarm_parent_singles.push(occ);
+            }
+        } else if options.include_undated && is_direct && mc.kind() == &ComponentKind::VTodo {
+            let cancelled = mc
+                .status()
+                .is_some_and(|s| s.trim().eq_ignore_ascii_case("CANCELLED"));
+            if !(options.skip_cancelled && cancelled) {
+                let placeholder = CalDateTime {
+                    date: CalDate {
+                        year: 1970,
+                        month: 1,
+                        day: 1,
+                    },
+                    time: CalTime {
+                        hour: 0,
+                        minute: 0,
+                        second: 0,
+                    },
+                    tz: icaloxide_core::datetime::TimeZoneRef::Floating,
+                };
+                undated.push(Occurrence {
+                    component_id: mc.id(),
+                    kind: mc.kind().clone(),
+                    start_utc: i64::MIN,
+                    end_utc: i64::MAX,
+                    start_local: placeholder.clone(),
+                    end_local: placeholder,
+                    is_all_day: false,
+                    is_undated: true,
+                    recurrence_id_utc: None,
+                    parent_id: None,
+                });
             }
         }
         return Ok(());

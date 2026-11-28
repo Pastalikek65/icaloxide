@@ -10,6 +10,7 @@ from icaloxide._icaloxide import (
     compile_vtimezone_transitions,
     fold_ical_lines,
     parse_component,
+    resolve_tzid,
     vtimezone_for_tzid,
 )
 
@@ -25,5 +26,6 @@ __all__ = [
     "compile_vtimezone_transitions",
     "fold_ical_lines",
     "parse_component",
+    "resolve_tzid",
     "vtimezone_for_tzid",
 ]

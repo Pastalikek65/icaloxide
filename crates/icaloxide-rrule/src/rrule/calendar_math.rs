@@ -80,6 +80,45 @@ pub fn week_days_in_year(year: i16, week_no: i8, wkst: Weekday) -> SmallVec<[Cal
     out
 }
 
+/// Resolve RFC 5545 `BYWEEKNO` values within calendar `year` (`Jan 1..Dec 31`),
+/// including late-December days belonging to `(year + 1)` week 1 and early-January
+/// days belonging to `(year - 1)`'s final week (matching `dateutil.rrule` even for `INTERVAL > 1`).
+pub fn byweekno_dates_in_year(year: i16, by_week_no: &[i8], wkst: Weekday) -> Vec<CalDate> {
+    let mut out = Vec::new();
+    for &wn in by_week_no {
+        for d in week_days_in_year(year, wn, wkst) {
+            if d.year == year {
+                out.push(d);
+            }
+        }
+    }
+    let next_weeks = weeks_in_year(year + 1, wkst) as i8;
+    if by_week_no.contains(&1) || by_week_no.contains(&(-next_weeks)) {
+        for d in week_days_in_year(year + 1, 1, wkst) {
+            if d.year == year {
+                out.push(d);
+            }
+        }
+    }
+    let jan1_epoch = CalDate {
+        year,
+        month: 1,
+        day: 1,
+    }
+    .to_days_since_epoch();
+    if week1_start_epoch(year, wkst) > jan1_epoch {
+        let prev_weeks = weeks_in_year(year - 1, wkst) as i8;
+        if by_week_no.contains(&-1) || by_week_no.contains(&prev_weeks) {
+            for d in week_days_in_year(year - 1, prev_weeks, wkst) {
+                if d.year == year {
+                    out.push(d);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Resolve a signed `BYYEARDAY` (`1..=366` or `-366..=-1`) in `year`.
 pub fn year_day_to_date(year: i16, yd: i16) -> Option<CalDate> {
     let total = i32::from(days_in_year(year));

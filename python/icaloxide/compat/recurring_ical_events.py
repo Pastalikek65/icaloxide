@@ -587,12 +587,13 @@ class Page:
 def _resolve_default_zoneinfo(tz_name: Optional[str]) -> Any:
     if not tz_name:
         return None
-    if tz_name.upper() in ("UTC", "ETC/UTC", "Z"):
+    canonical = _ox.resolve_tzid(tz_name) or tz_name
+    if canonical.upper() in ("UTC", "ETC/UTC", "Z"):
         return datetime.timezone.utc
     try:
         from zoneinfo import ZoneInfo
 
-        return ZoneInfo(tz_name)
+        return ZoneInfo(canonical)
     except Exception:
         return None
 
@@ -744,6 +745,7 @@ class UnfoldableCalendar:
             self._query = rust_cal.query(
                 components=self._components,
                 skip_bad_series=skip_bad_series,
+                include_undated=True,
                 max_iterations=max_iterations,
                 max_periods=max_periods,
             )
@@ -763,6 +765,7 @@ class UnfoldableCalendar:
                 return self._rust_cal.query(
                     components=self._components,
                     skip_bad_series=self._skip_bad_series,
+                    include_undated=True,
                     default_tz=inferred,
                     max_iterations=self._max_iterations,
                     max_periods=self._max_periods,
@@ -806,6 +809,13 @@ class UnfoldableCalendar:
         if s_bound == e_bound and not isinstance(date, tuple):
             occs = self._query_for(s_bound).at(s_bound)
             custom = self._custom_components_in(s_bound, e_bound + datetime.timedelta(seconds=1) if isinstance(e_bound, datetime.datetime) else e_bound)
+        elif (
+            isinstance(s_bound, datetime.date)
+            and not isinstance(s_bound, datetime.datetime)
+            and e_bound == s_bound + datetime.timedelta(days=1)
+        ):
+            occs = self._query_for(s_bound).at(s_bound)
+            custom = self._custom_components_in(s_bound, s_bound)
         elif isinstance(date, (int, str, tuple)):
             if isinstance(e_bound, datetime.datetime):
                 occs = self._query_for(s_bound).between(s_bound, e_bound)
@@ -836,6 +846,8 @@ class UnfoldableCalendar:
                 raise PeriodEndBeforeStart("between() stop duration must be non-negative")
         else:
             e_val = _to_point(stop)
+            if isinstance(e_val, datetime.date) and not isinstance(e_val, datetime.datetime):
+                e_val = datetime.datetime.combine(e_val, datetime.time.min)
         occs = self._query_for(s_val).between(s_val, e_val)
         keep = self._keep_recurrence
         tz_obj = self._default_zi
@@ -927,6 +939,8 @@ class UnfoldableCalendar:
                     e_val = datetime.datetime.combine(s_val, datetime.time.min) + stop
             else:
                 e_val = _to_point(stop)
+                if isinstance(e_val, datetime.date) and not isinstance(e_val, datetime.datetime):
+                    e_val = datetime.datetime.combine(e_val, datetime.time.min)
             return self._query_for(s_val).count(s_val, e_val) + len(
                 self._custom_components_in(s_val, e_val)
             )

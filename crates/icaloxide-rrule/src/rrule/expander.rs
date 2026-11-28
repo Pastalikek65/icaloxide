@@ -5,7 +5,7 @@ use smallvec::SmallVec;
 
 use crate::error::{IterationBudget, RRuleError};
 use crate::rrule::calendar_math::{
-    month_day_to_date, week_days_in_year, week_start_on_or_before, weekdays_in_month,
+    byweekno_dates_in_year, month_day_to_date, week_start_on_or_before, weekdays_in_month,
     weekdays_in_year, year_day_to_date,
 };
 use crate::rrule::{Frequency, RRule};
@@ -137,12 +137,14 @@ impl<'a> RRuleIter<'a> {
         consecutive_empty: usize,
         emitted: u32,
         pending: VecDeque<LocalDateTime>,
+        finished: bool,
     ) {
         self.period_idx = period_idx;
         self.periods_checked = periods_checked;
         self.consecutive_empty = consecutive_empty;
         self.emitted = emitted;
         self.pending = pending;
+        self.finished = finished;
     }
 
     fn refill(&mut self) -> Result<bool, RRuleError> {
@@ -205,14 +207,14 @@ impl Iterator for RRuleIter<'_> {
     type Item = Result<LocalDateTime, RRuleError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.finished {
-            return None;
-        }
         if self.rule.count.is_some_and(|c| self.emitted >= c) {
             self.finished = true;
             return None;
         }
         if self.pending.is_empty() {
+            if self.finished {
+                return None;
+            }
             match self.refill() {
                 Ok(true) => {}
                 Ok(false) => return None,
@@ -312,10 +314,7 @@ fn generate_yearly(
     let year = year_i64 as i16;
 
     let mut dates = if !rule.by_week_no.is_empty() {
-        let mut d = Vec::new();
-        for &wn in &rule.by_week_no {
-            d.extend(week_days_in_year(year, wn, rule.wkst));
-        }
+        let mut d = byweekno_dates_in_year(year, &rule.by_week_no, rule.wkst);
         if !rule.by_month.is_empty() {
             d.retain(|date| rule.by_month.contains(&date.month));
         }

@@ -38,9 +38,9 @@ class Component:
 
 class Occurrence:
     @property
-    def start(self) -> DateLike: ...
+    def start(self) -> Optional[DateLike]: ...
     @property
-    def end(self) -> DateLike: ...
+    def end(self) -> Optional[DateLike]: ...
     @property
     def is_all_day(self) -> bool: ...
     @property
@@ -80,6 +80,7 @@ def compile_vtimezone_transitions(
     data: InputData,
 ) -> List[Tuple[int, int, int, bool, Optional[str]]]: ...
 def fold_ical_lines(lines: List[str]) -> bytes: ...
+def resolve_tzid(tzid: str) -> Optional[str]: ...
 
 class CalendarQuery:
     @property
@@ -129,6 +130,7 @@ class Calendar:
         components: Optional[Sequence[str]] = None,
         skip_cancelled: bool = False,
         skip_bad_series: bool = False,
+        include_undated: bool = False,
         default_tz: Optional[str] = None,
         max_iterations: Optional[int] = None,
         max_periods: Optional[int] = None,

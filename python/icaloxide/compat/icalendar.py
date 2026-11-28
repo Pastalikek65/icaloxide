@@ -1018,7 +1018,11 @@ class vPeriod:
     @classmethod
     def from_jcal(cls, jcal_prop: list[Any]) -> vPeriod:
         params = Parameters.from_jcal_property(jcal_prop)
-        lhs, rhs = str(jcal_prop[3]).split("/", 1)
+        raw_p = jcal_prop[3]
+        if isinstance(raw_p, (list, tuple)) and len(raw_p) == 2:
+            lhs, rhs = str(raw_p[0]), str(raw_p[1])
+        else:
+            lhs, rhs = str(raw_p).split("/", 1)
         s = _parse_iso_dt(lhs, dict(params))
         e: Any = (
             _parse_duration_str(rhs)
@@ -1837,22 +1841,26 @@ class Component:
                     if _is_binary_prop(p_obj):
                         val = vBinary(_decode_binary_val(val), params=p_obj)
                     props.append((up, val, p_obj))
-            dtstart_p = _temporal_params_for_value(self._rust_comp.start, comp.params("DTSTART"))
-            end_p = _temporal_params_for_value(self._rust_comp.end, comp.params(end_key))
-            props.append(
-                (
-                    "DTSTART",
-                    self._rust_comp.start,
-                    self._make_prop_params(dtstart_p) if dtstart_p else None,
+            if self._rust_comp.start is not None:
+                dtstart_p = _temporal_params_for_value(
+                    self._rust_comp.start, comp.params("DTSTART")
                 )
-            )
-            props.append(
-                (
-                    end_key,
-                    self._rust_comp.end,
-                    self._make_prop_params(end_p) if end_p else None,
+                props.append(
+                    (
+                        "DTSTART",
+                        self._rust_comp.start,
+                        self._make_prop_params(dtstart_p) if dtstart_p else None,
+                    )
                 )
-            )
+                if self._rust_comp.end is not None:
+                    end_p = _temporal_params_for_value(self._rust_comp.end, comp.params(end_key))
+                    props.append(
+                        (
+                            end_key,
+                            self._rust_comp.end,
+                            self._make_prop_params(end_p) if end_p else None,
+                        )
+                    )
         elif self._rust_comp is not None:
             for pname, val, raw_params in self._rust_comp.raw_properties_compact():
                 up = pname.upper()
@@ -1954,10 +1962,11 @@ class Component:
                         raise KeyError(name)
                     return default
                 occ_end_key = "DUE" if self._rust_comp.name == "VTODO" else "DTEND"
-                if key_upper == "DTSTART":
-                    return self._rust_comp.start
-                if key_upper == occ_end_key:
-                    return self._rust_comp.end
+                if self._rust_comp.start is not None:
+                    if key_upper == "DTSTART":
+                        return self._rust_comp.start
+                    if key_upper == occ_end_key and self._rust_comp.end is not None:
+                        return self._rust_comp.end
                 if key_upper == "DURATION":
                     if default is _MISSING:
                         raise KeyError(name)
@@ -2011,18 +2020,19 @@ class Component:
                 ):
                     return default
                 occ_end_key = "DUE" if self._rust_comp.name == "VTODO" else "DTEND"
-                if key_upper == "DTSTART":
-                    dt_p = _temporal_params_for_value(
-                        self._rust_comp.start,
-                        self._rust_comp.component.params("DTSTART"),
-                    )
-                    return self._wrap_prop(key_upper, self._rust_comp.start, dt_p, match_idx=0)
-                if key_upper == occ_end_key:
-                    end_p = _temporal_params_for_value(
-                        self._rust_comp.end,
-                        self._rust_comp.component.params(occ_end_key),
-                    )
-                    return self._wrap_prop(key_upper, self._rust_comp.end, end_p, match_idx=0)
+                if self._rust_comp.start is not None:
+                    if key_upper == "DTSTART":
+                        dt_p = _temporal_params_for_value(
+                            self._rust_comp.start,
+                            self._rust_comp.component.params("DTSTART"),
+                        )
+                        return self._wrap_prop(key_upper, self._rust_comp.start, dt_p, match_idx=0)
+                    if key_upper == occ_end_key and self._rust_comp.end is not None:
+                        end_p = _temporal_params_for_value(
+                            self._rust_comp.end,
+                            self._rust_comp.component.params(occ_end_key),
+                        )
+                        return self._wrap_prop(key_upper, self._rust_comp.end, end_p, match_idx=0)
                 if key_upper == "DURATION":
                     return default
                 pairs = self._rust_comp.component.get_all_with_params(key_upper)
@@ -2198,6 +2208,49 @@ class Component:
         for sub in dup._subcomponents:
             sub._parent = dup
         return dup
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> Component:
+        if not self._materialized:
+            if self._rust_cal is not None:
+                dup: Component = self.__class__(_rust_cal=self._rust_cal)
+            elif self._rust_comp is not None:
+                dup = self.__class__(
+                    _rust_comp=self._rust_comp,
+                    _keep_recurrence=self._keep_recurrence,
+                )
+            else:
+                dup = self.__class__()
+            dup.name = self.name
+            dup._errors = list(self._errors) if self._errors is not None else None
+            memo[id(self)] = dup
+            return dup
+
+        dup = self.__class__()
+        dup.name = self.name
+        memo[id(self)] = dup
+        assert self._props is not None and self._subcomponents is not None
+        dup._props = copy.deepcopy(self._props, memo)
+        assert dup._props is not None
+        for _k, v, p in dup._props:
+            if p is not None:
+                p._on_mutate = dup._mark_dirty
+            if hasattr(v, "params") and isinstance(v.params, Parameters):
+                if p is not None:
+                    v.params = p
+                else:
+                    v.params._on_mutate = dup._mark_dirty
+            if hasattr(v, "_on_mutate"):
+                v._on_mutate = dup._mark_dirty
+        dup._subcomponents = _TrackedSubcomponents(
+            dup, [copy.deepcopy(sub, memo) for sub in self._subcomponents]
+        )
+        for sub in dup._subcomponents:
+            sub._parent = dup
+        dup._errors = copy.deepcopy(self._errors, memo)
+        return dup
+
+    def __reduce__(self) -> tuple[Any, tuple[str, bytes]]:
+        return (_unpickle_component, (self.name, self.to_ical(sorted=False)))
 
     def __len__(self) -> int:
         return len(self.keys())
@@ -2559,6 +2612,15 @@ def _normalize_jcal_param(value: Any) -> Any:
     return value
 
 
+def _format_jcal_period_str(start: Any, end_or_dur: Any) -> str:
+    iso_s = _iso_temporal(start)
+    if isinstance(end_or_dur, datetime.timedelta):
+        iso_e = _format_temporal(end_or_dur, {})
+    else:
+        iso_e = _iso_temporal(end_or_dur)
+    return f"{iso_s}/{iso_e}"
+
+
 def _prop_to_jcal(key: str, val: Any, raw_params: dict[str, Any]) -> list[Any]:
     params = {
         k.lower(): _normalize_jcal_param(v)
@@ -2626,7 +2688,18 @@ def _prop_to_jcal(key: str, val: Any, raw_params: dict[str, Any]) -> list[Any]:
         return [pname, params, "float", val]
     if isinstance(val, tuple) and key == "GEO" and len(val) == 2:
         return [pname, params, "float", [val[0], val[1]]]
+    if isinstance(val, tuple) and len(val) == 2 and isinstance(val[0], datetime.datetime):
+        return [pname, params, "period", _format_jcal_period_str(val[0], val[1])]
     if isinstance(val, list):
+        if val and isinstance(val[0], vPeriod):
+            return [pname, params, "period", *[_format_jcal_period_str(x.start, x.end_or_dur) for x in val]]
+        if (
+            val
+            and isinstance(val[0], tuple)
+            and len(val[0]) == 2
+            and isinstance(val[0][0], datetime.datetime)
+        ):
+            return [pname, params, "period", *[_format_jcal_period_str(x[0], x[1]) for x in val]]
         if val and isinstance(val[0], datetime.datetime):
             return [pname, params, "date-time", *[_iso_temporal(x) for x in val]]
         if val and isinstance(val[0], datetime.date):
@@ -3743,6 +3816,13 @@ def _wrap_rust_component(
 ) -> Component:
     cls = _COMPONENT_CLASS_MAP.get(comp.name, Component)
     return cls(_rust_comp=comp, _keep_recurrence=keep_recurrence, _parent=_parent)
+
+
+def _unpickle_component(cls_name: str, raw: bytes) -> Component:
+    target_cls = _COMPONENT_CLASS_MAP.get(cls_name.upper(), Component)
+    res = target_cls.from_ical(raw)
+    assert isinstance(res, Component)
+    return res
 
 
 def _wrap_rust_occurrence_fast(

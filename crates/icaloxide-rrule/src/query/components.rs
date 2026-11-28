@@ -48,6 +48,7 @@ fn period_to_occ(
                 start_local: start.clone(),
                 end_local: end.clone(),
                 is_all_day: false,
+                is_undated: false,
                 recurrence_id_utc: None,
                 parent_id: None,
             }
@@ -65,6 +66,7 @@ fn period_to_occ(
                 start_local: start.clone(),
                 end_local,
                 is_all_day: false,
+                is_undated: false,
                 recurrence_id_utc: None,
                 parent_id: None,
             }
@@ -124,6 +126,7 @@ pub fn expand_alarms_for_parent(
                         start_local: fire_local.clone(),
                         end_local: fire_local,
                         is_all_day: false,
+                        is_undated: false,
                         recurrence_id_utc: Some(fire_utc),
                         parent_id: Some(parent_occ.component_id),
                     });
@@ -151,6 +154,7 @@ pub fn expand_alarms_for_parent(
                         start_local: t_local.clone(),
                         end_local: t_local,
                         is_all_day: false,
+                        is_undated: false,
                         recurrence_id_utc: Some(t_utc),
                         parent_id: Some(parent_occ.component_id),
                     });

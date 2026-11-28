@@ -5,6 +5,28 @@ All notable changes to `icaloxide` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-11-28
+
+### Bug Fixes (Uncovered via Differential Fuzzing & Torture Testing)
+
+- **DST Fall-Back `fold=1` & Spring-Forward Wall-Clock Parity (`icaloxide-py`)**:
+  - Added `cal_datetime_to_py_with_utc` so occurrences landing in a DST fall-back fold preserve `fold=1` (preventing negative `end < start` durations during repeated wall-clock hours in IANA zones and computing exact post-transition offsets for custom `VTIMEZONE`s), while preserving wall-clock `fold=0` `ZoneInfo` construction across spring-forward gaps.
+- **`YEARLY;INTERVAL>1;BYWEEKNO` Cross-Year Spillover (`icaloxide-rrule`)**:
+  - Added `byweekno_dates_in_year` so `FREQ=YEARLY` with `BYWEEKNO` includes late-December week-1 spillover and early-January previous-year final-week spillover strictly inside each stepped calendar year, even for `INTERVAL > 1`.
+- **Final `UNTIL` Period Draining (`icaloxide-rrule`)**:
+  - Fixed `RRuleIter::next()` and `AfterIter` (`AdvanceRuleCursor` / `AdvanceSplitCursor`) checking `finished` before draining remaining queued candidates in `pending`, ensuring the final `UNTIL` period emits every matching occurrence on both `between()` and streaming `after()`.
+- **`pickle` & `copy.deepcopy` Support (`icaloxide-py`, `icaloxide.compat`)**:
+  - Added `module = "icaloxide._icaloxide"` on PyO3 classes, `_unpickle_calendar` / `__reduce__` on `Calendar` and `Component` (Rust), and `__deepcopy__` / `__reduce__` on `compat.Component` (preserving zero-copy lazy cloning with isolated mutation and full pickle roundtripping).
+- **Query Bounds & Extreme Timezone Semantics (`icaloxide-rrule`, `icaloxide.compat`)**:
+  - Aligned `compat.recurring_ical_events.between()` / `count()` exclusive date stop bounds with upstream `recurring-ical-events` while keeping `at(date)` supporting single-day tuples/strings (`(y, m, d)`, `"YYYYMMDD"`).
+  - Fixed `CalendarQuery::between` / `overlaps_window` for point-in-time queries (`start == end`).
+  - Updated naive `CalendarQuery::at_date()` to query a `[-15h, +15h]` padded UTC window and filter by component local wall clock so extreme offsets (`Pacific/Kiritimati` `+14:00`, `Pacific/Niue` `-11:00`) match accurately.
+- **Tolerant Malformed Series & Windows `X-WR-TIMEZONE` (`icaloxide-rrule`, `icaloxide.compat`)**:
+  - Supported `RRULE:COUNT=0` (emitting master `DTSTART`), normalized backwards `DTEND < DTSTART` components without dropping/crashing, added `include_undated: bool` opt-in on `Calendar.query()` (default `False`; enabled by `compat.recurring_ical_events` for undated `VTODO`s with `start=None`/`end=None`), and exported `resolve_tzid()` so Windows CLDR names in `X-WR-TIMEZONE` resolve to canonical `ZoneInfo`.
+- **jCal `period` Serialization (`icaloxide.compat`)**:
+  - Fixed `_prop_to_jcal` and `vPeriod.from_jcal` so `RDATE;VALUE=PERIOD` and `FREEBUSY` period lists emit RFC 7265 `"period"` entries and parse both string (`"s/e"`) and 2-element list (`["s", "e"]`) jCal periods.
+- **Verification**: Added relentless torture & 150-case differential fuzzing suite in `tests/test_torture_v08.py`.
+
 ## [0.7.0] - 2026-11-27
 
 ### Performance & Parity

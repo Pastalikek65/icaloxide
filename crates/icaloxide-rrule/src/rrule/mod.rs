@@ -237,7 +237,7 @@ impl RRule {
                     rule.interval = iv;
                 }
                 "COUNT" => {
-                    let c = parse_ranged_i32(val, 1, 10_000_000)? as u32;
+                    let c = parse_ranged_i32(val, 0, 10_000_000)? as u32;
                     rule.count = Some(c);
                 }
                 "UNTIL" => rule.until = Some(parse_until(val)?),

@@ -643,6 +643,63 @@ END:VCALENDAR\r\n";
 }
 
 #[test]
+fn byweekno_interval_gt_1_cross_year_spillover() {
+    // INTERVAL=3 cross-year spillover must stay within each stepped calendar year.
+    let interval3_ics = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+PRODID:-//icaloxide//v080-byweekno-int3//EN\r\n\
+BEGIN:VEVENT\r\n\
+UID:int3-2024\r\n\
+DTSTART;VALUE=DATE:20241225\r\n\
+DURATION:P1D\r\n\
+RRULE:FREQ=YEARLY;INTERVAL=3;BYWEEKNO=1,52,53;BYDAY=SU;WKST=MO;COUNT=7\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\n\
+UID:int3-2026\r\n\
+DTSTART;VALUE=DATE:20260122\r\n\
+DURATION:P1D\r\n\
+RRULE:FREQ=YEARLY;INTERVAL=3;BYWEEKNO=1,52,53;BYDAY=SU;WKST=MO;COUNT=7\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+
+    let cal3 = Arc::new(Calendar::parse_str(interval3_ics).unwrap());
+    let q3 = CalendarQuery::new(cal3, QueryOptions::default()).unwrap();
+    let occs3 = q3
+        .between(utc_ts(2024, 1, 1, 0, 0, 0), utc_ts(2032, 1, 1, 0, 0, 0))
+        .unwrap();
+    let mut d2024 = Vec::new();
+    let mut d2026 = Vec::new();
+    for occ in occs3 {
+        match q3.calendar().component(occ.component_id).unwrap().uid() {
+            Some("int3-2024") => d2024.push(occ.start_local.date),
+            Some("int3-2026") => d2026.push(occ.start_local.date),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        d2024,
+        vec![
+            icaloxide_core::datetime::CalDate::new(2024, 12, 25).unwrap(),
+            icaloxide_core::datetime::CalDate::new(2024, 12, 29).unwrap(),
+            icaloxide_core::datetime::CalDate::new(2027, 1, 3).unwrap(),
+            icaloxide_core::datetime::CalDate::new(2027, 1, 10).unwrap(),
+            icaloxide_core::datetime::CalDate::new(2030, 1, 6).unwrap(),
+            icaloxide_core::datetime::CalDate::new(2030, 12, 29).unwrap(),
+        ]
+    );
+    assert_eq!(
+        d2026,
+        vec![
+            icaloxide_core::datetime::CalDate::new(2026, 1, 22).unwrap(),
+            icaloxide_core::datetime::CalDate::new(2026, 12, 27).unwrap(),
+            icaloxide_core::datetime::CalDate::new(2029, 1, 7).unwrap(),
+            icaloxide_core::datetime::CalDate::new(2029, 12, 30).unwrap(),
+        ]
+    );
+}
+
+#[test]
 fn cross_timezone_dtend_preserves_end_tz_until_lt_dtstart_and_unbounded_all() {
     let ics = "BEGIN:VCALENDAR\r\n\
 VERSION:2.0\r\n\
