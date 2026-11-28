@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import datetime
 import xml.etree.ElementTree as ET
+from pathlib import Path
 
 import icalendar as up_ical
 import icaloxide
-from icaloxide.compat.icalendar import Calendar, vUTCOffset
+import recurring_ical_events as up_rie
+from icaloxide.cli import main as cli_main
+from icaloxide.compat.icalendar import Calendar, vRecur, vUTCOffset
 from icaloxide.compat.props_extra import vAdr, vN, vOrg
 from icaloxide.compat.recurring_ical_events import of as compat_of
 from icaloxide.compat.xcal import XCAL_NS
@@ -125,3 +128,75 @@ def test_multiline_categories_request_status_fastpath_xcal_and_props_extra() -> 
     assert adr.country == "Country,A"
     assert vN.from_ical(r"Doe\\n;Jane\;").family == r"Doe\n"
     assert vOrg.from_ical(r"Acme\\n;R\&D\;1") == (r"Acme\n", r"R\&D;1")
+
+
+def test_rdate_date_on_timed_vrecur_uppercase_and_cli_safety(tmp_path: Path) -> None:
+    """Round-3 fixes: RDATE;VALUE=DATE midnight semantics, vRecur uppercase, CLI safety, VTIMEZONE UNTIL, mid-event after()."""
+    # 1. RDATE;VALUE=DATE on timed DTSTART matches upstream (00:00:00)
+    ics_rd = (
+        b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//R//EN\r\nBEGIN:VEVENT\r\nUID:r1\r\n"
+        b"DTSTART:20260701T100000Z\r\nDURATION:PT1H\r\nRDATE;VALUE=DATE:20260705\r\nSUMMARY:R1\r\n"
+        b"END:VEVENT\r\nEND:VCALENDAR\r\n"
+    )
+    ws = datetime.datetime(2026, 6, 30, tzinfo=datetime.timezone.utc)
+    we = datetime.datetime(2026, 7, 10, tzinfo=datetime.timezone.utc)
+    up_rd = [(e.decoded("DTSTART").astimezone(datetime.timezone.utc), e.decoded("DTEND").astimezone(datetime.timezone.utc)) for e in up_rie.of(up_ical.Calendar.from_ical(ics_rd)).between(ws, we)]
+    ox_rd = [(e.decoded("DTSTART").astimezone(datetime.timezone.utc), e.decoded("DTEND").astimezone(datetime.timezone.utc)) for e in compat_of(Calendar.from_ical(ics_rd)).between(ws, we)]
+    assert ox_rd == up_rd
+
+    # 2. vRecur uppercase normalization
+    vr = vRecur.from_ical("freq=monthly;byday=+1mo,-1fr;wkst=su;count=5")
+    assert vr["FREQ"] == ["MONTHLY"]
+    assert vr["BYDAY"] == ["+1MO", "-1FR"]
+    assert vr["WKST"] == ["SU"]
+    assert vr.to_ical() == b"FREQ=MONTHLY;BYDAY=+1MO,-1FR;WKST=SU;COUNT=5"
+
+    # 3. CLI validate returns 1 cleanly on strict syntax errors; query handles VTODO cleanly
+    bad_file = tmp_path / "bad.ics"
+    bad_file.write_bytes(b'BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY;BAD="unterminated:Hi\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n')
+    assert cli_main(["validate", str(bad_file)]) == 1
+
+    todo_file = tmp_path / "todo.ics"
+    todo_file.write_bytes(
+        b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//T//EN\r\n"
+        b"BEGIN:VTODO\r\nUID:t1\r\nDTSTART:20260702T100000Z\r\nSUMMARY:Task\r\nEND:VTODO\r\n"
+        b"END:VCALENDAR\r\n"
+    )
+    assert cli_main(["query", str(todo_file), "--between", "2026-07-01", "2026-07-05", "--components", "VTODO"]) == 0
+
+    # 4. Historical VTIMEZONE with UNTIL transition matches upstream
+    ics_vtz_hist = (
+        b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//VTZ//EN\r\n"
+        b"BEGIN:VTIMEZONE\r\nTZID:Custom/US-Hist\r\n"
+        b"BEGIN:DAYLIGHT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nTZNAME:EDT\r\n"
+        b"DTSTART:19870405T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=4;BYDAY=1SU;UNTIL=20060402T070000Z\r\nEND:DAYLIGHT\r\n"
+        b"BEGIN:STANDARD\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nTZNAME:EST\r\n"
+        b"DTSTART:19871025T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU;UNTIL=20061029T060000Z\r\nEND:STANDARD\r\n"
+        b"BEGIN:DAYLIGHT\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nTZNAME:EDT\r\n"
+        b"DTSTART:20070311T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU\r\nEND:DAYLIGHT\r\n"
+        b"BEGIN:STANDARD\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nTZNAME:EST\r\n"
+        b"DTSTART:20071104T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU\r\nEND:STANDARD\r\n"
+        b"END:VTIMEZONE\r\n"
+        b"BEGIN:VEVENT\r\nUID:h1\r\nDTSTART;TZID=Custom/US-Hist:20060320T100000\r\nDURATION:PT1H\r\nSUMMARY:Pre2007\r\nEND:VEVENT\r\n"
+        b"BEGIN:VEVENT\r\nUID:h2\r\nDTSTART;TZID=Custom/US-Hist:20260320T100000\r\nDURATION:PT1H\r\nSUMMARY:Post2007\r\nEND:VEVENT\r\n"
+        b"END:VCALENDAR\r\n"
+    )
+    ws_y = datetime.datetime(2005, 1, 1, tzinfo=datetime.timezone.utc)
+    we_y = datetime.datetime(2027, 1, 1, tzinfo=datetime.timezone.utc)
+    up_h = sorted((e.decoded("SUMMARY"), e.decoded("DTSTART").astimezone(datetime.timezone.utc)) for e in up_rie.of(up_ical.Calendar.from_ical(ics_vtz_hist)).between(ws_y, we_y))
+    ox_h = sorted((e.decoded("SUMMARY"), e.decoded("DTSTART").astimezone(datetime.timezone.utc)) for e in compat_of(Calendar.from_ical(ics_vtz_hist)).between(ws_y, we_y))
+    assert ox_h == up_h
+
+    # 5. after() starting mid-event includes currently-running events
+    ics_mid = (
+        b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//M//EN\r\n"
+        b"BEGIN:VEVENT\r\nUID:m-single\r\nDTSTART:20260701T080000Z\r\nDTEND:20260701T140000Z\r\nSUMMARY:LongSingle\r\nEND:VEVENT\r\n"
+        b"BEGIN:VEVENT\r\nUID:m-recur\r\nDTSTART:20260601T080000Z\r\nDURATION:PT6H\r\nRRULE:FREQ=DAILY;COUNT=40\r\nSUMMARY:LongRecur\r\nEND:VEVENT\r\n"
+        b"END:VCALENDAR\r\n"
+    )
+    mid_pt = datetime.datetime(2026, 7, 1, 11, 0, tzinfo=datetime.timezone.utc)
+    end_pt = datetime.datetime(2026, 7, 3, 0, 0, tzinfo=datetime.timezone.utc)
+    up_a = sorted((e.decoded("UID"), e.decoded("DTSTART").astimezone(datetime.timezone.utc)) for e in up_rie.of(up_ical.Calendar.from_ical(ics_mid)).after(mid_pt) if e.decoded("DTSTART").astimezone(datetime.timezone.utc) < end_pt)
+    ox_a = sorted((e.decoded("UID"), e.decoded("DTSTART").astimezone(datetime.timezone.utc)) for e in compat_of(Calendar.from_ical(ics_mid)).after(mid_pt) if e.decoded("DTSTART").astimezone(datetime.timezone.utc) < end_pt)
+    assert ox_a == up_a
+

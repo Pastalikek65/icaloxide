@@ -5,6 +5,18 @@ All notable changes to `icaloxide` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.2] - 2026-11-28
+
+### Bug Fixes (Round-3 Deep Parity, `vRecur` Normalization & CLI Safety)
+
+- **`RDATE;VALUE=DATE` on Timed Components (`icaloxide-rrule`)**:
+  - Normalized `RDATE;VALUE=DATE` entries to midnight (`00:00:00`) instead of inheriting `DTSTART`'s wall-clock time, matching upstream `recurring-ical-events` / `dateutil`.
+- **`vRecur` Uppercase Normalization (`icaloxide.compat.icalendar`)**:
+  - Uppercased `FREQ`, `BYDAY`, `WKST`, `RSCALE`, and `SKIP` string values in `vRecur.from_ical()` and `vRecur.__setitem__()` per RFC 5545 §3.3.10.
+- **CLI Error & Undated Occurrence Safety (`icaloxide.cli`)**:
+  - Caught strict `ValueError` syntax errors cleanly in `icaloxide validate` (exit code `1` to stderr) and guarded `occ.start` / `occ.end` for `None` in `icaloxide query`.
+- **Verification**: Added Round-3 regressions (`RDATE;VALUE=DATE` on timed `DTSTART`, lowercase `vRecur`, CLI `validate`/`query`, historical `VTIMEZONE` `UNTIL`, and mid-event `after()`) to `tests/test_audit_v091.py`.
+
 ## [0.9.1] - 2026-11-28
 
 ### Bug Fixes (Deep Parser/Serializer, Compat & xCal Audit)

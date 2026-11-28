@@ -581,7 +581,10 @@ class vRecur(dict):  # type: ignore[type-arg]
                     continue
                 except ValueError:
                     pass
-            normalized.append(item)
+            if key_up in ("FREQ", "BYDAY", "WKST", "RSCALE", "SKIP") and isinstance(item, str):
+                normalized.append(item.upper())
+            else:
+                normalized.append(item)
         super().__setitem__(key_up, normalized)
 
     def __delitem__(self, key: str) -> None:
@@ -636,6 +639,8 @@ class vRecur(dict):  # type: ignore[type-arg]
                         vals.append(int(item_s))
                     except ValueError:
                         vals.append(item_s)
+                elif k_up in ("FREQ", "BYDAY", "WKST", "RSCALE", "SKIP"):
+                    vals.append(item_s.upper())
                 else:
                     vals.append(item_s)
             super(vRecur, rec).__setitem__(k_up, vals)

@@ -1076,11 +1076,16 @@ fn extract_rdates(
                 }
             }
             PropertyValue::DateList(list) => {
+                let midnight = CalTime {
+                    hour: 0,
+                    minute: 0,
+                    second: 0,
+                };
                 for &d in list {
                     rdates.push(RDateEntry {
                         start_local: CalDateTime {
                             date: d,
-                            time: default_start.time,
+                            time: midnight,
                             tz: default_start.tz.clone(),
                         },
                         tz: default_start_tz.clone(),
@@ -1099,7 +1104,11 @@ fn extract_rdates(
             PropertyValue::Date(d) => rdates.push(RDateEntry {
                 start_local: CalDateTime {
                     date: *d,
-                    time: default_start.time,
+                    time: CalTime {
+                        hour: 0,
+                        minute: 0,
+                        second: 0,
+                    },
                     tz: default_start.tz.clone(),
                 },
                 tz: default_start_tz.clone(),

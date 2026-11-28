@@ -40,7 +40,11 @@ def _cmd_view(args: argparse.Namespace) -> int:
 
 
 def _cmd_validate(args: argparse.Namespace) -> int:
-    cal = icaloxide.Calendar.from_ical(Path(args.file), strict=True)
+    try:
+        cal = icaloxide.Calendar.from_ical(Path(args.file), strict=True)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     issues = cal.validate()
     missing_tz = cal.missing_tzids()
     for line, msg in issues:
@@ -64,7 +68,9 @@ def _cmd_query(args: argparse.Namespace) -> int:
             print(f"{b_start.isoformat()} -> {b_end.isoformat()}")
         return 0
     for occ in q.between(start, end):  # type: ignore[arg-type]
-        print(f"[{occ.name}] {occ.start.isoformat()} .. {occ.end.isoformat()} | {occ.summary or ''}")
+        s_str = occ.start.isoformat() if occ.start is not None else "(undated)"
+        e_str = occ.end.isoformat() if occ.end is not None else "(undated)"
+        print(f"[{occ.name}] {s_str} .. {e_str} | {occ.summary or ''}")
     return 0
 
 
