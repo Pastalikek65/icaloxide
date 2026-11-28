@@ -49,16 +49,6 @@ from icaloxide.compat.icalendar import (
 )
 
 
-def _unescape_structured(raw: str) -> str:
-    return (
-        raw.replace("\\n", "\n")
-        .replace("\\N", "\n")
-        .replace("\\;", ";")
-        .replace("\\,", ",")
-        .replace("\\\\", "\\")
-    )
-
-
 def _split_semicolons(text: str) -> list[str]:
     out: list[str] = []
     buf: list[str] = []
@@ -69,11 +59,18 @@ def _split_semicolons(text: str) -> list[str]:
             buf.clear()
         elif ch == "\\":
             nxt = next(it, "")
-            buf.append("\\" + nxt)
+            if nxt in ("n", "N"):
+                buf.append("\n")
+            elif nxt in (";", ",", "\\"):
+                buf.append(nxt)
+            elif nxt:
+                buf.append("\\" + nxt)
+            else:
+                buf.append("\\")
         else:
             buf.append(ch)
     out.append("".join(buf))
-    return [_unescape_structured(p) for p in out]
+    return out
 
 
 class AdrFields(NamedTuple):

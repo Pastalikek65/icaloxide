@@ -5,6 +5,21 @@ All notable changes to `icaloxide` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] - 2026-11-28
+
+### Bug Fixes (Deep Parser/Serializer, Compat & xCal Audit)
+
+- **`Calendar.modify_occurrence()` & `complete_occurrence()` (`icaloxide.compat.icalendar`)**:
+  - Defaulted override `DTSTART` to `recurrence_id` (instead of leaving master's `DTSTART`) and shifted `DTEND`/`DUE` by master's span when neither `end` nor `duration` is explicitly supplied, plus normalized `k.replace("_", "-").upper()` so `percent_complete=100` writes `PERCENT-COMPLETE:100`.
+- **`VALUE=TIME` UTC `Z` & Leap Second Handling (`icaloxide-core`, `icaloxide-py`, `icaloxide.compat`)**:
+  - Updated `PropertyValue::Time` to preserve `is_utc: bool` across parse, roundtrip `to_ical()`, jCal, and xCal; clamped leap second `60` to `59` in `cal_time_to_py` so Python `datetime.time` conversion never raises `ValueError`.
+- **`VALUE=UTC-OFFSET` Property & Multi-Line `CATEGORIES` Parity (`icaloxide.compat.icalendar`)**:
+  - Wrapped and serialized custom `VALUE=UTC-OFFSET` properties as `vUTCOffset` (`+053015` / `"utc-offset"`) instead of durations (`PT5H30M15S`), flattened multi-line `CATEGORIES` in `Component.categories`, and restricted materialized `REQUEST-STATUS` fast-path splitting to `split(";", 2)`.
+- **RFC 6321 xCal & Structured Property Unescaping (`icaloxide.compat.xcal`, `props_extra`)**:
+  - Emitted and parsed RFC 6321 `<code>`/`<description>`/`<data>` elements for `REQUEST-STATUS`, `<start>`/`<end>`/`<duration>` children for `PERIOD`, and UTC `Z` on `TIME`.
+  - Replaced chained `.replace(...)` in `props_extra._split_semicolons` with single-pass unescaping so `\\n` decodes to literal `\n`.
+- **Verification**: Added `tests/test_audit_v091.py`.
+
 ## [0.9.0] - 2026-11-28
 
 ### Bug Fixes (Comprehensive Audit & Extended Differential Verification)

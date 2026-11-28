@@ -21,6 +21,8 @@ def _format_iso_xcal(val: Any) -> tuple[str, str]:
     if isinstance(val, datetime.date):
         return "date", val.isoformat()
     if isinstance(val, datetime.time):
+        if val.tzinfo is not None and val.utcoffset() == datetime.timedelta(0):
+            return "time", val.strftime("%H:%M:%SZ")
         return "time", val.strftime("%H:%M:%S")
     if isinstance(val, datetime.timedelta):
         total = int(val.total_seconds())
@@ -74,6 +76,36 @@ def _append_xcal_prop(props_el: ET.Element, jprop: list[Any]) -> None:
             for item in sub_items:
                 el = ET.SubElement(rec_el, _tag(str(rk).lower()))
                 el.text = str(item)
+        return
+
+    if pname == "request-status" and vals and isinstance(vals[0], list):
+        parts = vals[0]
+        if len(parts) >= 1:
+            c_el = ET.SubElement(prop_el, _tag("code"))
+            c_el.text = str(parts[0])
+        if len(parts) >= 2:
+            d_el = ET.SubElement(prop_el, _tag("description"))
+            d_el.text = str(parts[1])
+        if len(parts) >= 3 and str(parts[2]):
+            x_el = ET.SubElement(prop_el, _tag("data"))
+            x_el.text = str(parts[2])
+        return
+
+    if jtype == "period":
+        for val in vals:
+            s_val = str(val)
+            if "/" in s_val:
+                start_s, end_or_dur = s_val.split("/", 1)
+                per_el = ET.SubElement(prop_el, _tag("period"))
+                st_el = ET.SubElement(per_el, _tag("start"))
+                st_el.text = start_s
+                is_dur = end_or_dur.startswith(("P", "-P", "+P"))
+                tag2 = "duration" if is_dur else "end"
+                end_el = ET.SubElement(per_el, _tag(tag2))
+                end_el.text = end_or_dur
+            else:
+                val_el = ET.SubElement(prop_el, _tag("period"))
+                val_el.text = s_val
         return
 
     if jtype == "float" and pname == "geo" and vals and isinstance(vals[0], list) and len(vals[0]) == 2:
@@ -134,6 +166,7 @@ def _parse_xcal_prop(prop_el: ET.Element) -> list[Any]:
     jtype = "text"
     vals: list[Any] = []
 
+    rs_parts: dict[str, str] = {}
     for child in prop_el:
         cname = _local_name(child.tag)
         if cname == "parameters":
@@ -143,6 +176,16 @@ def _parse_xcal_prop(prop_el: ET.Element) -> list[Any]:
                 if not pvals and pel.text:
                     pvals = [pel.text]
                 params[pk] = pvals[0] if len(pvals) == 1 else pvals
+        elif pname == "request-status" and cname in ("code", "description", "data"):
+            rs_parts[cname] = child.text or ""
+        elif cname == "period":
+            jtype = "period"
+            sub_map = {_local_name(sc.tag): (sc.text or "") for sc in child}
+            if "start" in sub_map:
+                second = sub_map.get("duration", sub_map.get("end", ""))
+                vals.append(f"{sub_map['start']}/{second}")
+            else:
+                vals.append(child.text or "")
         elif cname == "recur":
             jtype = "recur"
             rec: dict[str, Any] = {}
@@ -175,6 +218,11 @@ def _parse_xcal_prop(prop_el: ET.Element) -> list[Any]:
             else:
                 vals.append(raw)
 
+    if pname == "request-status" and rs_parts:
+        rs_list = [rs_parts.get("code", ""), rs_parts.get("description", "")]
+        if "data" in rs_parts:
+            rs_list.append(rs_parts["data"])
+        return [pname, params, "text", rs_list]
     if pname == "geo" and len(vals) == 2 and all(isinstance(x, (int, float)) for x in vals):
         return [pname, params, "float", [vals[0], vals[1]]]
     if not vals:

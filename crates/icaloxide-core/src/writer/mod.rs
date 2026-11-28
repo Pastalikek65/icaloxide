@@ -156,7 +156,12 @@ fn format_property(prop: &Property, buf: &mut String) -> fmt::Result {
         PropertyValue::Geo { lat, lon } => write!(buf, "{lat};{lon}")?,
         PropertyValue::Boolean(b) => buf.push_str(if *b { "TRUE" } else { "FALSE" }),
         PropertyValue::UtcOffset(off) => write!(buf, "{off}")?,
-        PropertyValue::Time(t) => write!(buf, "{t}")?,
+        PropertyValue::Time { time, is_utc } => {
+            write!(buf, "{time}")?;
+            if *is_utc {
+                buf.push('Z');
+            }
+        }
         PropertyValue::RequestStatus(parts) => {
             for (idx, part) in parts.iter().enumerate() {
                 if idx > 0 {

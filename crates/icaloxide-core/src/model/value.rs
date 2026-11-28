@@ -22,7 +22,7 @@ pub enum PropertyValue {
     Geo { lat: f64, lon: f64 },
     Boolean(bool),
     UtcOffset(UtcOffset),
-    Time(CalTime),
+    Time { time: CalTime, is_utc: bool },
     RequestStatus(Vec<CompactString>),
     Uri(CompactString),
     CalAddress(CompactString),
@@ -122,9 +122,20 @@ fn parse_scalar_value(
         ValueType::DateTime => {
             parse_datetime_with_tz_recovery(ctx, raw.trim(), warnings).map(PropertyValue::DateTime)
         }
-        ValueType::Time => CalTime::parse_bytes(raw.trim().as_bytes())
-            .map(PropertyValue::Time)
-            .map_err(|e| e.to_string()),
+        ValueType::Time => {
+            let trimmed = raw.trim().as_bytes();
+            let (time_bytes, is_utc) = if let Some(prefix) = trimmed
+                .strip_suffix(b"Z")
+                .or_else(|| trimmed.strip_suffix(b"z"))
+            {
+                (prefix, true)
+            } else {
+                (trimmed, false)
+            };
+            CalTime::parse_bytes(time_bytes)
+                .map(|time| PropertyValue::Time { time, is_utc })
+                .map_err(|e| e.to_string())
+        }
         ValueType::Duration => CalDuration::parse_bytes(raw.trim().as_bytes())
             .map(PropertyValue::Duration)
             .map_err(|e| e.to_string()),

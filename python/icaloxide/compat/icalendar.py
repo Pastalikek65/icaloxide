@@ -97,7 +97,8 @@ def _format_temporal(val: Any, params: dict[str, Any]) -> str:
                 parts.append(f"{secs}S")
         return "".join(parts)
     if isinstance(val, datetime.time):
-        return f"{val.hour:02d}{val.minute:02d}{val.second:02d}"
+        suffix = "Z" if val.tzinfo is not None and val.utcoffset() == datetime.timedelta(0) else ""
+        return f"{val.hour:02d}{val.minute:02d}{val.second:02d}{suffix}"
     return str(val)
 
 
@@ -1553,7 +1554,15 @@ def _categories_prop(key: str = "CATEGORIES") -> property:
         val = self.decoded(key, None)
         if val is None:
             return []
-        return list(val) if isinstance(val, list) else [str(val)]
+        if not isinstance(val, list):
+            return [str(val)]
+        flat: list[str] = []
+        for item in val:
+            if isinstance(item, list):
+                flat.extend(str(sub) for sub in item)
+            else:
+                flat.append(str(item))
+        return flat
 
     def fset(self: Any, val: Any) -> None:
         self.pop(key, None)
@@ -1914,6 +1923,11 @@ class Component:
             if isinstance(val, vBinary):
                 return val
             return vBinary(_decode_binary_val(val), params=p_obj)
+        if isinstance(val, datetime.timedelta) and (
+            key_upper in ("TZOFFSETFROM", "TZOFFSETTO")
+            or str(p_obj.get("VALUE", "")).upper() == "UTC-OFFSET"
+        ):
+            return vUTCOffset(val, params=p_obj)
         if key_upper in _TEMPORAL_KEYS and isinstance(val, vDDDTypes):
             val._on_mutate = self._make_value_sync(key_upper, match_idx, val)
             return val
@@ -2474,7 +2488,7 @@ class Component:
                 if key in _RAW_STR_KEYS:
                     lines.append(f"{key}:{val}")
                 elif key == "REQUEST-STATUS":
-                    esc_parts = ";".join(_escape_text(p) for p in val.split(";"))
+                    esc_parts = ";".join(_escape_text(p) for p in val.split(";", 2))
                     lines.append(f"{key}:{esc_parts}")
                 else:
                     lines.append(f"{key}:{_escape_text(val)}")
@@ -2564,7 +2578,10 @@ class Component:
             for pk, pv in val.params.items():
                 params.setdefault(pk, pv)
             return val.to_ical().decode("utf-8")
-        if isinstance(val, datetime.timedelta) and key in ("TZOFFSETFROM", "TZOFFSETTO"):
+        if isinstance(val, datetime.timedelta) and (
+            key in ("TZOFFSETFROM", "TZOFFSETTO")
+            or str(params.get("VALUE", "")).upper() == "UTC-OFFSET"
+        ):
             return _format_utc_offset(val)
         if isinstance(val, vDDDTypes):
             for pk, pv in val.params.items():
@@ -2665,7 +2682,13 @@ def _prop_to_jcal(key: str, val: Any, raw_params: dict[str, Any]) -> list[Any]:
         return [pname, params, "recur", rec_dict]
     if key == "RRULE" and isinstance(val, str):
         return _prop_to_jcal(key, vRecur.from_ical(val), raw_params)
-    if isinstance(val, vUTCOffset) or (key in ("TZOFFSETFROM", "TZOFFSETTO") and isinstance(val, datetime.timedelta)):
+    if isinstance(val, vUTCOffset) or (
+        isinstance(val, datetime.timedelta)
+        and (
+            key in ("TZOFFSETFROM", "TZOFFSETTO")
+            or str(raw_params.get("VALUE", "")).upper() == "UTC-OFFSET"
+        )
+    ):
         td_val = val.dt if isinstance(val, vUTCOffset) else val
         return [pname, params, "utc-offset", _format_utc_offset(td_val, colon=True)]
     if isinstance(val, vBinary):
@@ -2693,7 +2716,8 @@ def _prop_to_jcal(key: str, val: Any, raw_params: dict[str, Any]) -> list[Any]:
     if isinstance(val, datetime.date):
         return [pname, params, "date", val.isoformat()]
     if isinstance(val, datetime.time):
-        return [pname, params, "time", val.strftime("%H:%M:%S")]
+        suffix = "Z" if val.tzinfo is not None and val.utcoffset() == datetime.timedelta(0) else ""
+        return [pname, params, "time", f"{val.strftime('%H:%M:%S')}{suffix}"]
     if isinstance(val, datetime.timedelta):
         return [pname, params, "duration", _format_temporal(val, {})]
     if isinstance(val, bool):
@@ -4058,21 +4082,39 @@ class Calendar(Component):
         )
         if master is None:
             raise KeyError(f"master component with UID={uid!r} not found")
+        end_key = "DUE" if master.name == "VTODO" else "DTEND"
+        master_start = master.decoded("DTSTART", None)
+        master_end = master.decoded(end_key, None) if "DURATION" not in master else None
+        master_dur = None
+        if master_start is not None and master_end is not None:
+            try:
+                master_dur = master_end - master_start
+            except TypeError:
+                master_dur = None
+
         ov = master.copy()
         for rec_key in ("RRULE", "RDATE", "EXDATE", "RECURRENCE-ID"):
             if rec_key in ov:
                 del ov[rec_key]
         rid_params = {"RANGE": "THISANDFUTURE"} if range_this_and_future else None
         ov.add("RECURRENCE-ID", recurrence_id, parameters=rid_params)
-        if "start" in updates:
-            ov["DTSTART"] = updates.pop("start")
+
+        new_start = updates.pop("start", updates.pop("dtstart", recurrence_id))
+        ov["DTSTART"] = new_start
         if "end" in updates:
-            end_key = "DUE" if ov.name == "VTODO" else "DTEND"
+            ov.pop("DURATION", None)
             ov[end_key] = updates.pop("end")
-        if "duration" in updates:
+        elif "duration" in updates:
+            ov.pop("DTEND", None)
+            ov.pop("DUE", None)
             ov["DURATION"] = updates.pop("duration")
+        elif end_key in ov and "DURATION" not in ov and master_dur is not None:
+            try:
+                ov[end_key] = new_start + master_dur
+            except TypeError:
+                pass
         for k, v in updates.items():
-            ov[k.upper()] = v
+            ov[k.replace("_", "-").upper()] = v
         seq = int(ov.decoded("SEQUENCE", 0) or 0) + 1
         ov["SEQUENCE"] = seq
         self.add_component(ov)

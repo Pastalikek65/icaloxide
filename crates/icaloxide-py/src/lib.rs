@@ -78,9 +78,18 @@ fn cal_date_to_py(py: Python<'_>, d: CalDate) -> PyResult<Bound<'_, PyAny>> {
         .call1((i32::from(d.year), d.month, d.day))
 }
 
-fn cal_time_to_py(py: Python<'_>, t: CalTime) -> PyResult<Bound<'_, PyAny>> {
+fn cal_time_to_py(py: Python<'_>, t: CalTime, is_utc: bool) -> PyResult<Bound<'_, PyAny>> {
     let types = dt_types(py)?;
-    types.time_cls.bind(py).call1((t.hour, t.minute, t.second))
+    let sec = t.second.min(59);
+    if is_utc {
+        let tz = types.utc_tz.bind(py);
+        types
+            .time_cls
+            .bind(py)
+            .call1((t.hour, t.minute, sec, 0_u8, tz))
+    } else {
+        types.time_cls.bind(py).call1((t.hour, t.minute, sec))
+    }
 }
 
 fn fixed_tz_to_py<'py>(
@@ -353,7 +362,7 @@ fn property_value_to_py<'py>(
         PropertyValue::Geo { lat, lon } => Ok(PyTuple::new(py, [*lat, *lon])?.into_any()),
         PropertyValue::Boolean(b) => Ok(PyBool::new(py, *b).to_owned().into_any()),
         PropertyValue::UtcOffset(off) => utc_offset_to_py(py, *off),
-        PropertyValue::Time(t) => cal_time_to_py(py, *t),
+        PropertyValue::Time { time, is_utc } => cal_time_to_py(py, *time, *is_utc),
         PropertyValue::RequestStatus(parts) => Ok(PyString::new(py, &parts.join(";")).into_any()),
     }
 }
