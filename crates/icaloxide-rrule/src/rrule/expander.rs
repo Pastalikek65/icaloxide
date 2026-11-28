@@ -97,8 +97,9 @@ impl<'a> RRuleIter<'a> {
         fast_forward_to: Option<LocalDateTime>,
         budget: IterationBudget,
     ) -> Self {
+        let finished = is_modularly_impossible(rule, dtstart);
         let mut period_idx = 0_u64;
-        if rule.count.is_none() {
+        if !finished && rule.count.is_none() {
             if let Some(target) = fast_forward_to {
                 if target > dtstart {
                     period_idx = compute_fast_forward_period(rule, dtstart, target);
@@ -115,7 +116,7 @@ impl<'a> RRuleIter<'a> {
             consecutive_empty: 0,
             emitted: 0,
             pending: VecDeque::new(),
-            finished: false,
+            finished,
         }
     }
 
@@ -227,6 +228,113 @@ impl Iterator for RRuleIter<'_> {
             self.finished = true;
         }
         Some(Ok(next_dt))
+    }
+}
+
+const fn gcd(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a
+}
+
+fn mod_reachable(
+    start: u32,
+    modulus: u32,
+    interval: u32,
+    mut targets: impl Iterator<Item = u32>,
+) -> bool {
+    let g = gcd(interval, modulus);
+    targets.any(|target| (target + modulus - start) % g == 0)
+}
+
+fn is_modularly_impossible(rule: &RRule, dtstart: LocalDateTime) -> bool {
+    let iv = rule.interval.max(1);
+    match rule.freq {
+        Frequency::Monthly => {
+            !rule.by_month.is_empty()
+                && !mod_reachable(
+                    u32::from(dtstart.date.month - 1),
+                    12,
+                    iv,
+                    rule.by_month.iter().map(|&m| u32::from(m - 1)),
+                )
+        }
+        Frequency::Daily => {
+            !rule.by_day.is_empty()
+                && iv % 7 == 0
+                && !rule
+                    .by_day
+                    .iter()
+                    .any(|bw| bw.weekday.to_u8() == dtstart.date.weekday())
+        }
+        Frequency::Hourly => {
+            !rule.by_hour.is_empty()
+                && !mod_reachable(
+                    u32::from(dtstart.time.hour),
+                    24,
+                    iv,
+                    rule.by_hour.iter().map(|&h| u32::from(h)),
+                )
+        }
+        Frequency::Minutely => {
+            if !rule.by_minute.is_empty()
+                && !mod_reachable(
+                    u32::from(dtstart.time.minute),
+                    60,
+                    iv,
+                    rule.by_minute.iter().map(|&m| u32::from(m)),
+                )
+            {
+                return true;
+            }
+            if !rule.by_hour.is_empty() {
+                let g_day = gcd(iv, 1440);
+                let start_mod = u32::from(dtstart.time.hour) * 60 + u32::from(dtstart.time.minute);
+                let any_hour_min = rule.by_hour.iter().any(|&h| {
+                    let h_off = u32::from(h) * 60;
+                    if rule.by_minute.is_empty() {
+                        (0..60_u32).any(|m| (h_off + m + 1440 - start_mod) % g_day == 0)
+                    } else {
+                        rule.by_minute
+                            .iter()
+                            .any(|&m| (h_off + u32::from(m) + 1440 - start_mod) % g_day == 0)
+                    }
+                });
+                if !any_hour_min {
+                    return true;
+                }
+            }
+            false
+        }
+        Frequency::Secondly => {
+            (!rule.by_second.is_empty()
+                && !mod_reachable(
+                    u32::from(dtstart.time.second),
+                    60,
+                    iv,
+                    rule.by_second.iter().map(|&s| u32::from(s)),
+                ))
+                || (!rule.by_minute.is_empty()
+                    && iv % 60 == 0
+                    && !mod_reachable(
+                        u32::from(dtstart.time.minute),
+                        60,
+                        iv / 60,
+                        rule.by_minute.iter().map(|&m| u32::from(m)),
+                    ))
+                || (!rule.by_hour.is_empty()
+                    && iv % 3600 == 0
+                    && !mod_reachable(
+                        u32::from(dtstart.time.hour),
+                        24,
+                        iv / 3600,
+                        rule.by_hour.iter().map(|&h| u32::from(h)),
+                    ))
+        }
+        Frequency::Yearly | Frequency::Weekly => false,
     }
 }
 
@@ -412,9 +520,14 @@ fn generate_weekly(
         return None;
     }
 
+    let dtstart_epoch = dtstart.date.to_days_since_epoch();
     let mut dates = Vec::with_capacity(7);
     for offset in 0..7_i32 {
-        let date = CalDate::from_days_since_epoch(week_start as i32 + offset);
+        let day_epoch = week_start as i32 + offset;
+        if period_idx == 0 && day_epoch < dtstart_epoch {
+            continue;
+        }
+        let date = CalDate::from_days_since_epoch(day_epoch);
         let wd_matches = if rule.by_day.is_empty() {
             if rule.by_month_day.is_empty() && rule.by_year_day.is_empty() {
                 date.weekday() == dtstart.date.weekday()

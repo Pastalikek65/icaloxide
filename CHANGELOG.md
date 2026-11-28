@@ -5,6 +5,22 @@ All notable changes to `icaloxide` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.3] - 2026-11-28
+
+### Bug Fixes (Round-4 Combinatorial RRULE, Parameter, jCal Bytes & Unescaping)
+
+- **`WEEKLY` + `WKST` + `BYSETPOS` Period-0 Alignment (`icaloxide-rrule`)**:
+  - Excluded days earlier than `DTSTART` during period `0` of `generate_weekly`, matching `dateutil`'s `wdayset` so `BYSETPOS` + `COUNT` does not select and drop pre-`DTSTART` candidates before counting occurrences.
+- **Modularly Impossible RRULE Short-Circuit (`icaloxide-rrule`)**:
+  - Detected modularly unsatisfiable `MONTHLY;INTERVAL=...;BYMONTH=...`, `DAILY;INTERVAL=7*k;BYDAY=...`, `HOURLY;INTERVAL=...;BYHOUR=...`, `MINUTELY;INTERVAL=...;BYHOUR/BYMINUTE=...`, and `SECONDLY;INTERVAL=...;BYSECOND/BYMINUTE/BYHOUR=...` progressions upfront via `gcd` checks, returning empty `RRULE` expansion cleanly without exhausting the DoS iteration budget while preserving budget enforcement on calendar-invalid rules like Feb 30.
+- **Bytes/Bytearray Input in `Calendar.from_jcal()` (`icaloxide.compat.icalendar`)**:
+  - Accepted UTF-8 `bytes` and `bytearray` inputs alongside `str` and nested `list` payloads, raising `JCalParsingError` on invalid UTF-8 or malformed JSON.
+- **Quote-Aware `Parameters.from_ical()` & RFC 6868 Decoding (`icaloxide.compat.icalendar`)**:
+  - Replaced naive `split(";")` with quote-aware `;` / `,` splitting for multi-value and semicolon-containing quoted parameters (`CN="Smith; John"`, `ALTREP="http://ex.com/?a=1;b=2"`, `MEMBER="a","b"`) and added single-pass RFC 6868 caret unescaping (`^^`, `^'`, `^n`/`^N`).
+- **Single-Pass `vText.from_ical()` Unescaping (`icaloxide.compat.icalendar`)**:
+  - Replaced chained `.replace(...)` calls with a single-pass scanner so escaped backslashes before `n`/`N`/`,`/`;` (`r"Hello\\nWorld\,Test\;Semi"`) are not double-unescaped into newlines.
+- **Verification**: Added `tests/test_audit_v093.py` (all 5 Round-4 bug regressions + deterministic 250-case combinatorial multi-modifier `between()`/`after()` differential fuzzer) and new Rust unit tests in `crates/icaloxide-rrule/tests/rrule_tests.rs`.
+
 ## [0.9.2] - 2026-11-28
 
 ### Bug Fixes (Round-3 Deep Parity, `vRecur` Normalization & CLI Safety)

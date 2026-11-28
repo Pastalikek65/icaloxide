@@ -813,3 +813,59 @@ END:VCALENDAR\r\n";
         .count();
     assert_eq!(future_cnt, 3);
 }
+
+#[test]
+fn weekly_bysetpos_period0_respects_dtstart_and_modular_impossibles_terminate_empty() {
+    // Regression for WEEKLY + WKST + BYSETPOS + COUNT when earlier days in period 0 < DTSTART.
+    let rule = RRule::parse("FREQ=WEEKLY;WKST=SA;BYDAY=TH,SA,FR,TU;BYSETPOS=1;COUNT=3").unwrap();
+    let out = expand_rrule(
+        &rule,
+        ldt(2025, 4, 1, 8, 0, 0),
+        None,
+        None,
+        None,
+        IterationBudget::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        vec![
+            ldt(2025, 4, 1, 8, 0, 0),
+            ldt(2025, 4, 5, 8, 0, 0),
+            ldt(2025, 4, 12, 8, 0, 0),
+        ]
+    );
+
+    // Modularly impossible rules must terminate cleanly with Ok(vec![]) rather than BudgetExceeded.
+    let cases = [
+        (
+            "FREQ=MONTHLY;INTERVAL=3;BYMONTH=2,8,11;COUNT=3",
+            ldt(2025, 7, 1, 23, 15, 0),
+        ),
+        (
+            "FREQ=HOURLY;INTERVAL=2;BYHOUR=0,6,12,18;COUNT=5",
+            ldt(2025, 7, 1, 23, 15, 0),
+        ),
+        (
+            "FREQ=MINUTELY;INTERVAL=15;BYMINUTE=5,20;COUNT=5",
+            ldt(2025, 7, 1, 10, 0, 0),
+        ),
+        (
+            "FREQ=SECONDLY;INTERVAL=10;BYSECOND=3,7;COUNT=5",
+            ldt(2025, 7, 1, 10, 0, 0),
+        ),
+        (
+            "FREQ=DAILY;INTERVAL=7;BYDAY=MO;COUNT=5",
+            ldt(2025, 4, 1, 8, 0, 0), // 2025-04-01 is Tuesday
+        ),
+    ];
+    for (rrule_str, start) in cases {
+        let r = RRule::parse(rrule_str).unwrap();
+        let expanded =
+            expand_rrule(&r, start, None, None, None, IterationBudget::default()).unwrap();
+        assert!(
+            expanded.is_empty(),
+            "expected empty expansion for modularly impossible rule {rrule_str}"
+        );
+    }
+}

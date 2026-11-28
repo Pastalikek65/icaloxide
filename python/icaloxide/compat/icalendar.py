@@ -148,13 +148,69 @@ def _parse_duration_str(raw: Union[str, bytes]) -> datetime.timedelta:
 
 
 def _unescape_ical_text(raw: str) -> str:
-    return (
-        raw.replace("\\n", "\n")
-        .replace("\\N", "\n")
-        .replace("\\;", ";")
-        .replace("\\,", ",")
-        .replace("\\\\", "\\")
-    )
+    if "\\" not in raw:
+        return raw
+    out: list[str] = []
+    i = 0
+    n = len(raw)
+    while i < n:
+        ch = raw[i]
+        if ch == "\\" and i + 1 < n:
+            nxt = raw[i + 1]
+            if nxt in ("n", "N"):
+                out.append("\n")
+                i += 2
+                continue
+            if nxt in ("\\", ",", ";"):
+                out.append(nxt)
+                i += 2
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _split_unquoted(text: str, sep: str) -> list[str]:
+    if sep not in text:
+        return [text]
+    parts: list[str] = []
+    start = 0
+    in_quotes = False
+    for i, ch in enumerate(text):
+        if ch == '"':
+            in_quotes = not in_quotes
+        elif ch == sep and not in_quotes:
+            parts.append(text[start:i])
+            start = i + 1
+    parts.append(text[start:])
+    return parts
+
+
+def _unescape_rfc6868(text: str) -> str:
+    if "^" not in text:
+        return text
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "^" and i + 1 < n:
+            nxt = text[i + 1]
+            if nxt == "^":
+                out.append("^")
+                i += 2
+                continue
+            if nxt == "'":
+                out.append('"')
+                i += 2
+                continue
+            if nxt in ("n", "N"):
+                out.append("\n")
+                i += 2
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def _flatten_params(params: Optional[dict[str, Any]]) -> dict[str, Any]:
@@ -322,12 +378,19 @@ class Parameters(dict):  # type: ignore[type-arg]
     def from_ical(cls, raw: Union[str, bytes]) -> Parameters:
         text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
         out = cls()
-        for part in text.split(";"):
+        for part in _split_unquoted(text, ";"):
             part = part.strip()
             if not part or "=" not in part:
                 continue
-            k, v = part.split("=", 1)
-            out[k.strip().upper()] = v.strip().strip('"')
+            k, raw_val = part.split("=", 1)
+            vals: list[str] = []
+            for tok in _split_unquoted(raw_val, ","):
+                item = tok.strip()
+                if len(item) >= 2 and item[0] == '"' and item[-1] == '"':
+                    item = item[1:-1]
+                vals.append(_unescape_rfc6868(item))
+            key = k.strip().upper()
+            out[key] = vals[0] if len(vals) == 1 else vals
         return out
 
     def to_ical(self) -> bytes:
@@ -2549,11 +2612,16 @@ class Component:
         return json.dumps(self.to_jcal())
 
     @classmethod
-    def from_jcal(cls, jcal: Union[str, list[Any]]) -> Component:
-        """Parse an RFC 7265 jCal JSON string or nested list into a Component."""
+    def from_jcal(cls, jcal: Union[str, bytes, bytearray, list[Any]]) -> Component:
+        """Parse an RFC 7265 jCal JSON string, UTF-8 bytes, or nested list into a Component."""
         try:
-            data = json.loads(jcal) if isinstance(jcal, str) else jcal
-        except json.JSONDecodeError as exc:
+            if isinstance(jcal, (bytes, bytearray)):
+                data = json.loads(bytes(jcal).decode("utf-8"))
+            elif isinstance(jcal, str):
+                data = json.loads(jcal)
+            else:
+                data = jcal
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise JCalParsingError(str(exc)) from exc
         if not isinstance(data, list) or len(data) < 3:
             raise JCalParsingError("invalid jCal structure")
