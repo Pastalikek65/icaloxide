@@ -14,12 +14,14 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::error::{IterationBudget, RRuleError};
-use crate::query::components::{expand_alarms_for_parent, extract_freebusy_occurrences};
+use crate::query::components::{
+    expand_alarms_for_parent, extract_absolute_alarms, extract_freebusy_occurrences,
+};
 use crate::recurrence::series::{
     apply_this_and_future_shift, compute_end_local, compute_end_local_with_tz,
     extract_component_timing, overlaps_window, resolve_datetime_with_fallback,
-    resolve_local_instant, should_emit_master_dtstart, span_from_duration, utc_to_local_approx,
-    CompiledSeries, OverrideEntry,
+    resolve_local_instant, resolve_until_utc, should_emit_master_dtstart, span_from_duration,
+    utc_to_local_approx, CompiledSeries, OverrideEntry,
 };
 use crate::recurrence::SpanDuration;
 use crate::rrule::{LocalDateTime, RRuleIter};
@@ -1159,8 +1161,13 @@ fn build_owned_stream(
                 earliest_end_utc,
                 &mut static_items,
             );
+            let master_is_floating = matches!(
+                master.start_local.tz,
+                icaloxide_core::datetime::TimeZoneRef::Floating
+            );
             for (r_idx, rule) in master.rrules.iter().enumerate() {
-                let until_utc = resolve_until_with_tz(rule, &master.tz);
+                let until_utc =
+                    resolve_until_utc(rule, &master.tz, master.is_all_day, master_is_floating);
                 rule_cursors.push(OwnedRuleCursor {
                     rule_idx: r_idx,
                     next_period_idx: 0,
@@ -1234,6 +1241,10 @@ fn push_split_cursors(
             .this_and_future
             .get(tf_idx + 1)
             .map(|n| n.recurrence_id_utc);
+        let tf_is_floating = matches!(
+            tf.start_local.tz,
+            icaloxide_core::datetime::TimeZoneRef::Floating
+        );
         for (rule_idx, rule) in tf.override_rrules.iter().enumerate() {
             split_cursors.push(OwnedSplitCursor {
                 tf_idx,
@@ -1245,7 +1256,7 @@ fn push_split_cursors(
                 pending: std::collections::VecDeque::new(),
                 iter_finished: false,
                 finished: false,
-                until_utc: resolve_until_with_tz(rule, &tf.tz),
+                until_utc: resolve_until_utc(rule, &tf.tz, tf.is_all_day, tf_is_floating),
                 next_split_utc,
                 next_occ: None,
             });
@@ -1520,6 +1531,46 @@ const fn keeps_for_after(start_utc: i64, end_utc: i64, earliest_end_utc: i64) ->
     }
 }
 
+fn collect_abs_alarms(
+    comp: ComponentRef<'_>,
+    reg: &TzRegistry,
+    default_tz: &CalendarTimeZone,
+    skip_cancelled: bool,
+    out: &mut Vec<Occurrence>,
+) {
+    let cancelled = skip_cancelled
+        && comp
+            .status()
+            .is_some_and(|s| s.trim().eq_ignore_ascii_case("CANCELLED"));
+    if !cancelled {
+        out.extend(extract_absolute_alarms(comp, reg, default_tz));
+    }
+}
+
+fn split_master_and_overrides<'a>(
+    comps: &[ComponentRef<'a>],
+) -> (Option<ComponentRef<'a>>, Vec<ComponentRef<'a>>) {
+    let mut best_master: Option<(i64, ComponentRef<'a>)> = None;
+    let mut overrides: Vec<ComponentRef<'a>> = Vec::new();
+    for &c in comps {
+        if c.property(&PropertyName::RecurrenceId).is_some() {
+            overrides.push(c);
+        } else {
+            let seq = match c.property(&PropertyName::Sequence).map(|p| &p.value) {
+                Some(PropertyValue::Integer(n)) => *n,
+                _ => 0,
+            };
+            if best_master
+                .as_ref()
+                .is_none_or(|(best_seq, _)| seq >= *best_seq)
+            {
+                best_master = Some((seq, c));
+            }
+        }
+    }
+    (best_master.map(|(_, c)| c), overrides)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn classify_component_group(
     comps: &[ComponentRef<'_>],
@@ -1534,16 +1585,7 @@ fn classify_component_group(
     alarm_parent_singles: &mut Vec<Occurrence>,
     alarm_parent_series: &mut Vec<CompiledSeries>,
 ) -> Result<(), RRuleError> {
-    let mut master: Option<ComponentRef<'_>> = None;
-    let mut overrides: Vec<ComponentRef<'_>> = Vec::new();
-
-    for &c in comps {
-        if c.property(&PropertyName::RecurrenceId).is_some() {
-            overrides.push(c);
-        } else if master.is_none() {
-            master = Some(c);
-        }
-    }
+    let (master, overrides) = split_master_and_overrides(comps);
 
     let is_simple_single = overrides.is_empty()
         && master.is_some_and(|m| {
@@ -1552,6 +1594,9 @@ fn classify_component_group(
 
     if is_simple_single {
         let mc = master.unwrap();
+        if has_alarm {
+            collect_abs_alarms(mc, reg, default_tz, options.skip_cancelled, singles);
+        }
         if let Some(timing) = extract_component_timing(mc, reg, default_tz) {
             if options.skip_cancelled && timing.cancelled {
                 return Ok(());
@@ -1616,6 +1661,15 @@ fn classify_component_group(
         return Ok(());
     }
 
+    if has_alarm {
+        if let Some(mc) = master {
+            collect_abs_alarms(mc, reg, default_tz, options.skip_cancelled, singles);
+        }
+        for &ov in &overrides {
+            collect_abs_alarms(ov, reg, default_tz, options.skip_cancelled, singles);
+        }
+    }
+
     if let Some(compiled) = CompiledSeries::build(master, &overrides, reg, default_tz)? {
         if is_direct && has_alarm {
             alarm_parent_series.push(compiled.clone());
@@ -1646,33 +1700,6 @@ fn scan_max_alarm_pad(comp: ComponentRef<'_>) -> i64 {
         }
     }
     max_pad
-}
-
-fn resolve_until_with_tz(rule: &crate::rrule::RRule, tz: &CalendarTimeZone) -> Option<i64> {
-    let u = rule.until.as_ref()?;
-    Some(match u {
-        crate::rrule::UntilValue::Date(d) => {
-            let end_time = CalTime {
-                hour: 23,
-                minute: 59,
-                second: 59,
-            };
-            match tz.resolve_local(*d, end_time, DstDisambiguation::Compatible) {
-                Ok(r) => r.utc_timestamp,
-                Err(_) => i64::from(d.to_days_since_epoch()) * 86_400 + 86_399,
-            }
-        }
-        crate::rrule::UntilValue::DateTime(dt) => {
-            if matches!(dt.tz, icaloxide_core::datetime::TimeZoneRef::Utc) {
-                dt.to_naive_timestamp()
-            } else {
-                match tz.resolve_local(dt.date, dt.time, DstDisambiguation::Compatible) {
-                    Ok(r) => r.utc_timestamp,
-                    Err(_) => dt.to_naive_timestamp(),
-                }
-            }
-        }
-    })
 }
 
 type ComponentGrouping<'a> = (

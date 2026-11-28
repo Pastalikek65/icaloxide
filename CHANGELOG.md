@@ -5,6 +5,26 @@ All notable changes to `icaloxide` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-11-28
+
+### Bug Fixes (Comprehensive Audit & Extended Differential Verification)
+
+- **RRULE Filter Completeness (`icaloxide-rrule`)**:
+  - Fixed `FREQ=YEARLY;BYMONTHDAY=...` (without `BYMONTH`) expanding across all 12 months instead of only `DTSTART`'s month.
+  - Fixed `FREQ=WEEKLY` with `BYMONTHDAY` or `BYYEARDAY` (and omitted `BYDAY`) wrongly filtering dates to `DTSTART`'s weekday.
+- **`UNTIL` Date & Naive Comparison Semantics (`icaloxide-rrule`)**:
+  - Unified `resolve_until_utc` across both `between()` and streaming `after()`: `UNTIL=YYYYMMDD` on a timed `DTSTART` resolves to `00:00:00` of that date, and naive `DATE-TIME` `UNTIL` on a `TZID` `DTSTART` compares against floating UTC wall clock per RFC 5545 / upstream parity.
+- **Duplicate Master `SEQUENCE` Selection & Absolute `VALARM` Deduplication (`icaloxide-rrule`)**:
+  - Updated `classify_component_group` to select the winning master component by highest `SEQUENCE` (instead of blindly taking the first component).
+  - Extracted absolute `DATE-TIME` `VALARM` triggers once per winning master/override instead of re-emitting per recurrence instance or losing alarms whose parent falls outside the relative pad window (respecting `skip_cancelled`).
+- **`VJOURNAL` & Undated `VTODO` Occurrence Serialization (`icaloxide-py`, `icaloxide.compat`)**:
+  - Prevented synthetic `DTEND` emission on `VJOURNAL` occurrences in `PyOccurrence::to_ical`, `_ensure_materialized`, `decoded()`, and `get()`, and omitted synthetic `DTSTART`/`DUE` on undated `VTODO::to_ical()`.
+- **jCal, Custom `VTIMEZONE` `tzinfo`, and `add_missing_timezones()` Parity (`icaloxide.compat`)**:
+  - Fixed jCal `REQUEST-STATUS` array serialization/deserialization and dropped redundant `ENCODING` param on binary `jCal` properties (`ATTACH`) for full `icalendar.Calendar.from_jcal()` interop.
+  - Replaced OS-locale `.timestamp()` in `_CompiledVTimezoneTzInfo` with OS-timezone-independent epoch math supporting DST fall-back `fold=0`/`fold=1`.
+  - Updated `Calendar.add_missing_timezones()` to mutate in-place (for both lazy and materialized calendars) and return `self`.
+- **Verification**: Added `tests/test_audit_v09.py` covering all regression cases plus an 80-case extended differential fuzzer (`MINUTELY`, `SECONDLY`, `BYSETPOS`, leap-day, extreme timezones, long fast-forward jumps).
+
 ## [0.8.0] - 2026-11-28
 
 ### Bug Fixes (Uncovered via Differential Fuzzing & Torture Testing)

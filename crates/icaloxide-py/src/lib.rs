@@ -768,6 +768,13 @@ impl PyOccurrence {
             .component(self.occ.component_id)
             .ok_or_else(|| PyKeyError::new_err("invalid component id"))
     }
+    fn is_synthetic_end(&self, pname: &PropertyName) -> bool {
+        (self.occ.kind == ComponentKind::VTodo && *pname == PropertyName::Due)
+            || (!matches!(
+                self.occ.kind,
+                ComponentKind::VTodo | ComponentKind::VJournal | ComponentKind::VAlarm
+            ) && *pname == PropertyName::DtEnd)
+    }
 }
 
 #[pymethods]
@@ -859,13 +866,13 @@ impl PyOccurrence {
     #[pyo3(signature = (key, default=None))]
     fn get(&self, py: Python<'_>, key: &str, default: Option<PyObject>) -> PyResult<PyObject> {
         let pname = PropertyName::parse(key);
-        if pname == PropertyName::DtStart {
-            return Ok(self.start(py)?.unbind());
-        }
-        if (self.occ.kind == ComponentKind::VTodo && pname == PropertyName::Due)
-            || (self.occ.kind != ComponentKind::VTodo && pname == PropertyName::DtEnd)
-        {
-            return Ok(self.end(py)?.unbind());
+        if !self.occ.is_undated {
+            if pname == PropertyName::DtStart {
+                return Ok(self.start(py)?.unbind());
+            }
+            if self.is_synthetic_end(&pname) {
+                return Ok(self.end(py)?.unbind());
+            }
         }
         let comp = self.comp()?;
         match comp.property(&pname) {
@@ -880,9 +887,7 @@ impl PyOccurrence {
             if pname == PropertyName::DtStart {
                 return Ok(self.start(py)?.unbind());
             }
-            if (self.occ.kind == ComponentKind::VTodo && pname == PropertyName::Due)
-                || (self.occ.kind != ComponentKind::VTodo && pname == PropertyName::DtEnd)
-            {
+            if self.is_synthetic_end(&pname) {
                 return Ok(self.end(py)?.unbind());
             }
         }
@@ -895,10 +900,7 @@ impl PyOccurrence {
 
     fn __contains__(&self, key: &str) -> PyResult<bool> {
         let pname = PropertyName::parse(key);
-        if !self.occ.is_undated
-            && (pname == PropertyName::DtStart
-                || (self.occ.kind == ComponentKind::VTodo && pname == PropertyName::Due)
-                || (self.occ.kind != ComponentKind::VTodo && pname == PropertyName::DtEnd))
+        if !self.occ.is_undated && (pname == PropertyName::DtStart || self.is_synthetic_end(&pname))
         {
             return Ok(true);
         }
@@ -940,24 +942,30 @@ impl PyOccurrence {
                 }
                 dst.add_property(prop.clone());
             }
-            if self.occ.is_all_day {
-                dst.add_property(Property::new(
-                    PropertyName::DtStart,
-                    PropertyValue::Date(self.occ.start_local.date),
-                ));
-                dst.add_property(Property::new(
-                    end_prop_name,
-                    PropertyValue::Date(self.occ.end_local.date),
-                ));
-            } else {
-                dst.add_property(Property::new(
-                    PropertyName::DtStart,
-                    PropertyValue::DateTime(self.occ.start_local.clone()),
-                ));
-                dst.add_property(Property::new(
-                    end_prop_name,
-                    PropertyValue::DateTime(self.occ.end_local.clone()),
-                ));
+            if !self.occ.is_undated {
+                if self.occ.is_all_day {
+                    dst.add_property(Property::new(
+                        PropertyName::DtStart,
+                        PropertyValue::Date(self.occ.start_local.date),
+                    ));
+                    if self.occ.kind != ComponentKind::VJournal {
+                        dst.add_property(Property::new(
+                            end_prop_name,
+                            PropertyValue::Date(self.occ.end_local.date),
+                        ));
+                    }
+                } else {
+                    dst.add_property(Property::new(
+                        PropertyName::DtStart,
+                        PropertyValue::DateTime(self.occ.start_local.clone()),
+                    ));
+                    if self.occ.kind != ComponentKind::VJournal {
+                        dst.add_property(Property::new(
+                            end_prop_name,
+                            PropertyValue::DateTime(self.occ.end_local.clone()),
+                        ));
+                    }
+                }
             }
         }
         let serialized = temp_cal

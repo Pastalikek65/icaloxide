@@ -408,7 +408,13 @@ pub fn should_emit_master_dtstart(master: &MasterSeries) -> bool {
         return true;
     }
     master.rrules.iter().any(|rule| {
-        resolve_until_utc(rule, &master.tz).is_none_or(|until_utc| master.start_utc <= until_utc)
+        resolve_until_utc(
+            rule,
+            &master.tz,
+            master.is_all_day,
+            matches!(master.start_local.tz, TimeZoneRef::Floating),
+        )
+        .is_none_or(|until_utc| master.start_utc <= until_utc)
     })
 }
 
@@ -692,8 +698,9 @@ fn expand_master_window(
     }
 
     let dtstart_ldt = LocalDateTime::new(master.start_local.date, master.start_local.time);
+    let start_is_floating = matches!(master.start_local.tz, TimeZoneRef::Floating);
     for rule in &master.rrules {
-        let until_utc = resolve_until_utc(rule, &master.tz);
+        let until_utc = resolve_until_utc(rule, &master.tz, master.is_all_day, start_is_floating);
         let until_local = until_utc.map(|u| utc_to_local_approx(u + 86_400, &master.tz));
         let iter = RRuleIter::new(rule, dtstart_ldt, until_local, Some(ff_local), budget);
         for item in iter {
@@ -747,8 +754,9 @@ fn expand_this_and_future_rrules(
     let win_end_local = utc_to_local_approx(end_utc + 86_400, &tf.tz);
     let mut seen: FxHashSet<i64> = FxHashSet::default();
 
+    let tf_is_floating = matches!(tf.start_local.tz, TimeZoneRef::Floating);
     for rule in &tf.override_rrules {
-        let until_utc = resolve_until_utc(rule, &tf.tz);
+        let until_utc = resolve_until_utc(rule, &tf.tz, tf.is_all_day, tf_is_floating);
         let until_local = until_utc.map(|u| utc_to_local_approx(u + 86_400, &tf.tz));
         for item in RRuleIter::new(rule, dtstart_ldt, until_local, Some(ff_local), budget) {
             let ldt = item?;
@@ -904,22 +912,38 @@ pub fn utc_to_local_approx(utc_ts: i64, tz: &CalendarTimeZone) -> LocalDateTime 
     LocalDateTime::from_naive_timestamp(utc_ts + i64::from(off))
 }
 
-pub fn resolve_until_utc(rule: &RRule, tz: &CalendarTimeZone) -> Option<i64> {
+pub fn resolve_until_utc(
+    rule: &RRule,
+    tz: &CalendarTimeZone,
+    is_all_day: bool,
+    start_is_floating: bool,
+) -> Option<i64> {
     let u = rule.until.as_ref()?;
     Some(match u {
         UntilValue::Date(d) => {
-            let end_time = CalTime {
-                hour: 23,
-                minute: 59,
-                second: 59,
+            let bound_time = if is_all_day {
+                CalTime {
+                    hour: 23,
+                    minute: 59,
+                    second: 59,
+                }
+            } else {
+                CalTime {
+                    hour: 0,
+                    minute: 0,
+                    second: 0,
+                }
             };
-            match tz.resolve_local(*d, end_time, DstDisambiguation::Compatible) {
+            match tz.resolve_local(*d, bound_time, DstDisambiguation::Compatible) {
                 Ok(res) => res.utc_timestamp,
-                Err(_) => i64::from(d.to_days_since_epoch()) * 86_400 + 86_399,
+                Err(_) => {
+                    i64::from(d.to_days_since_epoch()) * 86_400
+                        + if is_all_day { 86_399 } else { 0 }
+                }
             }
         }
         UntilValue::DateTime(dt) => {
-            if matches!(dt.tz, TimeZoneRef::Utc) {
+            if matches!(dt.tz, TimeZoneRef::Utc) || !start_is_floating {
                 dt.to_naive_timestamp()
             } else {
                 match tz.resolve_local(dt.date, dt.time, DstDisambiguation::Compatible) {
@@ -1154,8 +1178,10 @@ fn build_master(
             timing.end_tz.as_ref(),
         )
         .0;
+        let start_is_floating = matches!(timing.start_local.tz, TimeZoneRef::Floating);
         for r in &rrules {
-            if let Some(u) = resolve_until_utc(r, &timing.tz) {
+            if let Some(u) = resolve_until_utc(r, &timing.tz, timing.is_all_day, start_is_floating)
+            {
                 max_e = max_e.max(u + timing.span.max_seconds());
             }
         }

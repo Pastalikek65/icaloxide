@@ -1852,7 +1852,7 @@ class Component:
                         self._make_prop_params(dtstart_p) if dtstart_p else None,
                     )
                 )
-                if self._rust_comp.end is not None:
+                if self._rust_comp.end is not None and self._rust_comp.name != "VJOURNAL":
                     end_p = _temporal_params_for_value(self._rust_comp.end, comp.params(end_key))
                     props.append(
                         (
@@ -1965,7 +1965,11 @@ class Component:
                 if self._rust_comp.start is not None:
                     if key_upper == "DTSTART":
                         return self._rust_comp.start
-                    if key_upper == occ_end_key and self._rust_comp.end is not None:
+                    if (
+                        key_upper == occ_end_key
+                        and self._rust_comp.end is not None
+                        and self._rust_comp.name != "VJOURNAL"
+                    ):
                         return self._rust_comp.end
                 if key_upper == "DURATION":
                     if default is _MISSING:
@@ -2027,7 +2031,11 @@ class Component:
                             self._rust_comp.component.params("DTSTART"),
                         )
                         return self._wrap_prop(key_upper, self._rust_comp.start, dt_p, match_idx=0)
-                    if key_upper == occ_end_key and self._rust_comp.end is not None:
+                    if (
+                        key_upper == occ_end_key
+                        and self._rust_comp.end is not None
+                        and self._rust_comp.name != "VJOURNAL"
+                    ):
                         end_p = _temporal_params_for_value(
                             self._rust_comp.end,
                             self._rust_comp.component.params(occ_end_key),
@@ -2588,8 +2596,8 @@ class Component:
             raw = val.to_ical()
             return raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
         if key == "REQUEST-STATUS":
-            parts = str(val).split(";")
-            return ";".join(_escape_text(p) for p in parts)
+            parts = val if isinstance(val, (list, tuple)) else str(val).split(";", 2)
+            return ";".join(_escape_text(str(p)) for p in parts)
         if key in ("RRULE", "ATTACH", "URL", "UID", "ATTENDEE", "ORGANIZER", "LINK", "CONCEPT"):
             return str(val)
         return _escape_text(str(val))
@@ -2661,7 +2669,15 @@ def _prop_to_jcal(key: str, val: Any, raw_params: dict[str, Any]) -> list[Any]:
         td_val = val.dt if isinstance(val, vUTCOffset) else val
         return [pname, params, "utc-offset", _format_utc_offset(td_val, colon=True)]
     if isinstance(val, vBinary):
+        params.pop("encoding", None)
         return [pname, params, "binary", val.to_ical().decode("ascii")]
+    if _is_binary_prop(raw_params) and isinstance(val, (bytes, str)):
+        params.pop("encoding", None)
+        b64 = base64.b64encode(val).decode("ascii") if isinstance(val, bytes) else str(val)
+        return [pname, params, "binary", b64]
+    if key == "REQUEST-STATUS":
+        parts = [str(p) for p in val] if isinstance(val, (list, tuple)) else str(val).split(";", 2)
+        return [pname, params, "text", parts]
     if isinstance(val, vPeriod):
         return val.to_jcal(name=pname)
     if isinstance(val, datetime.datetime):
@@ -2761,6 +2777,8 @@ def _jcal_values_to_py(pname: str, jtype: str, vals: list[Any], params: dict[str
         return float(vals[0])
     if jtype == "boolean":
         return bool(vals[0])
+    if pname == "REQUEST-STATUS" and vals and isinstance(vals[0], list):
+        return ";".join(str(x) for x in vals[0])
     if len(vals) > 1 or pname in ("CATEGORIES", "RESOURCES"):
         return [str(v) for v in vals]
     return str(vals[0]) if vals else ""
@@ -3484,25 +3502,46 @@ class _CompiledVTimezoneTzInfo(datetime.tzinfo):
             _, _, off_to, is_dst, abbr = self._transitions[0]
             return off_to, (3600 if is_dst else 0), abbr or self._name
 
-        naive_ts = int(dt.replace(tzinfo=None).timestamp()) if dt.year >= 1970 else (
+        naive_ts = (
             (dt.date() - datetime.date(1970, 1, 1)).days * 86400
             + dt.hour * 3600
             + dt.minute * 60
             + dt.second
         )
-        # Converge local wall-clock timestamp against sorted UTC transitions
-        est_off = self._transitions[0][1]
-        idx = bisect.bisect_right(self._trans_utc, naive_ts - est_off)
-        for _ in range(2):
-            chosen = self._transitions[idx - 1] if idx > 0 else self._transitions[0]
-            est_off = chosen[2] if idx > 0 else chosen[1]
-            idx = bisect.bisect_right(self._trans_utc, naive_ts - est_off)
-        if idx == 0:
-            _, off_from, _, _, abbr = self._transitions[0]
-            return off_from, 0, abbr or self._name
-        _, off_from, off_to, is_dst, abbr = self._transitions[idx - 1]
-        dst_secs = (off_to - off_from) if is_dst and off_to > off_from else (3600 if is_dst else 0)
-        return off_to, dst_secs, abbr or self._name
+        fold = getattr(dt, "fold", 0)
+        lo = bisect.bisect_left(self._trans_utc, naive_ts - 86400)
+        n = len(self._transitions)
+        k = lo
+        while k < n and self._trans_utc[k] <= naive_ts + 86400:
+            tu, off_from, off_to, is_dst, abbr = self._transitions[k]
+            if off_to < off_from and tu + off_to <= naive_ts < tu + off_from:
+                if fold == 1:
+                    dst_secs = (off_to - off_from) if is_dst and off_to > off_from else (3600 if is_dst else 0)
+                    return off_to, dst_secs, abbr or self._name
+                if k > 0:
+                    _, p_from, p_to, p_dst, p_abbr = self._transitions[k - 1]
+                    prev_dst = (p_to - p_from) if p_dst and p_to > p_from else (3600 if p_dst else 0)
+                    return off_from, prev_dst, p_abbr or self._name
+                return off_from, (off_from - off_to if not is_dst else 0), self._name
+            k += 1
+
+        # Outside fall-back ambiguity: locate active transition via right-bounded scan
+        idx = bisect.bisect_right(self._trans_utc, naive_ts + 86400)
+        while idx > 0:
+            tu, off_from, off_to, is_dst, abbr = self._transitions[idx - 1]
+            thresh = tu + off_from if off_to > off_from and fold == 0 else tu + off_to
+            if naive_ts >= thresh:
+                if off_to > off_from and tu + off_from <= naive_ts < tu + off_to and fold == 0:
+                    if idx > 1:
+                        _, p_from, p_to, p_dst, p_abbr = self._transitions[idx - 2]
+                        prev_dst = (p_to - p_from) if p_dst and p_to > p_from else (3600 if p_dst else 0)
+                        return off_from, prev_dst, p_abbr or self._name
+                    return off_from, 0, self._name
+                dst_secs = (off_to - off_from) if is_dst and off_to > off_from else (3600 if is_dst else 0)
+                return off_to, dst_secs, abbr or self._name
+            idx -= 1
+        _, off_from, _, _, _ = self._transitions[0]
+        return off_from, 0, self._name
 
     def utcoffset(self, dt: Optional[datetime.datetime]) -> datetime.timedelta:
         off, _, _ = self._resolve(dt)
@@ -4094,10 +4133,17 @@ class Calendar(Component):
 
     def add_missing_timezones(self) -> Calendar:
         if not self._materialized and self._rust_cal is not None:
-            return Calendar(_rust_cal=self._rust_cal.add_missing_timezones())
-        raw = self.to_ical()
-        enriched = _ox.Calendar.from_ical(raw).add_missing_timezones()
-        return Calendar(_rust_cal=enriched)
+            self._rust_cal = self._rust_cal.add_missing_timezones()
+            self._children_cache = None
+            return self
+        existing = {tz.get("TZID") for tz in self.timezones if tz.get("TZID") is not None}
+        enriched = self._as_rust_calendar().add_missing_timezones()
+        for r_tz in enriched.timezones:
+            tzid = r_tz.get("TZID")
+            if tzid is not None and tzid not in existing:
+                existing.add(tzid)
+                self.add_component(_wrap_rust_component(r_tz, _parent=self))
+        return self
 
     def _as_rust_calendar(self) -> _ox.Calendar:
         if not self._materialized and self._rust_cal is not None:

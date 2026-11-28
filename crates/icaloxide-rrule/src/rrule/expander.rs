@@ -353,7 +353,11 @@ fn generate_yearly(
         }
         d
     } else if !rule.by_month_day.is_empty() {
-        resolve_month_dates(year, dtstart.date.month, dtstart.date.day, rule)
+        let mut d = Vec::new();
+        for month in 1..=12_u8 {
+            d.extend(resolve_month_dates(year, month, dtstart.date.day, rule));
+        }
+        d
     } else {
         CalDate::new(year, dtstart.date.month, dtstart.date.day)
             .ok()
@@ -412,7 +416,11 @@ fn generate_weekly(
     for offset in 0..7_i32 {
         let date = CalDate::from_days_since_epoch(week_start as i32 + offset);
         let wd_matches = if rule.by_day.is_empty() {
-            date.weekday() == dtstart.date.weekday()
+            if rule.by_month_day.is_empty() && rule.by_year_day.is_empty() {
+                date.weekday() == dtstart.date.weekday()
+            } else {
+                true
+            }
         } else {
             rule.by_day
                 .iter()
