@@ -1589,7 +1589,9 @@ fn classify_component_group(
 
     let is_simple_single = overrides.is_empty()
         && master.is_some_and(|m| {
-            m.property(&PropertyName::RRule).is_none() && m.property(&PropertyName::RDate).is_none()
+            m.property(&PropertyName::RRule).is_none()
+                && m.property(&PropertyName::RDate).is_none()
+                && m.property(&PropertyName::ExDate).is_none()
         });
 
     if is_simple_single {

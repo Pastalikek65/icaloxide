@@ -5,6 +5,20 @@ All notable changes to `icaloxide` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.4] - 2026-11-28
+
+### Bug Fixes (Round-5 Non-Recurring `EXDATE`, Override Updates, jCal/xCal & `Calendar.new`)
+
+- **Non-Recurring `EXDATE` Respect (`icaloxide-rrule`)**:
+  - Excluded components carrying `EXDATE` properties from the `is_simple_single` bypass in `compile_group_into`, so standalone events/todos with `EXDATE == DTSTART` (UTC, `TZID`, `VALUE=DATE`, cross-TZ, and attached `VALARM`s) are properly suppressed across `between()`, `at()`, `after()`, `count()`, and `all()`.
+- **Idempotent In-Place `Calendar.modify_occurrence()` (`icaloxide.compat.icalendar`)**:
+  - Checked for an existing override matching `(uid, RECURRENCE-ID)` (normalizing aware UTC datetimes) before cloning master, updating it in place with incremented `SEQUENCE` instead of appending duplicate overrides.
+- **Single-Element `EXDATE`/`RDATE` jCal & xCal Roundtrip Parity (`icaloxide.compat.icalendar`)**:
+  - Preserved list wrapping in `_jcal_values_to_py` for single-item `EXDATE` and `RDATE` (`date`, `date-time`, and `period`), and aligned `Calendar.from_jcal` typing + tracked subcomponent rebinding on fallback wrapping.
+- **`Calendar.new()` `PRODID` & RFC 5545 Cleanliness (`icaloxide.compat.icalendar`)**:
+  - Uppercased `language` in synthesized `PRODID` (`-//Org//Name//LANG`) and removed emitting an invalid `LANGUAGE` property directly on `VCALENDAR`.
+- **Verification**: Added `tests/test_audit_v094.py` (all 4 Round-5 fixes + 150-case multi-TZ DST/EXDATE/RDATE/Override differential fuzzer + double-`THISANDFUTURE`/pagination/RFC 6868 tests) and a Rust regression in `crates/icaloxide-rrule/tests/rrule_tests.rs`.
+
 ## [0.9.3] - 2026-11-28
 
 ### Bug Fixes (Round-4 Combinatorial RRULE, Parameter, jCal Bytes & Unescaping)

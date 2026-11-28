@@ -2842,10 +2842,10 @@ def _jcal_values_to_py(pname: str, jtype: str, vals: list[Any], params: dict[str
         return vRecur(vals[0])
     if jtype == "date":
         parsed = [datetime.date.fromisoformat(str(v)) for v in vals]
-        return parsed[0] if len(parsed) == 1 else parsed
+        return parsed if len(parsed) > 1 or pname in ("EXDATE", "RDATE") else parsed[0]
     if jtype == "date-time":
         parsed_dt = [_parse_iso_dt(str(v), params) for v in vals]
-        return parsed_dt[0] if len(parsed_dt) == 1 else parsed_dt
+        return parsed_dt if len(parsed_dt) > 1 or pname in ("EXDATE", "RDATE") else parsed_dt[0]
     if jtype == "time":
         parsed_t = [_parse_iso_time(str(v), params) for v in vals]
         return parsed_t[0] if len(parsed_t) == 1 else parsed_t
@@ -2863,7 +2863,7 @@ def _jcal_values_to_py(pname: str, jtype: str, vals: list[Any], params: dict[str
             )
             for v in vals
         ]
-        return out_p[0] if len(out_p) == 1 else out_p
+        return out_p if len(out_p) > 1 or pname in ("EXDATE", "RDATE") else out_p[0]
     if jtype == "binary":
         return vBinary(base64.b64decode(str(vals[0])), params=params)
     if jtype == "integer":
@@ -4024,14 +4024,22 @@ class Calendar(Component):
         return cal
 
     @classmethod
-    def from_jcal(cls, jcal: Union[str, list[Any]]) -> Calendar:
+    def from_jcal(cls, jcal: Union[str, bytes, bytearray, list[Any]]) -> Calendar:
         comp = Component.from_jcal(jcal)
         if isinstance(comp, Calendar):
             return comp
         cal = cls()
         cal.name = comp.name
         cal._props = comp._props
-        cal._subcomponents = comp._subcomponents
+        if cal._props is not None:
+            for _k, v, p in cal._props:
+                if p is not None:
+                    p._on_mutate = cal._mark_dirty
+                if hasattr(v, "params") and isinstance(v.params, Parameters):
+                    v.params._on_mutate = cal._mark_dirty
+                if hasattr(v, "_on_mutate"):
+                    v._on_mutate = cal._mark_dirty
+        cal._subcomponents = _TrackedSubcomponents(cal, comp._subcomponents or ())
         return cal
 
     @classmethod
@@ -4061,7 +4069,8 @@ class Calendar(Component):
     ) -> Calendar:
         effective_prodid = prodid
         if effective_prodid is None and organization is not None:
-            effective_prodid = f"-//{organization}//{name or 'icaloxide'}//{language or 'EN'}"
+            lang = language.upper() if language else "EN"
+            effective_prodid = f"-//{organization}//{name or 'icaloxide'}//{lang}"
         cal = cls(_rust_cal=_ox.Calendar.new(prodid=effective_prodid, name=name))
         if calscale is not None and calscale != "GREGORIAN":
             cal["CALSCALE"] = calscale
@@ -4075,8 +4084,6 @@ class Calendar(Component):
             cal["REFRESH-INTERVAL"] = refresh_interval
         if source is not None:
             cal["SOURCE"] = source
-        if language is not None:
-            cal["LANGUAGE"] = language
         if any(
             x is not None and x != ()
             for x in (
@@ -4139,6 +4146,30 @@ class Calendar(Component):
                 return self
         raise KeyError(f"master component with UID={uid!r} not found")
 
+    @staticmethod
+    def _same_recurrence_id(a: Any, b: Any) -> bool:
+        av = a.dt if isinstance(a, vDDDTypes) else a
+        bv = b.dt if isinstance(b, vDDDTypes) else b
+        if isinstance(av, datetime.datetime) != isinstance(bv, datetime.datetime):
+            return False
+        if isinstance(av, datetime.datetime) and isinstance(bv, datetime.datetime):
+            if (av.tzinfo is None) != (bv.tzinfo is None):
+                return False
+            if av.tzinfo is not None and bv.tzinfo is not None:
+                return av.astimezone(datetime.timezone.utc) == bv.astimezone(datetime.timezone.utc)
+        return bool(av == bv)
+
+    @staticmethod
+    def _component_span(comp: Component, end_key: str) -> Optional[datetime.timedelta]:
+        st = comp.decoded("DTSTART", None)
+        en = comp.decoded(end_key, None) if "DURATION" not in comp else None
+        if st is not None and en is not None:
+            try:
+                return en - st
+            except TypeError:
+                return None
+        return None
+
     def modify_occurrence(
         self,
         uid: str,
@@ -4156,24 +4187,45 @@ class Calendar(Component):
         if master is None:
             raise KeyError(f"master component with UID={uid!r} not found")
         end_key = "DUE" if master.name == "VTODO" else "DTEND"
-        master_start = master.decoded("DTSTART", None)
-        master_end = master.decoded(end_key, None) if "DURATION" not in master else None
-        master_dur = None
-        if master_start is not None and master_end is not None:
-            try:
-                master_dur = master_end - master_start
-            except TypeError:
-                master_dur = None
+        master_dur = self._component_span(master, end_key)
 
-        ov = master.copy()
-        for rec_key in ("RRULE", "RDATE", "EXDATE", "RECURRENCE-ID"):
-            if rec_key in ov:
-                del ov[rec_key]
-        rid_params = {"RANGE": "THISANDFUTURE"} if range_this_and_future else None
-        ov.add("RECURRENCE-ID", recurrence_id, parameters=rid_params)
+        existing_ov = next(
+            (
+                c
+                for c in self._subcomponents
+                if c.uid == uid
+                and "RECURRENCE-ID" in c
+                and self._same_recurrence_id(c.decoded("RECURRENCE-ID", None), recurrence_id)
+            ),
+            None,
+        )
 
-        new_start = updates.pop("start", updates.pop("dtstart", recurrence_id))
-        ov["DTSTART"] = new_start
+        explicit_start = "start" in updates or "dtstart" in updates
+        if existing_ov is not None:
+            ov = existing_ov
+            if range_this_and_future:
+                rid_prop = ov.get("RECURRENCE-ID")
+                if rid_prop is not None and hasattr(rid_prop, "params"):
+                    rid_prop.params["RANGE"] = "THISANDFUTURE"
+                else:
+                    ov["RECURRENCE-ID"] = vDDDTypes(recurrence_id, params={"RANGE": "THISANDFUTURE"})
+            shift_dur = self._component_span(ov, end_key) if explicit_start else None
+            if explicit_start and shift_dur is None:
+                shift_dur = master_dur
+            new_start = updates.pop("start", updates.pop("dtstart", None))
+            if explicit_start:
+                ov["DTSTART"] = new_start
+        else:
+            ov = master.copy()
+            for rec_key in ("RRULE", "RDATE", "EXDATE", "RECURRENCE-ID"):
+                if rec_key in ov:
+                    del ov[rec_key]
+            rid_params = {"RANGE": "THISANDFUTURE"} if range_this_and_future else None
+            ov.add("RECURRENCE-ID", recurrence_id, parameters=rid_params)
+            shift_dur = master_dur
+            new_start = updates.pop("start", updates.pop("dtstart", recurrence_id))
+            ov["DTSTART"] = new_start
+
         if "end" in updates:
             ov.pop("DURATION", None)
             ov[end_key] = updates.pop("end")
@@ -4181,16 +4233,17 @@ class Calendar(Component):
             ov.pop("DTEND", None)
             ov.pop("DUE", None)
             ov["DURATION"] = updates.pop("duration")
-        elif end_key in ov and "DURATION" not in ov and master_dur is not None:
+        elif shift_dur is not None and end_key in ov and "DURATION" not in ov:
             try:
-                ov[end_key] = new_start + master_dur
+                ov[end_key] = new_start + shift_dur
             except TypeError:
                 pass
         for k, v in updates.items():
             ov[k.replace("_", "-").upper()] = v
         seq = int(ov.decoded("SEQUENCE", 0) or 0) + 1
         ov["SEQUENCE"] = seq
-        self.add_component(ov)
+        if existing_ov is None:
+            self.add_component(ov)
         return ov
 
     def complete_occurrence(

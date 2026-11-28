@@ -587,7 +587,7 @@ END:VEVENT\r\n\
 END:VCALENDAR\r\n";
 
     let cal = Arc::new(Calendar::parse_str(ics).unwrap());
-    let q = CalendarQuery::new(cal, QueryOptions::default()).unwrap();
+    let q = Arc::new(CalendarQuery::new(cal, QueryOptions::default()).unwrap());
     let occs = q
         .between(utc_ts(2025, 1, 1, 0, 0, 0), utc_ts(2030, 1, 15, 0, 0, 0))
         .unwrap();
@@ -732,7 +732,7 @@ END:VEVENT\r\n\
 END:VCALENDAR\r\n";
 
     let cal = Arc::new(Calendar::parse_str(ics).unwrap());
-    let q = CalendarQuery::new(cal, QueryOptions::default()).unwrap();
+    let q = Arc::new(CalendarQuery::new(cal, QueryOptions::default()).unwrap());
     let occs = q.all().unwrap();
     assert_eq!(occs.len(), 3, "UNTIL < DTSTART should emit 0 occurrences");
 
@@ -790,7 +790,7 @@ END:VEVENT\r\n\
 END:VCALENDAR\r\n";
 
     let cal = Arc::new(Calendar::parse_str(ics).unwrap());
-    let q = CalendarQuery::new(cal, QueryOptions::default()).unwrap();
+    let q = Arc::new(CalendarQuery::new(cal, QueryOptions::default()).unwrap());
 
     // Tokyo 15:00+09:00 == 06:00Z
     let tokyo_win = q
@@ -868,4 +868,48 @@ fn weekly_bysetpos_period0_respects_dtstart_and_modular_impossibles_terminate_em
             "expected empty expansion for modularly impossible rule {rrule_str}"
         );
     }
+}
+
+#[test]
+fn non_recurring_component_with_exdate_respects_exclusions() {
+    let ics = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+PRODID:-//Test//EN\r\n\
+BEGIN:VEVENT\r\n\
+UID:single-excluded\r\n\
+DTSTART:20260701T090000Z\r\n\
+DURATION:PT1H\r\n\
+EXDATE:20260701T090000Z\r\n\
+SUMMARY:Excluded\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\n\
+UID:single-kept\r\n\
+DTSTART:20260702T090000Z\r\n\
+DURATION:PT1H\r\n\
+EXDATE:20260703T090000Z\r\n\
+SUMMARY:Kept\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+
+    let cal = Arc::new(Calendar::parse_str(ics).unwrap());
+    let q = Arc::new(CalendarQuery::new(cal, QueryOptions::default()).unwrap());
+
+    let win = q
+        .between(utc_ts(2026, 6, 30, 0, 0, 0), utc_ts(2026, 7, 10, 0, 0, 0))
+        .unwrap();
+    assert_eq!(win.len(), 1);
+    assert_eq!(
+        q.calendar().component(win[0].component_id).unwrap().uid(),
+        Some("single-kept")
+    );
+
+    let all_occs = q.all().unwrap();
+    assert_eq!(all_occs.len(), 1);
+
+    let streamed: Vec<_> = q
+        .after(utc_ts(2026, 6, 30, 0, 0, 0))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(streamed.len(), 1);
 }
