@@ -37,6 +37,8 @@ def _add_span(base: Any, delta: datetime.timedelta) -> Any:
     if isinstance(base, datetime.datetime):
         return base + delta
     if isinstance(base, datetime.date):
+        if delta.seconds == 0 and delta.microseconds == 0:
+            return base + delta
         return datetime.datetime.combine(base, datetime.time.min) + delta
     raise IncompleteAlarmInformation(f"invalid alarm anchor type: {type(base).__name__}")
 
@@ -154,6 +156,11 @@ class Alarms:
                 dur = component.decoded("DURATION", None)
                 if isinstance(dur, datetime.timedelta):
                     end = _add_span(start, dur)
+                elif name == "VEVENT":
+                    if isinstance(start, datetime.date) and not isinstance(start, datetime.datetime):
+                        end = start + datetime.timedelta(days=1)
+                    else:
+                        end = start
             if end is not None:
                 self.set_end(end)
             last_ack = component.decoded("X-MOZ-LASTACK", None)
@@ -221,7 +228,11 @@ class Alarms:
                 yield _add_span(first, dur * idx)
 
     def _make_alarm_time(self, alarm: Any, trigger: Any) -> AlarmTime:
-        if isinstance(trigger, datetime.date) and not isinstance(trigger, datetime.datetime):
+        if (
+            isinstance(trigger, datetime.date)
+            and not isinstance(trigger, datetime.datetime)
+            and self._local_tzinfo is not None
+        ):
             trigger = datetime.datetime.combine(trigger, datetime.time.min)
         if getattr(trigger, "tzinfo", None) is None and self._local_tzinfo is not None:
             trigger = trigger.replace(tzinfo=self._local_tzinfo)

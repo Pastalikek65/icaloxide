@@ -5,6 +5,19 @@ All notable changes to `icaloxide` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.5] - 2026-11-28
+
+### Bug Fixes (Round-6 jCal/xCal `RRULE;UNTIL`, All-Day `VALARM`, and Leading-Slash `TZID`)
+
+- **jCal / xCal `RRULE;UNTIL` ISO-8601 Normalization (`icaloxide.compat.icalendar`)**:
+  - Updated `_parse_until_str` and `vRecur.__setitem__` to parse extended ISO-8601 date and UTC date-time strings (e.g. `"2026-07-05T10:00:00Z"`, `"2026-07-15"`) emitted by jCal/xCal into Python `date`/`datetime` values so `to_ical()` produces valid compact RFC 5545 `UNTIL` tokens.
+- **All-Day `VEVENT` `VALARM` Parity (`icaloxide.compat.alarms`)**:
+  - Preserved `datetime.date` triggers for whole-day alarm offsets (`TRIGGER:-P1D`) unless `set_local_timezone()` is active, matching `icalendar 7.x`.
+  - Defaulted `VEVENT` alarm end anchor to `DTSTART + 1 day` (all-day) or `DTSTART` (timed) when `DTEND` and `DURATION` are omitted, fixing `ComponentEndMissing` on all-day `TRIGGER;RELATED=END` alarms.
+- **RFC 5545 Leading-Slash Globally Unique `TZID`s (`icaloxide-core`, `icaloxide-py`)**:
+  - Extended `strip_vendor_prefix`, `TzRegistry::resolve_canonical_iana`, and `resolve_tzid` to recognize leading-slash globally unique identifiers such as `/America/New_York`, `/America/Indiana/Indianapolis`, `/UTC`, and `/US/Eastern` instead of requiring 3+ vendor path segments.
+- **Verification**: Added `tests/test_audit_v095.py` and expanded `crates/icaloxide-core/tests/tz_tests.rs`.
+
 ## [0.9.4] - 2026-11-28
 
 ### Bug Fixes (Round-5 Non-Recurring `EXDATE`, Override Updates, jCal/xCal & `Calendar.new`)

@@ -39,6 +39,39 @@ fn windows_cldr_vendor_prefix_and_fixed_offsets() {
         ),
         Some("America/Argentina/Buenos_Aires")
     );
+    assert_eq!(
+        strip_vendor_prefix("/America/New_York"),
+        Some("America/New_York")
+    );
+    assert_eq!(
+        strip_vendor_prefix("/America/Indiana/Indianapolis"),
+        Some("America/Indiana/Indianapolis")
+    );
+    assert_eq!(strip_vendor_prefix("/UTC"), Some("UTC"));
+    assert_eq!(strip_vendor_prefix("/US/Eastern"), Some("US/Eastern"));
+
+    let empty_reg = TzRegistry::default();
+    assert_eq!(
+        empty_reg
+            .resolve_canonical_iana("/America/New_York")
+            .as_deref(),
+        Some("America/New_York")
+    );
+    assert_eq!(
+        empty_reg.resolve_canonical_iana("/UTC").as_deref(),
+        Some("UTC")
+    );
+    assert_eq!(
+        empty_reg.resolve_canonical_iana("/US/Eastern").as_deref(),
+        Some("US/Eastern")
+    );
+    assert_eq!(
+        empty_reg
+            .resolve_canonical_iana("/Eastern Standard Time")
+            .as_deref(),
+        Some("America/New_York")
+    );
+    assert!(empty_reg.resolve("/America/New_York").is_some());
 
     // Standard ISO-style offsets
     assert_eq!(

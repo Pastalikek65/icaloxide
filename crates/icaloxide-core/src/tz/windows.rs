@@ -160,12 +160,22 @@ pub fn resolve_iana_alias(raw: &str) -> Option<&'static str> {
         .map(|(_, val)| *val)
 }
 
-/// Strip vendor TZID prefixes such as `/mozilla.org/20050126_1/Europe/Berlin`
-/// or `/freeassociation.sourceforge.net/Tzfile/America/New_York`.
+/// Strip RFC 5545 leading-slash or vendor TZID prefixes such as `/America/New_York`,
+/// `/mozilla.org/20050126_1/Europe/Berlin`, or
+/// `/freeassociation.sourceforge.net/Tzfile/America/New_York`.
 pub fn strip_vendor_prefix(tzid: &str) -> Option<&str> {
     let trimmed = tzid.trim().trim_matches('"');
     if !trimmed.starts_with('/') {
         return None;
+    }
+    let without_slash = trimmed.trim_start_matches('/');
+    if !without_slash.is_empty()
+        && (without_slash.eq_ignore_ascii_case("UTC")
+            || without_slash.eq_ignore_ascii_case("Etc/UTC")
+            || jiff::tz::TimeZone::get(without_slash).is_ok()
+            || resolve_iana_alias(without_slash).is_some())
+    {
+        return Some(without_slash);
     }
     let parts: Vec<&str> = trimmed.split('/').filter(|s| !s.is_empty()).collect();
     if parts.len() >= 3 {

@@ -638,6 +638,9 @@ class vRecur(dict):  # type: ignore[type-arg]
             items = [value]
         normalized: list[Any] = []
         for item in items:
+            if key_up == "UNTIL" and isinstance(item, str):
+                normalized.append(_parse_until_str(item.strip()))
+                continue
             if key_up in ("INTERVAL", "COUNT", "BYMONTH", "BYMONTHDAY", "BYYEARDAY", "BYWEEKNO", "BYSETPOS", "BYHOUR", "BYMINUTE", "BYSECOND") and isinstance(item, str):
                 try:
                     normalized.append(int(item))
@@ -772,6 +775,20 @@ def _parse_until_str(raw: str) -> Any:
             tzinfo=datetime.timezone.utc if raw.endswith(("Z", "z")) else None,
         )
         return dt
+    if len(raw) == 10 and raw[4] == "-" and raw[7] == "-":
+        try:
+            return datetime.date.fromisoformat(raw)
+        except ValueError:
+            return raw
+    if "-" in raw and ("T" in raw or "t" in raw):
+        try:
+            if raw.endswith(("Z", "z")):
+                return datetime.datetime.fromisoformat(raw[:-1]).replace(
+                    tzinfo=datetime.timezone.utc
+                )
+            return datetime.datetime.fromisoformat(raw)
+        except ValueError:
+            return raw
     return raw
 
 

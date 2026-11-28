@@ -114,8 +114,19 @@ impl TzRegistry {
             }
         }
         if let Some(stripped) = strip_vendor_prefix(cleaned) {
+            if stripped.eq_ignore_ascii_case("UTC") || stripped.eq_ignore_ascii_case("Etc/UTC") {
+                return Some(CompactString::const_new("UTC"));
+            }
             if let Ok(tz) = TimeZone::get(stripped) {
                 return Some(CompactString::from(tz.iana_name().unwrap_or(stripped)));
+            }
+            if let Some(alias) = resolve_iana_alias(stripped) {
+                if alias == "UTC" {
+                    return Some(CompactString::const_new("UTC"));
+                }
+                if let Ok(tz) = TimeZone::get(alias) {
+                    return Some(CompactString::from(tz.iana_name().unwrap_or(alias)));
+                }
             }
         }
         None

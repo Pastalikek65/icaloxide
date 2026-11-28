@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use compact_str::CompactString;
-use icaloxide_core::tz::{build_vtimezone_for_tzid, resolve_iana_alias, strip_vendor_prefix};
+use icaloxide_core::tz::{build_vtimezone_for_tzid, strip_vendor_prefix};
 use icaloxide_core::writer::write_folded_line;
 use icaloxide_core::{
     CalDate, CalDateTime, CalDuration, CalPeriod, CalTime, Calendar as CoreCalendar,
@@ -2077,11 +2077,11 @@ fn fold_ical_lines<'py>(
 
 #[pyfunction]
 fn resolve_tzid(tzid: &str) -> Option<String> {
-    let stripped = strip_vendor_prefix(tzid).unwrap_or(tzid);
-    if let Some(canon) = resolve_iana_alias(stripped) {
-        return Some(canon.to_owned());
-    }
     let reg = TzRegistry::default();
+    if let Some(canon) = reg.resolve_canonical_iana(tzid) {
+        return Some(canon.into_string());
+    }
+    let stripped = strip_vendor_prefix(tzid).unwrap_or(tzid);
     if reg.resolve(stripped).is_some() {
         return Some(stripped.to_owned());
     }
